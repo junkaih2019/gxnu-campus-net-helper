@@ -141,6 +141,7 @@ struct MenuState {
     app_dir: PathBuf,
     on_action: Arc<dyn Fn(TrayAction) + Send + Sync>,
     latest_snapshot: Arc<Mutex<Option<MonitorSnapshot>>>,
+    active_account_label: Arc<Mutex<String>>,
     palette: MenuPalette,
     items: Vec<MenuItemSpec>,
     hovered: Option<usize>,
@@ -160,6 +161,7 @@ impl FluentTrayMenu {
     pub fn new<F>(
         app_dir: PathBuf,
         latest_snapshot: Arc<Mutex<Option<MonitorSnapshot>>>,
+        active_account_label: Arc<Mutex<String>>,
         on_action: F,
     ) -> Result<Self, String>
     where
@@ -187,6 +189,7 @@ impl FluentTrayMenu {
                 app_dir,
                 on_action: Arc::new(on_action),
                 latest_snapshot,
+                active_account_label,
                 palette,
                 items: Vec::new(),
                 hovered: None,
@@ -383,8 +386,34 @@ fn refresh_menu_content(state: &mut MenuState, snap: Option<&MonitorSnapshot>) {
 
     state.status_color = dot;
     state.status_halo = halo;
-    state.header_sub = match snap {
-        Some(s) if s.state == MonitorState::Online && s.metrics.last_check_ms > 0 => {
+    let account_label = state
+        .active_account_label
+        .lock()
+        .ok()
+        .map(|g| g.trim().to_string())
+        .filter(|s| !s.is_empty() && s != "未配置账号");
+    state.header_sub = match (snap, account_label.as_deref()) {
+        (Some(s), Some(acct)) if s.state == MonitorState::Online && s.metrics.last_check_ms > 0 => {
+            let ms = s.metrics.last_check_ms;
+            let lat = if ms >= 1000 {
+                format!("{:.1}s", ms as f64 / 1000.0)
+            } else {
+                format!("{ms} ms")
+            };
+            format!("{} · 已连接 {lat}", truncate_chars(acct, 10))
+        }
+        (Some(s), Some(acct)) if s.state == MonitorState::Online => {
+            format!("{} · {title}", truncate_chars(acct, 10))
+        }
+        (Some(s), Some(acct)) if !s.message.is_empty() && s.message != title => {
+            format!(
+                "{} · {}",
+                truncate_chars(acct, 8),
+                truncate_chars(&s.message, 12)
+            )
+        }
+        (_, Some(acct)) => format!("{} · {title}", truncate_chars(acct, 10)),
+        (Some(s), None) if s.state == MonitorState::Online && s.metrics.last_check_ms > 0 => {
             let ms = s.metrics.last_check_ms;
             let lat = if ms >= 1000 {
                 format!("{:.1}s", ms as f64 / 1000.0)
@@ -393,10 +422,10 @@ fn refresh_menu_content(state: &mut MenuState, snap: Option<&MonitorSnapshot>) {
             };
             format!("{title} · 网关延迟 {lat}")
         }
-        Some(s) if !s.message.is_empty() && s.message != title => {
+        (Some(s), None) if !s.message.is_empty() && s.message != title => {
             format!("{title} · {}", truncate_chars(&s.message, 16))
         }
-        _ => title.to_owned(),
+        (_, None) => title.to_owned(),
     };
 
     let mut items = vec![

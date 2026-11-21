@@ -1,21 +1,22 @@
 //! Windows 11 Fluent 风格设置中心：
-//! - 左侧分组目录（账号管理 / 监控与自启 / 通知与数据）
+//! - 左侧分组目录（账号管理 / 监控与自启 / 外观与显示 / 通知与数据）
 //! - 右侧带标题与说明的分组卡片
 //! - 底部常驻状态与操作栏（还原修改 / 保存设置）
 
+use std::collections::HashMap;
 use std::path::Path;
 
-use eframe::egui::{self, CornerRadius, CursorIcon, Sense, Stroke, StrokeKind, Vec2};
+use eframe::egui::{self, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
-use crate::models::Settings;
+use crate::models::{AccountProfile, Settings};
 use crate::ui::icons::{self, Icon};
 use crate::ui::theme::{
-    body_text, bold_text, carrier_label, clamp_ui_zoom, Palette, ThemeMode, UiPrefs, RADIUS_MD,
-    RADIUS_SM,
+    body_text, bold_text, carrier_label, clamp_ui_zoom, with_alpha, Palette, ThemeMode, UiPrefs,
+    RADIUS_MD, RADIUS_SM,
 };
 use crate::ui::widgets::{
-    badge, nav_rail_item, primary_button, save_button, secondary_button, segmented_control,
-    stepper_field, toggle_switch,
+    badge, icon_button, nav_rail_item, primary_button, save_button, secondary_button,
+    segmented_control, stepper_field, toggle_switch,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,9 @@ impl SettingsTab {
 
 pub struct SettingsForm {
     pub tab: SettingsTab,
+    /// 当前正在编辑的账号 ID；`None` 表示正在创建新账号。
+    pub editing_account_id: Option<String>,
+    pub remark: String,
     pub student_id: String,
     pub password: String,
     pub show_password: bool,
@@ -66,12 +70,31 @@ pub struct SettingsForm {
 
 impl SettingsForm {
     pub fn from_settings(settings: &Settings) -> Self {
+        let active = settings.active_account();
+        let (editing_account_id, remark, student_id, carrier, monthly_quota_gb) = match active {
+            Some(acc) => (
+                Some(acc.id.clone()),
+                acc.remark.clone(),
+                acc.student_id.clone(),
+                acc.carrier.parse::<usize>().unwrap_or(2).min(3),
+                acc.monthly_quota_gb,
+            ),
+            None => (
+                None,
+                String::new(),
+                settings.student_id.clone(),
+                settings.carrier.parse::<usize>().unwrap_or(2).min(3),
+                settings.monthly_quota_gb,
+            ),
+        };
         Self {
             tab: SettingsTab::Account,
-            student_id: settings.student_id.clone(),
+            editing_account_id,
+            remark,
+            student_id,
             password: String::new(),
             show_password: false,
-            carrier: settings.carrier.parse::<usize>().unwrap_or(2).min(3),
+            carrier,
             check_interval: settings.check_interval,
             heartbeat_minutes: (settings.heartbeat_interval / 60).clamp(1, 1440),
             offline_interval: settings.offline_interval,
@@ -81,7 +104,7 @@ impl SettingsForm {
             notify_toast: settings.notify_toast,
             notify_wechat: settings.notify_wechat,
             notify_quiet_minutes: settings.notify_quiet_minutes,
-            monthly_quota_gb: settings.monthly_quota_gb,
+            monthly_quota_gb,
         }
     }
 
@@ -91,10 +114,29 @@ impl SettingsForm {
         self.tab = tab;
     }
 
-    pub fn to_settings(&self) -> Settings {
+    pub fn load_account_draft(&mut self, profile: &AccountProfile) {
+        self.editing_account_id = Some(profile.id.clone());
+        self.remark = profile.remark.clone();
+        self.student_id = profile.student_id.clone();
+        self.password.clear();
+        self.show_password = false;
+        self.carrier = profile.carrier.parse::<usize>().unwrap_or(2).min(3);
+        self.monthly_quota_gb = profile.monthly_quota_gb;
+    }
+
+    pub fn start_new_account(&mut self) {
+        self.editing_account_id = None;
+        self.remark.clear();
+        self.student_id.clear();
+        self.password.clear();
+        self.show_password = false;
+        self.carrier = 2;
+        self.monthly_quota_gb = 0;
+    }
+
+    /// 将全局监控/自启/通知参数合并回给定配置，保留已有账号列表与活跃账号。
+    pub fn to_global_settings(&self, base: &Settings) -> Settings {
         Settings {
-            student_id: self.student_id.trim().to_string(),
-            carrier: self.carrier.to_string(),
             check_interval: self.check_interval,
             heartbeat_interval: self.heartbeat_minutes.clamp(1, 1440) * 60,
             offline_interval: self.offline_interval,
@@ -104,17 +146,25 @@ impl SettingsForm {
             notify_toast: self.notify_toast,
             notify_wechat: self.notify_wechat,
             notify_quiet_minutes: self.notify_quiet_minutes,
-            monthly_quota_gb: self.monthly_quota_gb,
-            ..Default::default()
+            ..base.clone()
         }
         .normalized()
     }
 
-    pub fn is_dirty(&self, saved: &Settings) -> bool {
-        let current = self.to_settings();
-        current.student_id != saved.student_id
-            || current.carrier != saved.carrier
-            || current.check_interval != saved.check_interval
+    pub fn draft_profile(&self, id: String) -> AccountProfile {
+        AccountProfile {
+            id,
+            remark: self.remark.trim().to_string(),
+            student_id: self.student_id.trim().to_string(),
+            carrier: self.carrier.to_string(),
+            monthly_quota_gb: self.monthly_quota_gb,
+        }
+        .normalized()
+    }
+
+    pub fn is_global_dirty(&self, saved: &Settings) -> bool {
+        let current = self.to_global_settings(saved);
+        current.check_interval != saved.check_interval
             || current.heartbeat_interval != saved.heartbeat_interval
             || current.offline_interval != saved.offline_interval
             || current.confirm_failures != saved.confirm_failures
@@ -122,8 +172,30 @@ impl SettingsForm {
             || current.auto_boot != saved.auto_boot
             || current.notify_toast != saved.notify_toast
             || current.notify_quiet_minutes != saved.notify_quiet_minutes
-            || current.monthly_quota_gb != saved.monthly_quota_gb
-            || !self.password.is_empty()
+    }
+
+    pub fn is_account_draft_dirty(&self, saved: &Settings) -> bool {
+        if let Some(id) = self.editing_account_id.as_deref() {
+            match saved.find_account(id) {
+                Some(acc) => {
+                    self.remark.trim() != acc.remark.trim()
+                        || self.student_id.trim() != acc.student_id.trim()
+                        || self.carrier.to_string() != acc.carrier
+                        || self.monthly_quota_gb.clamp(0, 2000) != acc.monthly_quota_gb
+                        || !self.password.is_empty()
+                }
+                None => true,
+            }
+        } else {
+            !self.remark.trim().is_empty()
+                || !self.student_id.trim().is_empty()
+                || !self.password.is_empty()
+                || self.monthly_quota_gb != 0
+        }
+    }
+
+    pub fn is_dirty(&self, saved: &Settings) -> bool {
+        self.is_global_dirty(saved) || self.is_account_draft_dirty(saved)
     }
 }
 
@@ -131,6 +203,9 @@ impl SettingsForm {
 pub struct SettingsActions {
     pub test_toast: bool,
     pub save: bool,
+    pub save_profile: bool,
+    pub switch_account: Option<String>,
+    pub delete_account: Option<String>,
     pub reset: bool,
     pub ui_prefs_changed: bool,
     pub set_window_size: Option<[f32; 2]>,
@@ -146,7 +221,7 @@ pub fn draw_settings_view(
     ui_prefs: &mut UiPrefs,
     app_dir: &Path,
     log_path: &Path,
-    credential_account: Option<&str>,
+    account_creds: &HashMap<String, bool>,
     needs_setup: bool,
     saving: bool,
     total_height: f32,
@@ -294,7 +369,8 @@ pub fn draw_settings_view(
                                                 p,
                                                 form,
                                                 saved,
-                                                credential_account,
+                                                account_creds,
+                                                &mut actions,
                                             ),
                                             SettingsTab::Monitor => draw_monitor_page(ui, p, form),
                                             SettingsTab::Display => {
@@ -340,12 +416,16 @@ pub fn draw_settings_view(
                                 ui.painter().circle_filled(dr.center(), 3.4, dot_c);
                                 ui.label(bold_text(status_str, 11.5, p.text));
                                 let summary = format!(
-                                    "· {} · {}s 巡检 · 自启{}",
+                                    "· {} · {} · {}s 巡检 · 自启{}",
+                                    saved.active_display_name(),
                                     carrier_label(&saved.carrier),
                                     saved.check_interval,
                                     if saved.auto_boot { "开" } else { "关" },
                                 );
-                                ui.label(body_text(summary, 11.0, p.text_muted));
+                                ui.add(
+                                    egui::Label::new(body_text(summary, 11.0, p.text_muted))
+                                        .truncate(),
+                                );
 
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
@@ -409,86 +489,148 @@ fn draw_account_page(
     p: &Palette,
     form: &mut SettingsForm,
     saved: &Settings,
-    credential_account: Option<&str>,
+    account_creds: &HashMap<String, bool>,
+    actions: &mut SettingsActions,
 ) {
     page_header(
         ui,
         p,
         "账号管理",
-        "配置广西师范大学校园网学号、运营商出口与可选流量提醒；密码加密保存在 Windows 凭据管理器中。",
+        "支持保存多个校园网账号并自定义备注名，主页顶栏可一键下线并切换账号；各账号密码独立加密保存于 Windows 凭据管理器。",
     );
 
-    let has_cred =
-        credential_account == Some(form.student_id.trim()) && !form.student_id.trim().is_empty();
-
-    // 1. 当前账号摘要卡（为阶段二多账号列表预留卡片容器结构）
+    // 1. 已保存账号目录卡
     group_card(ui, p, |ui| {
+        ui.spacing_mut().item_spacing.y = 8.0;
         ui.allocate_ui_with_layout(
-            Vec2::new(ui.available_width(), 34.0),
+            Vec2::new(ui.available_width(), 26.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.spacing_mut().item_spacing.x = 10.0;
-                let (ico_r, _) = ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
-                ui.painter()
-                    .rect_filled(ico_r, CornerRadius::same(8), p.accent_soft);
-                icons::paint(ui.painter(), ico_r.shrink(7.0), Icon::User, p.accent);
-
-                ui.vertical(|ui| {
-                    ui.spacing_mut().item_spacing.y = 2.0;
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 6.0;
-                        let title = if saved.student_id.trim().is_empty() {
-                            "尚未配置校园网账号".to_string()
-                        } else {
-                            mask_student_id(&saved.student_id)
-                        };
-                        ui.label(bold_text(title, 12.5, p.text));
-                        badge(
-                            ui,
-                            p.accent,
-                            p.accent_soft,
-                            p.accent_border,
-                            carrier_label(&saved.carrier),
-                        );
-                    });
-                    let quota_text = if saved.monthly_quota_gb > 0 {
-                        format!("月流量提醒 {} GB", saved.monthly_quota_gb)
-                    } else {
-                        "月流量不限（适合运营商出口）".to_string()
-                    };
-                    ui.label(body_text(quota_text, 10.5, p.text_muted));
-                });
+                ui.spacing_mut().item_spacing.x = 6.0;
+                ui.label(bold_text("已保存账号", 12.5, p.text));
+                let count_text = if saved.accounts.is_empty() {
+                    "尚未添加".to_string()
+                } else {
+                    format!("共 {} 个 · 点击条目编辑", saved.accounts.len())
+                };
+                ui.label(body_text(count_text, 11.0, p.text_muted));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if has_cred {
-                        badge(ui, p.ok, p.ok_soft, p.ok_border, "凭据已加密");
-                    } else {
-                        badge(ui, p.warn, p.warn_soft, p.warn_border, "未保存密码");
+                    if form.editing_account_id.is_none() && !saved.accounts.is_empty() {
+                        badge(ui, p.accent, p.accent_soft, p.accent_border, "正在新增账号");
+                    } else if draw_compact_action_btn(ui, p, Some(Icon::Plus), "新增账号", false)
+                        .clicked()
+                    {
+                        form.start_new_account();
                     }
                 });
             },
         );
+
+        if saved.accounts.is_empty() {
+            egui::Frame::new()
+                .fill(p.subtle)
+                .stroke(Stroke::new(1.0_f32, p.divider))
+                .corner_radius(CornerRadius::same(RADIUS_SM))
+                .inner_margin(egui::Margin::symmetric(12, 10))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(body_text(
+                        "尚未保存校园网账号，请在下方填写备注名、学号与密码后保存。",
+                        11.5,
+                        p.text_muted,
+                    ));
+                });
+        } else {
+            ui.spacing_mut().item_spacing.y = 6.0;
+            for acc in &saved.accounts {
+                let is_active = acc.id == saved.active_account_id;
+                let is_editing = form.editing_account_id.as_deref() == Some(acc.id.as_str());
+                let has_cred = account_creds.get(&acc.id).copied().unwrap_or(false);
+                draw_saved_account_row(ui, p, acc, is_active, is_editing, has_cred, form, actions);
+            }
+        }
     });
 
     ui.add_space(10.0);
 
-    // 2. 账号编辑表单卡
+    // 2. 账号编辑 / 新增表单卡
+    let is_new = form.editing_account_id.is_none();
+    let editing_saved = form
+        .editing_account_id
+        .as_deref()
+        .and_then(|id| saved.find_account(id));
+    let editing_has_cred = editing_saved.is_some_and(|acc| {
+        account_creds.get(&acc.id).copied().unwrap_or(false)
+            && acc.student_id.trim() == form.student_id.trim()
+    });
+    let draft_dirty = form.is_account_draft_dirty(saved);
+
     group_card(ui, p, |ui| {
         ui.spacing_mut().item_spacing.y = 8.0;
-        ui.label(bold_text("账号与出口配置", 12.5, p.text));
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 24.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let heading = match editing_saved {
+                    Some(acc) => format!("编辑账号 · {}", acc.display_name()),
+                    None => "新增校园网账号".to_string(),
+                };
+                ui.label(bold_text(heading, 12.5, p.text));
+                if let Some(acc) = editing_saved {
+                    if acc.id == saved.active_account_id {
+                        badge(ui, p.ok, p.ok_soft, p.ok_border, "当前活跃");
+                    }
+                }
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if is_new
+                        && !saved.accounts.is_empty()
+                        && draw_compact_action_btn(ui, p, None, "取消新增", false).clicked()
+                    {
+                        if let Some(active) = saved.active_account() {
+                            form.load_account_draft(active);
+                        }
+                    }
+                });
+            },
+        );
 
         let full_w = ui.available_width();
         let col_gap = 12.0_f32;
         let col_w = ((full_w - col_gap) * 0.5).floor().max(140.0);
 
+        // 第一行：备注名称 | 校园网学号
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = col_gap;
             ui.allocate_ui_with_layout(
-                Vec2::new(col_w, 48.0),
+                Vec2::new(col_w, 52.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.label(body_text(
+                        "备注名称（选填，优先显示）",
+                        11.5,
+                        p.text_secondary,
+                    ));
+                    ui.add_space(4.0);
+                    styled_text_box(
+                        ui,
+                        p,
+                        col_w,
+                        &mut form.remark,
+                        "如：宿舍联通、实验室电信",
+                        false,
+                        None,
+                    );
+                },
+            );
+
+            ui.allocate_ui_with_layout(
+                Vec2::new(col_w, 52.0),
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
                     ui.label(body_text("校园网学号", 11.5, p.text_secondary));
-                    ui.add_space(3.0);
+                    ui.add_space(4.0);
                     styled_text_box(
                         ui,
                         p,
@@ -500,14 +642,20 @@ fn draw_account_page(
                     );
                 },
             );
+        });
 
+        ui.add_space(2.0);
+
+        // 第二行：登录密码 | 独立凭据隔离状态
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = col_gap;
             ui.allocate_ui_with_layout(
-                Vec2::new(col_w, 48.0),
+                Vec2::new(col_w, 52.0),
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
-                    ui.label(body_text("密码", 11.5, p.text_secondary));
-                    ui.add_space(3.0);
-                    let hint = if has_cred {
+                    ui.label(body_text("登录密码", 11.5, p.text_secondary));
+                    ui.add_space(4.0);
+                    let hint = if editing_has_cred {
                         "已保存，留空不修改"
                     } else {
                         "输入校园网密码"
@@ -523,6 +671,63 @@ fn draw_account_page(
                         None
                     };
                     styled_text_box(ui, p, col_w, &mut form.password, hint, mask_password, eye);
+                },
+            );
+
+            ui.allocate_ui_with_layout(
+                Vec2::new(col_w, 52.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.label(body_text("凭据安全存储", 11.5, p.text_secondary));
+                    ui.add_space(4.0);
+                    let (fg, bg, border, status_txt) = if !form.password.is_empty() {
+                        (
+                            p.accent,
+                            p.accent_soft,
+                            p.accent_border,
+                            "保存后将加密更新 DPAPI 凭据",
+                        )
+                    } else if editing_has_cred {
+                        (
+                            p.ok,
+                            p.ok_soft,
+                            p.ok_border,
+                            "已加密保存在 Windows 凭据管理器",
+                        )
+                    } else {
+                        (
+                            p.warn,
+                            p.warn_soft,
+                            p.warn_border,
+                            "尚未保存密码，请输入后保存",
+                        )
+                    };
+                    let (box_rect, _) =
+                        ui.allocate_exact_size(Vec2::new(col_w, 30.0), Sense::hover());
+                    ui.painter().rect(
+                        box_rect,
+                        CornerRadius::same(RADIUS_SM),
+                        bg,
+                        Stroke::new(1.0_f32, border),
+                        StrokeKind::Inside,
+                    );
+                    let ico_r = Rect::from_center_size(
+                        Pos2::new(box_rect.left() + 15.0, box_rect.center().y),
+                        Vec2::splat(12.5),
+                    );
+                    icons::paint(ui.painter(), ico_r, Icon::Key, fg);
+                    let font = egui::FontId::proportional(11.0);
+                    let galley = ui
+                        .painter()
+                        .layout_no_wrap(status_txt.to_string(), font, fg);
+                    ui.painter().galley(
+                        Pos2::new(
+                            box_rect.left() + 27.0,
+                            box_rect.center().y - galley.size().y * 0.5,
+                        ),
+                        galley,
+                        fg,
+                    );
                 },
             );
         });
@@ -544,21 +749,269 @@ fn draw_account_page(
             "GB",
         );
 
-        ui.add_space(2.0);
-        egui::Frame::new()
-            .fill(p.subtle)
-            .stroke(Stroke::new(1.0_f32, p.divider))
-            .corner_radius(CornerRadius::same(6))
-            .inner_margin(egui::Margin::symmetric(10, 7))
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
+        row_divider(ui, p);
+
+        // 卡片底部操作行：左安全隔离说明 + 右保存账号按钮
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 30.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
                 ui.label(body_text(
-                    "密码通过 Windows DPAPI 写入当前用户的 Windows 凭据管理器（GXNUCampusLogin/v4），绝不以明文存入配置文件或日志。",
+                    "密码按账号 ID 隔离加密存储（GXNUCampusLogin/v5），绝不明文写入配置或日志",
                     10.5,
                     p.text_muted,
                 ));
-            });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let btn_label = if is_new {
+                        "添加并保存账号"
+                    } else {
+                        "保存此账号"
+                    };
+                    let clicked = if is_new || draft_dirty {
+                        primary_button(ui, p, Some(Icon::Check), btn_label).clicked()
+                    } else {
+                        secondary_button(ui, p, Some(Icon::Check), btn_label).clicked()
+                    };
+                    if clicked {
+                        actions.save_profile = true;
+                    }
+                });
+            },
+        );
     });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_saved_account_row(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    acc: &AccountProfile,
+    is_active: bool,
+    is_editing: bool,
+    has_cred: bool,
+    form: &mut SettingsForm,
+    actions: &mut SettingsActions,
+) {
+    let row_w = ui.available_width();
+    let row_h = 46.0_f32;
+    let (row_rect, _) = ui.allocate_exact_size(Vec2::new(row_w, row_h), Sense::hover());
+    let hovered = ui.rect_contains_pointer(row_rect);
+
+    let (fill, stroke) = if is_editing {
+        (p.accent_soft, Stroke::new(1.1_f32, p.accent_border))
+    } else if hovered {
+        (p.card_hover, Stroke::new(1.0_f32, p.border_strong))
+    } else {
+        (p.subtle, Stroke::new(1.0_f32, p.divider))
+    };
+    ui.painter().rect(
+        row_rect,
+        CornerRadius::same(RADIUS_SM),
+        fill,
+        stroke,
+        StrokeKind::Inside,
+    );
+
+    if is_active {
+        let bar = Rect::from_min_max(
+            Pos2::new(row_rect.left() + 1.5, row_rect.top() + 8.0),
+            Pos2::new(row_rect.left() + 4.5, row_rect.bottom() - 8.0),
+        );
+        ui.painter().rect_filled(bar, CornerRadius::same(2), p.ok);
+    }
+
+    let inner = row_rect.shrink2(Vec2::new(10.0, 5.0));
+    let right_reserved = if is_active { 122.0_f32 } else { 174.0_f32 };
+    let left_w = (inner.width() - right_reserved).max(140.0);
+
+    // 左侧可点击信息区（点击选中该账号到下方表单编辑）
+    let left_rect = Rect::from_min_size(inner.min, Vec2::new(left_w, inner.height()));
+    let select_resp = ui
+        .interact(
+            left_rect,
+            ui.id().with(("acct_row_select", &acc.id)),
+            Sense::click(),
+        )
+        .on_hover_cursor(CursorIcon::PointingHand);
+    if select_resp.clicked() {
+        form.load_account_draft(acc);
+    }
+
+    // 头像圆角底块
+    let avatar_rect = Rect::from_center_size(
+        Pos2::new(left_rect.left() + 14.0, left_rect.center().y),
+        Vec2::splat(26.0),
+    );
+    let (av_bg, av_fg) = if is_active {
+        (p.ok_soft, p.ok)
+    } else {
+        (with_alpha(p.accent, 22), p.accent)
+    };
+    ui.painter()
+        .rect_filled(avatar_rect, CornerRadius::same(7), av_bg);
+    icons::paint(ui.painter(), avatar_rect.shrink(6.0), Icon::User, av_fg);
+
+    let text_x = avatar_rect.right() + 9.0;
+    let title_y = left_rect.top() + 9.5;
+    let sub_y = left_rect.bottom() - 8.5;
+
+    let display_name = acc.display_name();
+    let title_font = egui::FontId::new(12.5, crate::ui::theme::bold_family());
+    let title_galley = ui
+        .painter()
+        .layout_no_wrap(display_name, title_font, p.text);
+    let title_w = title_galley.size().x;
+    ui.painter().galley(
+        Pos2::new(text_x, title_y - title_galley.size().y * 0.5),
+        title_galley,
+        p.text,
+    );
+
+    if is_active {
+        let tag_font = egui::FontId::new(10.0, crate::ui::theme::bold_family());
+        let tag_galley = ui
+            .painter()
+            .layout_no_wrap("当前使用".to_string(), tag_font, p.ok);
+        let pill_rect = Rect::from_center_size(
+            Pos2::new(
+                text_x + title_w + 7.0 + (tag_galley.size().x + 10.0) * 0.5,
+                title_y,
+            ),
+            Vec2::new(tag_galley.size().x + 10.0, 17.0),
+        );
+        if pill_rect.right() <= left_rect.right() {
+            ui.painter().rect(
+                pill_rect,
+                CornerRadius::same(4),
+                p.ok_soft,
+                Stroke::new(1.0_f32, p.ok_border),
+                StrokeKind::Inside,
+            );
+            ui.painter().galley(
+                Pos2::new(
+                    pill_rect.center().x - tag_galley.size().x * 0.5,
+                    pill_rect.center().y - tag_galley.size().y * 0.5,
+                ),
+                tag_galley,
+                p.ok,
+            );
+        }
+    }
+
+    let quota_part = if acc.monthly_quota_gb > 0 {
+        format!(" · 限额 {} GB", acc.monthly_quota_gb)
+    } else {
+        String::new()
+    };
+    let subtitle = if acc.remark.trim().is_empty() {
+        format!("{}{}", carrier_label(&acc.carrier), quota_part)
+    } else {
+        format!(
+            "{} · {}{}",
+            acc.masked_student_id(),
+            carrier_label(&acc.carrier),
+            quota_part
+        )
+    };
+    ui.painter().text(
+        Pos2::new(text_x, sub_y),
+        egui::Align2::LEFT_CENTER,
+        subtitle,
+        egui::FontId::proportional(10.5),
+        p.text_muted,
+    );
+
+    // 右侧操作区（凭据状态徽章 + 一键切换 + 删除）
+    let right_rect = Rect::from_min_max(Pos2::new(left_rect.right() + 6.0, inner.top()), inner.max);
+    let mut right_ui = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(right_rect)
+            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+    );
+    right_ui.spacing_mut().item_spacing.x = 6.0;
+
+    if icon_button(
+        &mut right_ui,
+        p,
+        Icon::Trash,
+        Vec2::splat(26.0),
+        13.0,
+        true,
+        "删除此账号及其保存的密码",
+    )
+    .clicked()
+    {
+        actions.delete_account = Some(acc.id.clone());
+    }
+
+    if !is_active
+        && draw_compact_action_btn(&mut right_ui, p, None, "切换", has_cred)
+            .on_hover_text(if has_cred {
+                "立即下线当前会话并切换登录此账号"
+            } else {
+                "该账号尚未保存密码，点击前往填写"
+            })
+            .clicked()
+    {
+        actions.switch_account = Some(acc.id.clone());
+    }
+
+    if has_cred {
+        badge(&mut right_ui, p.ok, p.ok_soft, p.ok_border, "已加密");
+    } else {
+        badge(&mut right_ui, p.warn, p.warn_soft, p.warn_border, "缺密码");
+    }
+}
+
+fn draw_compact_action_btn(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    icon: Option<Icon>,
+    label: &str,
+    accent: bool,
+) -> egui::Response {
+    let font = egui::FontId::new(11.0, crate::ui::theme::bold_family());
+    let fg = if accent { p.accent } else { p.text_secondary };
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font, fg);
+    let icon_w = if icon.is_some() { 15.0 } else { 0.0 };
+    let w = (galley.size().x + icon_w + 16.0).max(46.0);
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 24.0), Sense::click());
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    let (fill, stroke, text_c) = if accent {
+        if resp.hovered() {
+            (p.accent, Stroke::NONE, p.on_accent)
+        } else {
+            (
+                p.accent_soft,
+                Stroke::new(1.0_f32, p.accent_border),
+                p.accent,
+            )
+        }
+    } else if resp.hovered() {
+        (p.card_hover, Stroke::new(1.0_f32, p.border_strong), p.text)
+    } else {
+        (p.card, Stroke::new(1.0_f32, p.border), p.text_secondary)
+    };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(6),
+        fill,
+        stroke,
+        StrokeKind::Inside,
+    );
+    let content_w = galley.size().x + icon_w;
+    let mut x = rect.center().x - content_w * 0.5;
+    if let Some(ic) = icon {
+        let ir = Rect::from_center_size(Pos2::new(x + 5.5, rect.center().y), Vec2::splat(11.0));
+        icons::paint(ui.painter(), ir, ic, text_c);
+        x += icon_w;
+    }
+    ui.painter().galley(
+        Pos2::new(x, rect.center().y - galley.size().y * 0.5),
+        galley,
+        text_c,
+    );
+    resp
 }
 
 fn draw_carrier_row(ui: &mut egui::Ui, p: &Palette, carrier: &mut usize) {
@@ -1092,7 +1545,7 @@ fn styled_text_box(
                         [edit_w, 20.0],
                         egui::TextEdit::singleline(value)
                             .password(password)
-                            .hint_text(hint)
+                            .hint_text(egui::RichText::new(hint).color(p.text_muted))
                             .vertical_align(egui::Align::Center)
                             .frame(false),
                     );
@@ -1127,16 +1580,6 @@ fn row_divider(ui: &mut egui::Ui, p: &Palette) {
     ui.add_space(6.0);
 }
 
-fn mask_student_id(id: &str) -> String {
-    let trimmed = id.trim();
-    if trimmed.chars().count() <= 4 {
-        trimmed.to_string()
-    } else {
-        let head: String = trimmed.chars().take(4).collect();
-        format!("{head}***")
-    }
-}
-
 fn open_path(path: &Path) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -1145,4 +1588,58 @@ fn open_path(path: &Path) {
         .args(["/C", "start", "", &path.to_string_lossy()])
         .creation_flags(CREATE_NO_WINDOW)
         .spawn();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn settings_form_tracks_account_draft_and_global_dirty_independently() {
+        let mut saved = Settings::default();
+        saved.upsert_account(
+            AccountProfile {
+                id: "acc-1".into(),
+                remark: "宿舍联通".into(),
+                student_id: "20240001".into(),
+                carrier: "2".into(),
+                monthly_quota_gb: 0,
+            },
+            true,
+        );
+        saved.upsert_account(
+            AccountProfile {
+                id: "acc-2".into(),
+                remark: "实验室电信".into(),
+                student_id: "20240002".into(),
+                carrier: "1".into(),
+                monthly_quota_gb: 50,
+            },
+            false,
+        );
+
+        let mut form = SettingsForm::from_settings(&saved);
+        assert_eq!(form.editing_account_id.as_deref(), Some("acc-1"));
+        assert_eq!(form.remark, "宿舍联通");
+        assert!(!form.is_dirty(&saved));
+
+        // 仅修改备注名 -> 账号草稿变脏，全局配置不变脏
+        form.remark = "南区宿舍联通".into();
+        assert!(form.is_account_draft_dirty(&saved));
+        assert!(!form.is_global_dirty(&saved));
+        assert!(form.is_dirty(&saved));
+
+        // 切换到新建空白草稿 -> 空草稿不算脏
+        form.start_new_account();
+        assert!(!form.is_account_draft_dirty(&saved));
+        assert!(!form.is_dirty(&saved));
+
+        // 修改全局巡检间隔 -> 保留所有多账号配置
+        form.check_interval = 60;
+        assert!(form.is_global_dirty(&saved));
+        let merged = form.to_global_settings(&saved);
+        assert_eq!(merged.check_interval, 60);
+        assert_eq!(merged.accounts.len(), 2);
+        assert_eq!(merged.active_account_id, "acc-1");
+    }
 }

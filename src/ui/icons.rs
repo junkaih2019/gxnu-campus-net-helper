@@ -39,6 +39,8 @@ pub enum Icon {
     ChevronDown,
     Folder,
     Monitor,
+    Plus,
+    Trash,
 }
 
 /// 在给定矩形内按比例居中绘制矢量图标。
@@ -397,6 +399,29 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             );
             painter.line_segment([pt(0.0, 0.30), pt(0.0, 0.64)], st);
             painter.line_segment([pt(-0.34, 0.64), pt(0.34, 0.64)], st);
+        }
+        Icon::Plus => {
+            painter.line_segment([pt(-0.54, 0.0), pt(0.54, 0.0)], st);
+            painter.line_segment([pt(0.0, -0.54), pt(0.0, 0.54)], st);
+        }
+        Icon::Trash => {
+            painter.line_segment([pt(-0.62, -0.42), pt(0.62, -0.42)], st);
+            let handle = vec![
+                pt(-0.24, -0.42),
+                pt(-0.24, -0.66),
+                pt(0.24, -0.66),
+                pt(0.24, -0.42),
+            ];
+            painter.add(egui::Shape::line(handle, st));
+            let body = vec![
+                pt(-0.48, -0.42),
+                pt(-0.38, 0.64),
+                pt(0.38, 0.64),
+                pt(0.48, -0.42),
+            ];
+            painter.add(egui::Shape::line(body, st));
+            painter.line_segment([pt(-0.16, -0.12), pt(-0.13, 0.38)], st);
+            painter.line_segment([pt(0.16, -0.12), pt(0.13, 0.38)], st);
         }
     }
 }

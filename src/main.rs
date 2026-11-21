@@ -454,16 +454,18 @@ fn run_daemon(
     });
 
     let menu_cb = Arc::clone(&dispatch_tray_action);
-    let mut fluent_menu =
-        match tray_menu::FluentTrayMenu::new(app_dir, Arc::clone(&latest_snapshot), move |action| {
-            menu_cb(action)
-        }) {
-            Ok(menu) => Some(menu),
-            Err(err) => {
-                logging::error(&format!("[TRAY_MENU_ERROR] {err}"));
-                None
-            }
-        };
+    let mut fluent_menu = match tray_menu::FluentTrayMenu::new(
+        app_dir,
+        Arc::clone(&latest_snapshot),
+        Arc::clone(&active_account_label),
+        move |action| menu_cb(action),
+    ) {
+        Ok(menu) => Some(menu),
+        Err(err) => {
+            logging::error(&format!("[TRAY_MENU_ERROR] {err}"));
+            None
+        }
+    };
 
     let tray_cb = Arc::clone(&dispatch_tray_action);
     tray.start_event_listener(move |action| tray_cb(action));

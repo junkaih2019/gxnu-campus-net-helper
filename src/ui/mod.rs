@@ -43,7 +43,6 @@ use widgets::{
     secondary_button,
 };
 
-const CREDENTIAL_TARGET: &str = "GXNUCampusLogin/v4";
 const MAX_LOG_LINES: usize = 4000;
 const MAX_TELEMETRY_POINTS: usize = 5000;
 const TITLEBAR_HEIGHT: f32 = 36.0;
@@ -116,7 +115,10 @@ pub struct GuardApp {
     window_size_dirty_since: Option<Instant>,
     view: AppView,
     form: settings_page::SettingsForm,
-    credential_account: Option<String>,
+    account_creds: HashMap<String, bool>,
+    account_menu_open: bool,
+    account_menu_anchor: Option<Rect>,
+    account_chip_clicked: bool,
     logs_state: logs_page::LogsState,
     telemetry: Vec<TelemetryPoint>,
     traffic: TrafficSummary,
@@ -143,14 +145,25 @@ impl GuardApp {
         let palette = Palette::of(ui_prefs.theme);
         theme::apply_theme(&cc.egui_ctx, &palette);
 
-        let credential_account = credentials::load(CREDENTIAL_TARGET)
-            .ok()
-            .flatten()
-            .filter(|stored| !stored.password.is_empty())
-            .map(|stored| stored.username);
+        let mut account_creds = HashMap::new();
+        for acc in &deps.settings.accounts {
+            account_creds.insert(
+                acc.id.clone(),
+                credentials::has_credential_for(&acc.id, &acc.student_id),
+            );
+        }
+        let legacy_cred_account = if deps.settings.accounts.is_empty() {
+            credentials::load(credentials::LEGACY_CREDENTIAL_TARGET)
+                .ok()
+                .flatten()
+                .filter(|stored| !stored.password.is_empty())
+                .map(|stored| stored.username)
+        } else {
+            None
+        };
         let mut form = settings_page::SettingsForm::from_settings(&deps.settings);
         if form.student_id.is_empty() {
-            form.student_id = credential_account.clone().unwrap_or_default();
+            form.student_id = legacy_cred_account.clone().unwrap_or_default();
         }
         // 不把已保存密码回填到输入框，仅在用户输入新密码时才允许预览并保存。
         form.password.clear();
@@ -170,8 +183,11 @@ impl GuardApp {
             log_lines = log_lines.split_off(log_lines.len() - MAX_LOG_LINES);
         }
 
-        let needs_setup =
-            needs_account_setup(&deps.settings.student_id, credential_account.as_deref());
+        let needs_setup = if let Some(active) = deps.settings.active_account() {
+            !account_creds.get(&active.id).copied().unwrap_or(false)
+        } else {
+            needs_account_setup(&deps.settings.student_id, legacy_cred_account.as_deref())
+        };
         let env_open_settings = std::env::var("GXNU_VIEW")
             .map(|v| v.eq_ignore_ascii_case("settings"))
             .unwrap_or(false)
@@ -207,7 +223,10 @@ impl GuardApp {
             window_size_dirty_since: None,
             view,
             form,
-            credential_account,
+            account_creds,
+            account_menu_open: false,
+            account_menu_anchor: None,
+            account_chip_clicked: false,
             logs_state: logs_page::LogsState::default(),
             telemetry: deps.initial_telemetry,
             traffic: deps.initial_traffic,
@@ -361,61 +380,237 @@ impl GuardApp {
         }
     }
 
-    fn save(&mut self) {
-        let settings = self.form.to_settings();
-        let start = self.needs_setup;
-        let result = credentials::load(CREDENTIAL_TARGET).and_then(|stored| {
-            if start
-                && (settings.student_id.is_empty()
-                    || (self.form.password.is_empty()
-                        && !stored
-                            .as_ref()
-                            .is_some_and(|c| c.matches_account(&settings.student_id))))
-            {
-                return Err("请输入当前学号和密码".into());
-            }
-            self.store.save_account(
-                &settings,
-                &self.settings.student_id,
-                &self.form.password,
-                stored.as_ref(),
-                |value| match value {
-                    Some(cred) => {
-                        credentials::save(CREDENTIAL_TARGET, &cred.username, &cred.password)
-                    }
-                    None => credentials::delete(CREDENTIAL_TARGET),
-                },
-            )
-        });
-        let password_changed = match result {
-            Ok(changed) => changed,
-            Err(err) => {
-                self.show_toast(format!("保存设置失败：{err}"), true);
-                return;
-            }
-        };
-        if !self.form.password.is_empty() {
-            self.form.password.clear();
-            self.form.show_password = false;
-            self.credential_account = Some(settings.student_id.clone());
+    fn refresh_account_creds(&mut self) {
+        self.account_creds.clear();
+        for acc in &self.settings.accounts {
+            self.account_creds.insert(
+                acc.id.clone(),
+                credentials::has_credential_for(&acc.id, &acc.student_id),
+            );
         }
-        let startup_error = if settings.auto_boot != self.settings.auto_boot {
-            startup::set_enabled(settings.auto_boot).err()
+    }
+
+    fn save(&mut self) {
+        if self.form.is_account_draft_dirty(&self.settings) || self.needs_setup {
+            self.save_account_profile(true);
+        } else {
+            self.save_global_settings();
+        }
+    }
+
+    fn save_global_settings(&mut self) {
+        let next = self.form.to_global_settings(&self.settings);
+        if let Err(err) = self.store.save_settings(&next) {
+            self.show_toast(format!("保存设置失败：{err}"), true);
+            return;
+        }
+        let startup_error = if next.auto_boot != self.settings.auto_boot {
+            startup::set_enabled(next.auto_boot).err()
         } else {
             None
         };
         let command = UiToDaemon::ReloadSettings {
-            start,
-            password_changed,
-            expected: settings.clone(),
+            start: false,
+            password_changed: false,
+            expected: next.clone(),
         };
-        self.settings = settings;
+        self.settings = next;
         if startup_error.is_some() {
             self.settings.auto_boot = startup::is_enabled();
             self.form.auto_boot = self.settings.auto_boot;
         }
         self.show_toast("设置已写入磁盘，等待守护进程确认", false);
         self.request(command, startup_error);
+    }
+
+    fn save_account_profile(&mut self, also_save_global: bool) {
+        let student_id = self.form.student_id.trim().to_string();
+        if student_id.is_empty() {
+            self.show_toast("请输入校园网学号", true);
+            return;
+        }
+        let is_new = self.form.editing_account_id.is_none();
+        let account_id = self.form.editing_account_id.clone().unwrap_or_else(|| {
+            if self.settings.accounts.is_empty() {
+                "default".to_string()
+            } else {
+                credentials::generate_account_id()
+            }
+        });
+        let previous_student_id = self
+            .settings
+            .find_account(&account_id)
+            .map(|a| a.student_id.clone())
+            .unwrap_or_default();
+
+        let mut next = if also_save_global {
+            self.form.to_global_settings(&self.settings)
+        } else {
+            self.settings.clone()
+        };
+        let profile = self.form.draft_profile(account_id.clone());
+        let display_name = profile.display_name();
+        let make_active = self.settings.accounts.is_empty()
+            || self.needs_setup
+            || account_id == self.settings.active_account_id;
+        next.upsert_account(profile, make_active);
+
+        let lookup_sid = if previous_student_id.is_empty() {
+            student_id.as_str()
+        } else {
+            previous_student_id.as_str()
+        };
+        let start = self.needs_setup;
+        let result = credentials::load_for_account(&account_id, lookup_sid).and_then(|stored| {
+            let has_matching = stored
+                .as_ref()
+                .is_some_and(|c| c.matches_account(&student_id));
+            if (start || is_new) && self.form.password.is_empty() && !has_matching {
+                return Err("请输入该账号的校园网密码".into());
+            }
+            let target_id = account_id.clone();
+            self.store.save_profile_credential(
+                &next,
+                &account_id,
+                &previous_student_id,
+                &self.form.password,
+                stored.as_ref(),
+                |value| match value {
+                    Some(cred) => {
+                        credentials::save_for_account(&target_id, &cred.username, &cred.password)
+                    }
+                    None => credentials::delete_for_account(&target_id),
+                },
+            )
+        });
+        let password_changed = match result {
+            Ok(changed) => changed,
+            Err(err) => {
+                self.show_toast(format!("保存账号失败：{err}"), true);
+                return;
+            }
+        };
+
+        let saved_new_password = !self.form.password.is_empty();
+        self.form.password.clear();
+        self.form.show_password = false;
+        self.form.editing_account_id = Some(account_id.clone());
+
+        let startup_error = if also_save_global && next.auto_boot != self.settings.auto_boot {
+            startup::set_enabled(next.auto_boot).err()
+        } else {
+            None
+        };
+        let affects_active = next.active_account_id == account_id;
+        let command = UiToDaemon::ReloadSettings {
+            start,
+            password_changed: password_changed && affects_active,
+            expected: next.clone(),
+        };
+        self.settings = next;
+        if startup_error.is_some() {
+            self.settings.auto_boot = startup::is_enabled();
+            self.form.auto_boot = self.settings.auto_boot;
+        }
+        self.refresh_account_creds();
+        if saved_new_password {
+            self.account_creds.insert(account_id.clone(), true);
+        }
+        if let Some(active) = self.settings.active_account() {
+            if self.account_creds.get(&active.id).copied().unwrap_or(false) {
+                self.needs_setup = false;
+            }
+        }
+        self.show_toast(
+            if is_new {
+                format!("已添加账号「{display_name}」，等待守护确认")
+            } else {
+                format!("已保存账号「{display_name}」")
+            },
+            false,
+        );
+        self.request(command, startup_error);
+    }
+
+    fn switch_account_to(&mut self, account_id: &str) {
+        self.account_menu_open = false;
+        if account_id == self.settings.active_account_id {
+            return;
+        }
+        let Some(target) = self.settings.find_account(account_id).cloned() else {
+            self.show_toast("未找到目标账号", true);
+            return;
+        };
+        let has_cred = self
+            .account_creds
+            .get(account_id)
+            .copied()
+            .unwrap_or_else(|| credentials::has_credential_for(&target.id, &target.student_id));
+        if !has_cred {
+            self.view = AppView::Settings;
+            self.form.tab = settings_page::SettingsTab::Account;
+            self.form.load_account_draft(&target);
+            self.show_toast(
+                format!("请先为「{}」输入并保存密码后再切换", target.display_name()),
+                true,
+            );
+            return;
+        }
+
+        let mut next = self.settings.clone();
+        if let Err(err) = next.switch_active_account(account_id) {
+            self.show_toast(err, true);
+            return;
+        }
+        if let Err(err) = self.store.save_settings(&next) {
+            self.show_toast(format!("保存切换配置失败：{err}"), true);
+            return;
+        }
+        self.settings = next.clone();
+        if !self.form.is_account_draft_dirty(&self.settings) {
+            self.form.load_account_draft(&target);
+        }
+        self.show_toast(format!("正在切换至「{}」…", target.display_name()), false);
+        self.request(
+            UiToDaemon::SwitchAccount {
+                account_id: account_id.to_string(),
+                expected: next,
+            },
+            None,
+        );
+    }
+
+    fn delete_account_profile(&mut self, account_id: &str) {
+        let mut next = self.settings.clone();
+        let Some(removed) = next.remove_account(account_id) else {
+            return;
+        };
+        if let Err(err) = self.store.save_settings(&next) {
+            self.show_toast(format!("删除账号失败：{err}"), true);
+            return;
+        }
+        let _ = credentials::delete_for_account(account_id);
+        self.settings = next.clone();
+        self.refresh_account_creds();
+        if self.form.editing_account_id.as_deref() == Some(account_id) {
+            if let Some(active) = self.settings.active_account().cloned() {
+                self.form.load_account_draft(&active);
+            } else {
+                self.form.start_new_account();
+            }
+        }
+        if self.settings.accounts.is_empty() {
+            self.needs_setup = true;
+        }
+        self.show_toast(format!("已删除账号「{}」", removed.display_name()), false);
+        self.request(
+            UiToDaemon::ReloadSettings {
+                start: false,
+                password_changed: false,
+                expected: next,
+            },
+            None,
+        );
     }
 
     fn drain_channels(&mut self) {
@@ -444,6 +639,11 @@ impl GuardApp {
             self.online_since_unix = env.online_since_unix;
             self.last_check_unix = env.last_check_unix;
             self.traffic = env.traffic;
+            if !env.active_account_id.is_empty()
+                && env.active_account_id != self.settings.active_account_id
+            {
+                let _ = self.settings.switch_active_account(&env.active_account_id);
+            }
 
             if snapshot.metrics.check_seq > self.last_check_seq {
                 self.last_check_seq = snapshot.metrics.check_seq;
@@ -602,6 +802,7 @@ impl GuardApp {
                 if draw_titlebar_chip_btn(ui, p, Icon::Settings, "设置", in_settings, dirty)
                     .clicked()
                 {
+                    self.account_menu_open = false;
                     self.view = if in_settings {
                         AppView::Home
                     } else {
@@ -628,7 +829,12 @@ impl GuardApp {
         let metrics = self.latest.as_ref().map(|s| &s.metrics);
         let dur = metrics.map(format_check_ms).unwrap_or_else(|| "—".into());
         let last_at_str = metrics.map(format_check_time).unwrap_or_else(|| "—".into());
-        let mut open_account_settings = false;
+        self.account_chip_clicked = false;
+        let display_name = self.settings.active_display_name();
+        let has_account =
+            !self.settings.accounts.is_empty() || !self.settings.student_id.is_empty();
+        let mut chip_clicked = false;
+        let mut chip_rect = Rect::NOTHING;
 
         accent_card(ui, p, status_fg, |ui| {
             ui.allocate_ui_with_layout(
@@ -639,7 +845,7 @@ impl GuardApp {
                     ui.add_space(4.0);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 3.0;
-                        // 第一行：连接状态 + 在线时长 + 嵌入式账号胶囊
+                        // 第一行：连接状态 + 在线时长 + 一键切号胶囊
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 7.0;
                             ui.label(bold_text(status_title(state), 15.0, p.text));
@@ -656,14 +862,16 @@ impl GuardApp {
                                     );
                                 }
                             }
-                            if draw_account_chip(
+                            let (clicked, rect) = draw_account_chip(
                                 ui,
                                 p,
-                                &self.settings.student_id,
+                                &display_name,
                                 carrier_label(&self.settings.carrier),
-                            ) {
-                                open_account_settings = true;
-                            }
+                                has_account,
+                                self.account_menu_open,
+                            );
+                            chip_clicked = clicked;
+                            chip_rect = rect;
                         });
 
                         // 第二行：巡检倒计时与最近检测，异常时直接显示可读故障说明
@@ -724,9 +932,282 @@ impl GuardApp {
             );
         });
 
-        if open_account_settings {
+        self.account_menu_anchor = Some(chip_rect);
+        if chip_clicked {
+            self.account_chip_clicked = true;
+            if self.settings.accounts.is_empty() {
+                self.account_menu_open = false;
+                self.view = AppView::Settings;
+                self.form.tab = settings_page::SettingsTab::Account;
+            } else {
+                self.account_menu_open = !self.account_menu_open;
+            }
+        }
+    }
+
+    fn draw_account_switcher_popover(&mut self, ctx: &egui::Context, p: &Palette) {
+        if self.view != AppView::Home || !self.account_menu_open {
+            return;
+        }
+        let Some(anchor) = self.account_menu_anchor else {
+            return;
+        };
+
+        let pop_w = 258.0_f32;
+        let screen = ctx.screen_rect();
+        let x = anchor
+            .left()
+            .min(screen.right() - pop_w - 10.0)
+            .max(screen.left() + 10.0);
+        let y = anchor.bottom() + 5.0;
+
+        let mut switch_target: Option<String> = None;
+        let mut open_manage = false;
+        let mut close_now = false;
+
+        let shadow = match p.mode {
+            ThemeMode::Light => egui::Shadow {
+                offset: [0, 6],
+                blur: 18,
+                spread: 0,
+                color: with_alpha(egui::Color32::BLACK, 34),
+            },
+            ThemeMode::Dark => egui::Shadow {
+                offset: [0, 8],
+                blur: 22,
+                spread: 0,
+                color: with_alpha(egui::Color32::BLACK, 120),
+            },
+        };
+
+        let area_resp = egui::Area::new(egui::Id::new("account_switcher_popover"))
+            .fixed_pos(Pos2::new(x, y))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(p.card)
+                    .stroke(Stroke::new(1.0_f32, p.border_strong))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(egui::Margin::same(8))
+                    .shadow(shadow)
+                    .show(ui, |ui| {
+                        let inner_w = pop_w - 16.0;
+                        ui.set_width(inner_w);
+                        ui.spacing_mut().item_spacing.y = 4.0;
+
+                        // 顶栏标题
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(inner_w, 20.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.add_space(4.0);
+                                ui.label(bold_text("切换校园网账号", 11.5, p.text_secondary));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.add_space(4.0);
+                                        ui.label(body_text(
+                                            format!("共 {} 个", self.settings.accounts.len()),
+                                            10.5,
+                                            p.text_muted,
+                                        ));
+                                    },
+                                );
+                            },
+                        );
+
+                        let sep1 = ui.allocate_space(Vec2::new(inner_w, 1.0)).1;
+                        ui.painter().line_segment(
+                            [sep1.left_center(), sep1.right_center()],
+                            Stroke::new(1.0_f32, p.divider),
+                        );
+
+                        egui::ScrollArea::vertical()
+                            .id_salt("account_switcher_list")
+                            .max_height(240.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| {
+                                ui.set_width(inner_w);
+                                ui.spacing_mut().item_spacing.y = 3.0;
+                                for acc in &self.settings.accounts {
+                                    let is_active = acc.id == self.settings.active_account_id;
+                                    let has_cred =
+                                        self.account_creds.get(&acc.id).copied().unwrap_or(false);
+                                    let (rect, resp) = ui.allocate_exact_size(
+                                        Vec2::new(inner_w, 42.0),
+                                        Sense::click(),
+                                    );
+                                    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+                                    let (bg, border) = if is_active {
+                                        (p.accent_soft, Stroke::new(1.0_f32, p.accent_border))
+                                    } else if resp.hovered() {
+                                        (p.card_hover, Stroke::new(1.0_f32, p.border))
+                                    } else {
+                                        (egui::Color32::TRANSPARENT, Stroke::NONE)
+                                    };
+                                    if bg != egui::Color32::TRANSPARENT {
+                                        ui.painter().rect(
+                                            rect,
+                                            CornerRadius::same(7),
+                                            bg,
+                                            border,
+                                            StrokeKind::Inside,
+                                        );
+                                    }
+
+                                    let icon_c = if is_active {
+                                        p.ok
+                                    } else if resp.hovered() {
+                                        p.accent
+                                    } else {
+                                        p.text_muted
+                                    };
+                                    let ic_r = Rect::from_center_size(
+                                        Pos2::new(rect.left() + 16.0, rect.center().y),
+                                        Vec2::splat(13.0),
+                                    );
+                                    icons::paint(
+                                        ui.painter(),
+                                        ic_r,
+                                        if is_active { Icon::Check } else { Icon::User },
+                                        icon_c,
+                                    );
+
+                                    let tx = rect.left() + 31.0;
+                                    let title_font =
+                                        egui::FontId::new(12.0, crate::ui::theme::bold_family());
+                                    ui.painter().text(
+                                        Pos2::new(tx, rect.top() + 13.5),
+                                        egui::Align2::LEFT_CENTER,
+                                        acc.display_name(),
+                                        title_font,
+                                        p.text,
+                                    );
+                                    let sub = if acc.remark.trim().is_empty() {
+                                        carrier_label(&acc.carrier).to_string()
+                                    } else {
+                                        format!(
+                                            "{} · {}",
+                                            acc.masked_student_id(),
+                                            carrier_label(&acc.carrier)
+                                        )
+                                    };
+                                    ui.painter().text(
+                                        Pos2::new(tx, rect.bottom() - 12.0),
+                                        egui::Align2::LEFT_CENTER,
+                                        sub,
+                                        egui::FontId::proportional(10.5),
+                                        p.text_muted,
+                                    );
+
+                                    // 右侧状态标签
+                                    let right_tag = if is_active {
+                                        Some(("当前", p.ok, p.ok_soft, p.ok_border))
+                                    } else if !has_cred {
+                                        Some(("缺密码", p.warn, p.warn_soft, p.warn_border))
+                                    } else if resp.hovered() {
+                                        Some(("切换", p.accent, p.accent_soft, p.accent_border))
+                                    } else {
+                                        None
+                                    };
+                                    if let Some((lbl, fg, sbg, sb)) = right_tag {
+                                        let tf = egui::FontId::new(
+                                            10.0,
+                                            crate::ui::theme::bold_family(),
+                                        );
+                                        let g =
+                                            ui.painter().layout_no_wrap(lbl.to_string(), tf, fg);
+                                        let pr = Rect::from_center_size(
+                                            Pos2::new(
+                                                rect.right() - 8.0 - (g.size().x + 10.0) * 0.5,
+                                                rect.center().y,
+                                            ),
+                                            Vec2::new(g.size().x + 10.0, 18.0),
+                                        );
+                                        ui.painter().rect(
+                                            pr,
+                                            CornerRadius::same(4),
+                                            sbg,
+                                            Stroke::new(1.0_f32, sb),
+                                            StrokeKind::Inside,
+                                        );
+                                        ui.painter().galley(
+                                            Pos2::new(
+                                                pr.center().x - g.size().x * 0.5,
+                                                pr.center().y - g.size().y * 0.5,
+                                            ),
+                                            g,
+                                            fg,
+                                        );
+                                    }
+
+                                    if resp.clicked() {
+                                        if is_active {
+                                            close_now = true;
+                                        } else {
+                                            switch_target = Some(acc.id.clone());
+                                        }
+                                    }
+                                }
+                            });
+
+                        let sep2 = ui.allocate_space(Vec2::new(inner_w, 1.0)).1;
+                        ui.painter().line_segment(
+                            [sep2.left_center(), sep2.right_center()],
+                            Stroke::new(1.0_f32, p.divider),
+                        );
+
+                        // 底部「管理 / 添加账号…」入口
+                        let (btn_rect, btn_resp) =
+                            ui.allocate_exact_size(Vec2::new(inner_w, 30.0), Sense::click());
+                        let btn_resp = btn_resp.on_hover_cursor(CursorIcon::PointingHand);
+                        if btn_resp.hovered() {
+                            ui.painter()
+                                .rect_filled(btn_rect, CornerRadius::same(6), p.subtle);
+                        }
+                        let plus_r = Rect::from_center_size(
+                            Pos2::new(btn_rect.left() + 16.0, btn_rect.center().y),
+                            Vec2::splat(11.5),
+                        );
+                        let lbl_c = if btn_resp.hovered() {
+                            p.accent
+                        } else {
+                            p.text_secondary
+                        };
+                        icons::paint(ui.painter(), plus_r, Icon::Plus, lbl_c);
+                        ui.painter().text(
+                            Pos2::new(btn_rect.left() + 31.0, btn_rect.center().y),
+                            egui::Align2::LEFT_CENTER,
+                            "管理 / 添加账号…",
+                            egui::FontId::new(11.5, crate::ui::theme::bold_family()),
+                            lbl_c,
+                        );
+                        if btn_resp.clicked() {
+                            open_manage = true;
+                        }
+                    });
+            });
+
+        if let Some(id) = switch_target {
+            self.switch_account_to(&id);
+        } else if open_manage {
+            self.account_menu_open = false;
             self.view = AppView::Settings;
             self.form.tab = settings_page::SettingsTab::Account;
+        } else if close_now {
+            self.account_menu_open = false;
+        } else if !self.account_chip_clicked {
+            let area_rect = area_resp.response.rect;
+            let dismiss = ctx.input(|i| {
+                i.key_pressed(egui::Key::Escape)
+                    || (i.pointer.primary_pressed()
+                        && i.pointer
+                            .interact_pos()
+                            .is_some_and(|pos| !area_rect.contains(pos) && !anchor.contains(pos)))
+            });
+            if dismiss {
+                self.account_menu_open = false;
+            }
         }
     }
 
@@ -932,6 +1413,7 @@ impl eframe::App for GuardApp {
                             log_h,
                         );
                     });
+                self.draw_account_switcher_popover(ctx, &p);
             }
             AppView::Settings => {
                 let saving = self
@@ -951,7 +1433,7 @@ impl eframe::App for GuardApp {
                             &mut self.ui_prefs,
                             &self.store.app_dir,
                             &self.log_path,
-                            self.credential_account.as_deref(),
+                            &self.account_creds,
                             self.needs_setup,
                             saving,
                             total_h,
@@ -973,6 +1455,15 @@ impl eframe::App for GuardApp {
                         h / zoom,
                     )));
                     self.show_toast(format!("窗口已调整为 {} × {}", w as i32, h as i32), false);
+                }
+                if actions.save_profile {
+                    self.save_account_profile(self.needs_setup);
+                }
+                if let Some(id) = actions.switch_account {
+                    self.switch_account_to(&id);
+                }
+                if let Some(id) = actions.delete_account {
+                    self.delete_account_profile(&id);
                 }
                 if actions.save {
                     self.save();
@@ -1072,22 +1563,18 @@ fn draw_titlebar_chip_btn(
     resp
 }
 
-/// 顶部状态条内的嵌入式账号胶囊（阶段二将升级为一键下拉切号菜单）。
-fn draw_account_chip(ui: &mut egui::Ui, p: &Palette, student_id: &str, carrier: &str) -> bool {
-    let trimmed = student_id.trim();
-    let has_account = !trimmed.is_empty();
-    let display = if !has_account {
-        "未配置账号".to_string()
-    } else if trimmed.chars().count() <= 4 {
-        trimmed.to_string()
-    } else {
-        let head: String = trimmed.chars().take(4).collect();
-        format!("{head}***")
-    };
-
+/// 顶部状态条内的一键切号胶囊（优先展示账号备注名，点击弹出切换浮层）。
+fn draw_account_chip(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    display_name: &str,
+    carrier: &str,
+    has_account: bool,
+    open: bool,
+) -> (bool, Rect) {
     let mut job = egui::text::LayoutJob::default();
     job.append(
-        &display,
+        display_name,
         0.0,
         egui::TextFormat {
             font_id: egui::FontId::new(11.5, crate::ui::theme::bold_family()),
@@ -1095,28 +1582,32 @@ fn draw_account_chip(ui: &mut egui::Ui, p: &Palette, student_id: &str, carrier: 
             ..Default::default()
         },
     );
-    job.append(
-        &format!(" · {carrier}"),
-        0.0,
-        egui::TextFormat {
-            font_id: egui::FontId::proportional(11.0),
-            color: p.text_muted,
-            ..Default::default()
-        },
-    );
+    if has_account {
+        job.append(
+            &format!(" · {carrier}"),
+            0.0,
+            egui::TextFormat {
+                font_id: egui::FontId::proportional(11.0),
+                color: p.text_muted,
+                ..Default::default()
+            },
+        );
+    }
     let galley = ui.painter().layout_job(job);
     let w = 8.0 + 12.0 + 5.0 + galley.size().x + 5.0 + 10.0 + 7.0;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 23.0), Sense::click());
     let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-    let stroke = if resp.hovered() {
-        Stroke::new(1.0_f32, p.accent)
+    let (fill, stroke) = if open {
+        (p.accent_soft, Stroke::new(1.1_f32, p.accent))
+    } else if resp.hovered() {
+        (p.card_hover, Stroke::new(1.0_f32, p.accent))
     } else {
-        Stroke::new(1.0_f32, p.border)
+        (p.subtle, Stroke::new(1.0_f32, p.border))
     };
     ui.painter().rect(
         rect,
         CornerRadius::same(6),
-        p.subtle,
+        fill,
         stroke,
         StrokeKind::Inside,
     );
@@ -1126,7 +1617,9 @@ fn draw_account_chip(ui: &mut egui::Ui, p: &Palette, student_id: &str, carrier: 
         ui.painter(),
         user_r,
         Icon::User,
-        if has_account {
+        if open {
+            p.accent
+        } else if has_account {
             p.text_secondary
         } else {
             p.warn
@@ -1140,8 +1633,12 @@ fn draw_account_chip(ui: &mut egui::Ui, p: &Palette, student_id: &str, carrier: 
     let chev_r = Rect::from_center_size(Pos2::new(rect.right() - 11.0, cy), Vec2::splat(9.5));
     icons::paint(ui.painter(), chev_r, Icon::ChevronDown, p.accent);
     let clicked = resp.clicked();
-    resp.on_hover_text("点击管理校园网账号与运营商出口");
-    clicked
+    resp.on_hover_text(if has_account {
+        "点击一键切换校园网账号或进入账号管理"
+    } else {
+        "点击添加校园网账号与运营商出口"
+    });
+    (clicked, rect)
 }
 
 /// 无边框窗口四边与四角拖拽调整大小。
