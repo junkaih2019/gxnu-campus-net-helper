@@ -25,7 +25,7 @@ const AUTH_FAILURES_BEFORE_ALERT: u32 = 2;
 /// 认证通过后的快速两段复验等待（先等 1s 立即验证，若门户尚未放行完再隔 1.5s 复验一次）。
 const VERIFY_DELAYS_MS: [u64; 2] = [1000, 1500];
 
-pub type CredentialProvider = Arc<dyn Fn() -> Option<StoredCredential> + Send + Sync>;
+pub type CredentialProvider = Arc<dyn Fn(&Settings) -> Option<StoredCredential> + Send + Sync>;
 pub type SnapshotSink = Arc<dyn Fn(MonitorSnapshot) + Send + Sync>;
 
 pub(crate) trait NetworkCheck: Send + Sync {
@@ -51,6 +51,7 @@ struct ControlState {
     enabled: bool,
     stopped: bool,
     manual: bool,
+    pending_switch: bool,
     wake: bool,
     generation: u64,
     session: u64,
@@ -99,6 +100,7 @@ impl ControlState {
 struct Cycle {
     session: u64,
     switching: bool,
+    switching_account: bool,
     started: Instant,
     generation: u64,
     manual: bool,
@@ -126,11 +128,11 @@ impl Shared {
             if state.stopped {
                 return None;
             }
-            if !state.enabled && !state.manual && !state.event_pending {
+            if !state.enabled && !state.manual && !state.event_pending && !state.pending_switch {
                 state = self.wake_cv.wait(state).unwrap();
                 continue;
             }
-            if !state.manual {
+            if !state.manual && !state.pending_switch {
                 if let Some(t) = &state.transition {
                     let delay = t.next_check.saturating_duration_since((self.now)());
                     if !delay.is_zero() {
@@ -157,6 +159,7 @@ impl Shared {
             enabled: state.enabled,
             manual: std::mem::take(&mut state.manual),
             switching: state.transition.is_some(),
+            switching_account: std::mem::take(&mut state.pending_switch),
             started,
         })
     }
@@ -399,6 +402,21 @@ impl MonitorControl {
         }
         self.shared.flush_latency(&mut mode);
         mode.generation += 1;
+        mode.wake = true;
+        self.shared.wake_cv.notify_all();
+        Ok(())
+    }
+
+    /// 原子切换校园网账号：先校验目标账号凭据，再注销旧会话、登录新账号并二次验证。
+    pub fn switch_account(&self, settings: Settings) -> Result<(), String> {
+        let mut mode = self.shared.control.lock().unwrap();
+        ensure_running(&mode)?;
+        let settings = settings.normalized();
+        *self.shared.settings.lock().unwrap() = settings;
+        self.shared.flush_latency(&mut mode);
+        mode.transition = None;
+        mode.generation += 1;
+        mode.pending_switch = true;
         mode.wake = true;
         self.shared.wake_cv.notify_all();
         Ok(())
@@ -794,6 +812,12 @@ fn run(shared: Arc<Shared>) {
             .lock()
             .map(|guard| guard.clone())
             .unwrap_or_default();
+
+        if cycle.switching_account {
+            handle_account_switch(&shared, cycle, &settings, &mut failures, &mut backoff);
+            continue;
+        }
+
         let started = Instant::now();
         let Some(result) = shared.checked_scan(cycle) else {
             continue;
@@ -919,7 +943,7 @@ fn run(shared: Arc<Shared>) {
             );
             shared.wait_duration(remaining);
         };
-        let credential = (shared.credentials)();
+        let credential = (shared.credentials)(&settings);
         if !shared.route_current(cycle) {
             continue;
         }
@@ -1070,6 +1094,150 @@ fn run(shared: Arc<Shared>) {
     }
 }
 
+/// 原子账号切换：先读取并校验目标账号凭据（避免目标无密码时误断当前网络），
+/// 再依次执行 `/drcom/logout` 注销旧会话 → 扫描当前有效 IP → 登录新账号 → 两段公网复验。
+fn handle_account_switch(
+    shared: &Shared,
+    cycle: Cycle,
+    settings: &Settings,
+    failures: &mut u32,
+    backoff: &mut AuthBackoff,
+) {
+    let publish =
+        |state, reason, message: &str| shared.publish(cycle.generation, state, reason, message);
+    let label = settings.active_display_name();
+
+    let credential =
+        (shared.credentials)(settings).filter(|cred| cred.matches_account(&settings.student_id));
+    if !shared.current(cycle) {
+        return;
+    }
+    let Some(credential) = credential else {
+        logging::warn(&format!(
+            "[SWITCH_ABORTED] 目标账号「{label}」尚未保存密码，已保留当前会话"
+        ));
+        publish(
+            MonitorState::Offline,
+            Some(DisconnectReason::CredentialsMissing),
+            &format!("账号「{label}」尚未保存密码，请先在设置中填写密码"),
+        );
+        return;
+    };
+
+    *failures = 0;
+    *backoff = AuthBackoff::default();
+
+    publish(
+        MonitorState::Authenticating,
+        None,
+        &format!("正在切换至「{label}」：注销旧会话…"),
+    );
+    let logout_res = shared.authenticator.logout();
+    logging::info(&format!(
+        "[PORTAL_LOGOUT] 切号前注销旧会话：success={}；{}",
+        logout_res.success, logout_res.message
+    ));
+    if !shared.current(cycle) {
+        return;
+    }
+
+    shared.wait_duration(Duration::from_millis(400));
+    if !shared.current(cycle) {
+        return;
+    }
+
+    let Some(scan) = shared.checked_scan(cycle) else {
+        return;
+    };
+
+    publish(
+        MonitorState::Authenticating,
+        None,
+        &format!("正在登录账号「{label}」…"),
+    );
+    let Some(auth) = shared.authenticator.authenticate_if(
+        &credential.username,
+        &credential.password,
+        &settings.carrier,
+        scan.auth_ip(),
+        || shared.route_current(cycle),
+    ) else {
+        return;
+    };
+    if !shared.current(cycle) {
+        return;
+    }
+
+    if auth.success {
+        logging::info(&format!(
+            "[LOGIN_ACCEPTED] 切号认证已受理（{label}）：{}；门户返回码={}",
+            auth.message, auth.code
+        ));
+        publish(
+            MonitorState::Verifying,
+            None,
+            &format!("账号「{label}」认证通过，正在验证公网连接"),
+        );
+        let mut last_verified: Option<DiagnosticResult> = None;
+        for &delay_ms in &VERIFY_DELAYS_MS {
+            shared.wait_duration(Duration::from_millis(delay_ms));
+            if !shared.current(cycle) {
+                return;
+            }
+            let Some(verified) = shared.checked_scan(cycle) else {
+                return;
+            };
+            if verified.online {
+                last_verified = Some(verified);
+                break;
+            }
+            last_verified = Some(verified);
+        }
+        if let Some(verified) = last_verified {
+            if verified.online {
+                let Some((seq, _)) = shared.record_metrics(cycle, &verified, false) else {
+                    return;
+                };
+                record_auth_event(shared, true, DisconnectReason::Online);
+                logging::info(&format!(
+                    "[ACCOUNT_SWITCHED] 已切换至账号「{label}」，公网已连接"
+                ));
+                publish(
+                    MonitorState::Online,
+                    Some(DisconnectReason::Online),
+                    &format!("已切换至账号「{label}」，校园网已连接"),
+                );
+                shared.measure_latency(cycle, seq);
+                if cycle.enabled {
+                    shared.wait(settings.check_interval as u64);
+                }
+                return;
+            }
+            logging::warn(&format!(
+                "[SWITCH_NOT_VERIFIED] 切号认证后仍离线（{label}）：{} {}",
+                verified.reason.as_str(),
+                verified.message
+            ));
+            publish(
+                MonitorState::Offline,
+                Some(verified.reason),
+                &format!("切换至「{label}」后公网未恢复：{}", verified.message),
+            );
+        }
+    } else {
+        record_auth_event(shared, false, auth.reason);
+        logging::warn(&format!(
+            "[SWITCH_FAILED] 切换账号「{label}」失败：{}；门户返回码={}",
+            auth.message, auth.code
+        ));
+        publish(
+            MonitorState::Offline,
+            Some(auth.reason),
+            &format!("切换至「{label}」失败：{}", auth.message),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     mod switching;
@@ -1216,7 +1384,7 @@ mod tests {
         let f = Fixture::new(
             false,
             "fixture-a",
-            Arc::new(move || {
+            Arc::new(move |_| {
                 entered.send(()).unwrap();
                 resumed
                     .lock()
@@ -1246,7 +1414,7 @@ mod tests {
         let mut f = Fixture::new(
             false,
             "fixture-a",
-            Arc::new(move || {
+            Arc::new(move |_| {
                 entered.send(()).unwrap();
                 resumed
                     .lock()
@@ -1272,7 +1440,7 @@ mod tests {
         let f = Fixture::new(
             false,
             "fixture-a",
-            Arc::new(move || {
+            Arc::new(move |_| {
                 let gate = resumed.lock().unwrap().take()?;
                 entered.send(()).unwrap();
                 gate.recv_timeout(Duration::from_secs(3)).unwrap();
@@ -1291,7 +1459,7 @@ mod tests {
 
     #[test]
     fn mismatched_configured_id_never_uses_another_accounts_password() {
-        let f = Fixture::new(false, "fixture-b", Arc::new(|| Some(fake_credential())));
+        let f = Fixture::new(false, "fixture-b", Arc::new(|_| Some(fake_credential())));
         f.monitor.control().start().unwrap();
         f.until(|s| s.reason == Some(DisconnectReason::CredentialsMissing));
         f.assert_no_submission();
@@ -1303,7 +1471,7 @@ mod tests {
             let f = Fixture::new(
                 online,
                 "",
-                Arc::new(|| panic!("read-only scan read credentials")),
+                Arc::new(|_| panic!("read-only scan read credentials")),
             );
             f.monitor.control().force_check().unwrap();
             let s = f.until(|s| s.metrics.check_seq == 1);
@@ -1317,7 +1485,7 @@ mod tests {
         }
     }
 
-    fn reply_once(listener: &TcpListener, body: &str) {
+    fn reply_once(listener: &TcpListener, body: &str) -> String {
         listener.set_nonblocking(true).unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         let mut stream = loop {
@@ -1336,6 +1504,11 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         let mut reader = std::io::BufReader::new(&stream);
+        let mut request_line = String::new();
+        assert_ne!(
+            std::io::BufRead::read_line(&mut reader, &mut request_line).unwrap(),
+            0
+        );
         let mut line = String::new();
         loop {
             line.clear();
@@ -1353,6 +1526,7 @@ mod tests {
             body.len()
         )
         .unwrap();
+        request_line
     }
 
     #[test]
@@ -1363,7 +1537,7 @@ mod tests {
         let f = Fixture::new(
             false,
             &fake_credential().username,
-            Arc::new(move || Some(stored.lock().unwrap().clone())),
+            Arc::new(move |_| Some(stored.lock().unwrap().clone())),
         );
         let ctrl = f.monitor.control();
         let refused = r#"dr1004({"result":0,"msg":1,"msga":"fake refusal"})"#;
@@ -1433,7 +1607,7 @@ mod tests {
         let f = Fixture::new(
             false,
             "",
-            Arc::new(move || {
+            Arc::new(move |_| {
                 calls.fetch_add(1, Ordering::SeqCst);
                 None
             }),
@@ -1465,7 +1639,7 @@ mod tests {
         let f = Fixture::new(
             false,
             "",
-            Arc::new(move || {
+            Arc::new(move |_| {
                 entered.send(()).unwrap();
                 gate.lock()
                     .unwrap()
@@ -1525,7 +1699,7 @@ mod tests {
                     release: Mutex::new(gate),
                 },
                 "",
-                Arc::new(|| Some(fake_credential())),
+                Arc::new(|_| Some(fake_credential())),
             );
             let ctrl = f.monitor.control();
             f.monitor.control().start().unwrap();
@@ -1570,7 +1744,7 @@ mod tests {
     fn existing_paused_daemon_applies_headless_start_and_acknowledges_strict_reload() {
         use crate::ipc::{self, IpcClient, IpcServer, UiToDaemon};
         use std::sync::atomic::{AtomicUsize, Ordering};
-        let f = Fixture::new(true, "", Arc::new(|| None));
+        let f = Fixture::new(true, "", Arc::new(|_| None));
         let dir = f._dir.path();
         let path = dir.join("config.json");
         let (server, listener) = IpcServer::bind(dir).unwrap();
@@ -1583,6 +1757,8 @@ mod tests {
             },
             control: f.monitor.control(),
             notifier: Arc::new(Mutex::new(crate::notify::ToastNotifier::new(false))),
+            active_account_id: Arc::new(Mutex::new(String::new())),
+            active_account_label: Arc::new(Mutex::new("未配置账号".into())),
             active_account_key: Arc::new(Mutex::new(crate::traffic::account_key_of(""))),
             traffic_tracker: Arc::new(Mutex::new(crate::traffic::TrafficTracker::new(dir))),
             latest_traffic: Arc::new(Mutex::new(crate::models::TrafficSummary::default())),
@@ -1651,5 +1827,71 @@ mod tests {
         }
         f.monitor.control().signal_stop();
         assert!(ipc::forward_launch(dir, true, true).is_err());
+    }
+
+    #[test]
+    fn switch_account_logs_out_then_authenticates_new_account_and_verifies() {
+        use crate::models::AccountProfile;
+        let f = Fixture::new(
+            true,
+            "20240001",
+            Arc::new(|cfg| {
+                Some(StoredCredential {
+                    username: cfg.student_id.clone(),
+                    password: format!("pass-{}", cfg.student_id),
+                })
+            }),
+        );
+        let ctrl = f.monitor.control();
+        ctrl.start().unwrap();
+        f.until(|s| s.state == MonitorState::Online);
+
+        let mut next = Settings::default();
+        next.upsert_account(
+            AccountProfile {
+                id: "acc-lab".into(),
+                remark: "实验室电信".into(),
+                student_id: "20249999".into(),
+                carrier: "1".into(),
+                monthly_quota_gb: 0,
+            },
+            true,
+        );
+        ctrl.switch_account(next).unwrap();
+
+        let req1 = reply_once(&f.portal, r#"dr1005({"result":1,"msg":"注销成功"});"#);
+        assert!(req1.starts_with("GET /logout?"), "unexpected req1: {req1}");
+        let req2 = reply_once(&f.portal, r#"dr1004({"result":1,"msg":"认证成功"});"#);
+        assert!(
+            req2.starts_with("GET /login?")
+                && req2.contains("DDDDD=20249999")
+                && req2.contains("R3=1"),
+            "unexpected req2: {req2}"
+        );
+        let switched =
+            f.until(|s| s.state == MonitorState::Online && s.message.contains("实验室电信"));
+        assert!(switched.message.contains("实验室电信"));
+    }
+
+    #[test]
+    fn switch_account_without_credentials_does_not_logout_existing_session() {
+        use crate::models::AccountProfile;
+        let f = Fixture::new(true, "20240001", Arc::new(|_| None));
+        let ctrl = f.monitor.control();
+        let mut next = Settings::default();
+        next.upsert_account(
+            AccountProfile {
+                id: "acc-empty".into(),
+                remark: "缺密码账号".into(),
+                student_id: "20248888".into(),
+                carrier: "3".into(),
+                monthly_quota_gb: 0,
+            },
+            true,
+        );
+        ctrl.switch_account(next).unwrap();
+        let snap = f.until(|s| s.reason == Some(DisconnectReason::CredentialsMissing));
+        assert!(snap.message.contains("缺密码账号"));
+        f.assert_no_submission();
     }
 }

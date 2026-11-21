@@ -8,6 +8,7 @@ use crate::logging;
 use crate::models::DisconnectReason;
 
 pub const PORTAL_URL: &str = "https://yc.gxnu.edu.cn/drcom/login";
+pub const LOGOUT_URL: &str = "https://yc.gxnu.edu.cn/drcom/logout";
 
 #[derive(Debug, Clone)]
 pub struct AuthenticationResult {
@@ -18,9 +19,16 @@ pub struct AuthenticationResult {
     pub code: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct LogoutResult {
+    pub success: bool,
+    pub message: String,
+}
+
 pub struct CampusAuthenticator {
     agent: ureq::Agent,
     portal_url: String,
+    logout_url: String,
 }
 
 impl Default for CampusAuthenticator {
@@ -34,13 +42,53 @@ impl CampusAuthenticator {
         Self {
             agent: http::agent(10),
             portal_url: PORTAL_URL.to_string(),
+            logout_url: LOGOUT_URL.to_string(),
         }
     }
 
     pub fn with_url(url: impl Into<String>) -> Self {
+        let portal_url = url.into();
+        let logout_url = if let Some(prefix) = portal_url.strip_suffix("/login") {
+            format!("{prefix}/logout")
+        } else {
+            LOGOUT_URL.to_string()
+        };
         Self {
             agent: http::agent(10),
-            portal_url: url.into(),
+            portal_url,
+            logout_url,
+        }
+    }
+
+    /// 主动注销当前 Dr.COM 校园网会话（切换账号前调用，失败或本已离线均不阻塞后续登录）。
+    pub fn logout(&self) -> LogoutResult {
+        let url = format!(
+            "{}?callback=dr1005&jsVersion=4.2.2&v=4532&lang=zh",
+            self.logout_url
+        );
+        match http::get(&self.agent, &url) {
+            Ok(response) => {
+                if !(200..300).contains(&response.status) {
+                    return LogoutResult {
+                        success: false,
+                        message: format!("注销接口返回 HTTP {}", response.status),
+                    };
+                }
+                match portal_reply(&response.body) {
+                    Some((success, message, _)) => LogoutResult {
+                        success,
+                        message: sanitize(&message, &[]),
+                    },
+                    None => LogoutResult {
+                        success: false,
+                        message: "门户注销响应格式未识别（可能当前已离线）".to_string(),
+                    },
+                }
+            }
+            Err(err) => LogoutResult {
+                success: false,
+                message: format!("请求注销接口失败：{}", err.as_str()),
+            },
         }
     }
 
@@ -336,5 +384,36 @@ mod tests {
         }
         assert!(portal_reply(" SUCCESS ").unwrap().0);
         assert!(!portal_reply(r#"{"result":0,"msg":7}"#).unwrap().0);
+    }
+
+    #[test]
+    fn logout_sends_drcom_logout_and_parses_reply() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = r#"dr1005({"result":1,"msg":"注销成功"});"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            req
+        });
+
+        let auth = CampusAuthenticator::with_url(format!("http://127.0.0.1:{port}/drcom/login"));
+        let res = auth.logout();
+        let req = handle.join().unwrap();
+
+        assert!(res.success);
+        assert!(res.message.contains("注销成功"));
+        assert!(req.contains("GET /drcom/logout?callback=dr1005"));
     }
 }

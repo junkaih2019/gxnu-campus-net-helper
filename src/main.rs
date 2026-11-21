@@ -211,6 +211,8 @@ fn run_daemon(
     )));
     let metrics_store = Arc::new(metrics_store::MetricsStore::new(&store.app_dir));
     let traffic_tracker = Arc::new(Mutex::new(traffic::TrafficTracker::new(&store.app_dir)));
+    let active_account_id = Arc::new(Mutex::new(settings.active_account_id.clone()));
+    let active_account_label = Arc::new(Mutex::new(settings.active_display_name()));
     let active_account_key = Arc::new(Mutex::new(traffic::account_key_of(&settings.student_id)));
     let latest_traffic = Arc::new(Mutex::new(traffic_tracker.lock().unwrap().summary(
         &active_account_key.lock().unwrap(),
@@ -243,12 +245,18 @@ fn run_daemon(
         });
 
     let credential_provider: monitor::CredentialProvider =
-        Arc::new(move || match credentials::load(CREDENTIAL_TARGET) {
-            Ok(Some(stored)) => Some(stored),
-            Ok(None) => None,
-            Err(err) => {
-                logging::error(&format!("[CREDENTIAL_ERROR] 无法读取 Windows 凭据：{err}"));
-                None
+        Arc::new(move |cfg: &models::Settings| {
+            let acct_id = cfg
+                .active_account()
+                .map(|a| a.id.as_str())
+                .unwrap_or(cfg.active_account_id.as_str());
+            match credentials::load_for_account(acct_id, &cfg.student_id) {
+                Ok(Some(stored)) => Some(stored),
+                Ok(None) => None,
+                Err(err) => {
+                    logging::error(&format!("[CREDENTIAL_ERROR] 无法读取 Windows 凭据：{err}"));
+                    None
+                }
             }
         });
 
@@ -260,6 +268,7 @@ fn run_daemon(
     let sink_ipc = Arc::clone(&ipc_server);
     let sink_is_online = Arc::clone(&is_online);
     let sink_traffic = Arc::clone(&latest_traffic);
+    let sink_acct_id = Arc::clone(&active_account_id);
 
     let sink: monitor::SnapshotSink = Arc::new(move |snapshot| {
         if let Ok(mut n) = sink_notifier.lock() {
@@ -310,11 +319,13 @@ fn run_daemon(
         post_thread_msg(main_tid, WM_TRAY_REFRESH);
 
         let traffic_summary = sink_traffic.lock().map(|g| g.clone()).unwrap_or_default();
+        let active_id = sink_acct_id.lock().map(|g| g.clone()).unwrap_or_default();
         sink_ipc.broadcast_snapshot(ipc::SnapshotEnvelope {
             snapshot,
             online_since_unix: online_ts,
             last_check_unix: check_ts,
             traffic: traffic_summary,
+            active_account_id: active_id,
         });
     });
 
@@ -329,6 +340,7 @@ fn run_daemon(
         let online_since = Arc::clone(&online_since_unix);
         let last_check = Arc::clone(&last_check_unix);
         let shared_traffic = Arc::clone(&latest_traffic);
+        let acct_id_ref = Arc::clone(&active_account_id);
         let ipc = Arc::clone(&ipc_server);
         std::thread::Builder::new()
             .name("traffic-sampler".to_string())
@@ -363,6 +375,10 @@ fn run_daemon(
                                 online_since_unix: online_since.lock().ok().and_then(|g| *g),
                                 last_check_unix: last_check.lock().ok().and_then(|g| *g),
                                 traffic: summary,
+                                active_account_id: acct_id_ref
+                                    .lock()
+                                    .map(|g| g.clone())
+                                    .unwrap_or_default(),
                             });
                         }
                     }
@@ -393,6 +409,8 @@ fn run_daemon(
         control: monitor_ctrl.clone(),
         store,
         notifier,
+        active_account_id: Arc::clone(&active_account_id),
+        active_account_label: Arc::clone(&active_account_label),
         active_account_key: Arc::clone(&active_account_key),
         traffic_tracker: Arc::clone(&traffic_tracker),
         latest_traffic: Arc::clone(&latest_traffic),
@@ -495,6 +513,8 @@ struct DaemonCommands {
     control: monitor::MonitorControl,
     store: config::SettingsStore,
     notifier: Arc<Mutex<notify::ToastNotifier>>,
+    active_account_id: Arc<Mutex<String>>,
+    active_account_label: Arc<Mutex<String>>,
     active_account_key: Arc<Mutex<String>>,
     traffic_tracker: Arc<Mutex<traffic::TrafficTracker>>,
     latest_traffic: Arc<Mutex<models::TrafficSummary>>,
@@ -502,6 +522,19 @@ struct DaemonCommands {
 }
 
 impl DaemonCommands {
+    fn sync_active_account_state(&self, settings: &models::Settings) {
+        let new_key = traffic::account_key_of(&settings.student_id);
+        *self.active_account_id.lock().unwrap() = settings.active_account_id.clone();
+        *self.active_account_label.lock().unwrap() = settings.active_display_name();
+        *self.active_account_key.lock().unwrap() = new_key.clone();
+        let refreshed = self
+            .traffic_tracker
+            .lock()
+            .unwrap()
+            .summary(&new_key, Local::now().date_naive());
+        *self.latest_traffic.lock().unwrap() = refreshed;
+    }
+
     fn apply(&self, cmd: ipc::UiToDaemon) -> Result<(), String> {
         use ipc::UiToDaemon::*;
         match cmd {
@@ -530,20 +563,31 @@ impl DaemonCommands {
                     return Err("磁盘设置已被其他写入更新，请重新核对后保存".into());
                 }
                 let enabled = settings.notify_toast;
-                let new_key = traffic::account_key_of(&settings.student_id);
+                self.sync_active_account_state(&settings);
                 self.control.update_settings(settings, password_changed)?;
                 self.notifier.lock().unwrap().set_enabled(enabled);
-                *self.active_account_key.lock().unwrap() = new_key.clone();
-                let refreshed = self
-                    .traffic_tracker
-                    .lock()
-                    .unwrap()
-                    .summary(&new_key, Local::now().date_naive());
-                *self.latest_traffic.lock().unwrap() = refreshed;
                 if start {
                     self.control.start()?;
                 }
                 logging::info("[SETTINGS_SAVED] 守护进程已应用设置");
+            }
+            SwitchAccount {
+                account_id,
+                expected,
+            } => {
+                let settings = self
+                    .store
+                    .load_strict()
+                    .map_err(|e| format!("读取配置失败：{e}"))?;
+                if settings != expected || settings.active_account_id != account_id {
+                    return Err("磁盘账号配置已变化，请刷新后重试切换".into());
+                }
+                let label = settings.active_display_name();
+                self.sync_active_account_state(&settings);
+                self.control.switch_account(settings)?;
+                logging::info(&format!(
+                    "[ACCOUNT_SWITCH] 守护进程开始切换至账号「{label}」"
+                ));
             }
             ShowUi => (self.show_ui)()?,
             TestToast { body } => self.notifier.lock().unwrap().send_test(&body),

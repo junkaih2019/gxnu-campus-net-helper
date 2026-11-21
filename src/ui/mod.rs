@@ -85,6 +85,7 @@ impl PendingCommand {
             (UiToDaemon::ReloadSettings { start: false, .. }, Ok(())) => {
                 ("设置已保存并生效".into(), false)
             }
+            (UiToDaemon::SwitchAccount { .. }, Ok(())) => ("正在切换校园网账号…".into(), false),
             (UiToDaemon::Start, Ok(())) => ("守护已启动".into(), false),
             (UiToDaemon::Pause, Ok(())) => ("守护已暂停".into(), false),
             (UiToDaemon::TestToast { .. }, Ok(())) => ("已处理系统测试通知请求".into(), false),

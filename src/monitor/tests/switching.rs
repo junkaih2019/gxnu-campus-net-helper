@@ -48,7 +48,7 @@ fn online() -> DiagnosticResult {
 
 fn fixture() -> (Fixture, Arc<TestNetwork>) {
     let net = TestNetwork::new();
-    let f = Fixture::with_check(Arc::clone(&net), "", Arc::new(|| Some(fake_credential())));
+    let f = Fixture::with_check(Arc::clone(&net), "", Arc::new(|_| Some(fake_credential())));
     f.monitor.control().start().unwrap();
     f.until(|s| s.state == MonitorState::Online);
     (f, net)
@@ -230,7 +230,7 @@ fn a_silent_route_change_while_reading_credentials_cancels_submission() {
     let f = Fixture::with_check(
         Arc::clone(&net),
         "",
-        Arc::new(move || {
+        Arc::new(move |_| {
             entered.send(()).unwrap();
             gate.lock()
                 .unwrap()

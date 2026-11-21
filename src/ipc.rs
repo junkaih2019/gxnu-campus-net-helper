@@ -31,6 +31,8 @@ pub struct SnapshotEnvelope {
     pub last_check_unix: Option<i64>,
     #[serde(default)]
     pub traffic: TrafficSummary,
+    #[serde(default)]
+    pub active_account_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +54,10 @@ pub enum UiToDaemon {
     ReloadSettings {
         start: bool,
         password_changed: bool,
+        expected: Settings,
+    },
+    SwitchAccount {
+        account_id: String,
         expected: Settings,
     },
     TestToast {
@@ -501,6 +507,7 @@ mod tests {
             online_since_unix: None,
             last_check_unix: None,
             traffic: TrafficSummary::default(),
+            active_account_id: String::new(),
         });
         let ep = server.endpoint();
         let (mut client, snapshots, logs) = IpcClient::connect(ep.port, &ep.token).unwrap();
