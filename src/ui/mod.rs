@@ -872,9 +872,9 @@ impl eframe::App for GuardApp {
                         let splitter_h = 10.0_f32;
                         let usable_h = (avail_h - splitter_h).max(300.0);
                         let (default_mid, min_mid) = if self.ui_prefs.show_home_traffic {
-                            (248.0_f32, 224.0_f32)
+                            (242.0_f32, 220.0_f32)
                         } else {
-                            (222.0_f32, 198.0_f32)
+                            (212.0_f32, 194.0_f32)
                         };
                         let min_log = 148.0_f32;
                         let max_mid = (usable_h - min_log).max(min_mid);
