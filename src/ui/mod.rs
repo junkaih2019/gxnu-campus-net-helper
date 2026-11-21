@@ -1366,7 +1366,6 @@ impl eframe::App for GuardApp {
                             .unwrap_or(default_mid)
                             .clamp(min_mid, max_mid)
                             .floor();
-                        let log_h = (usable_h - mid_h).max(min_log);
 
                         // Tier 2: 按设置切换「可拖左右双卡」或「可拖双栏通栏稳定性面板」
                         let show_traffic = self.ui_prefs.show_home_traffic;
@@ -1403,7 +1402,8 @@ impl eframe::App for GuardApp {
                             self.window_size_dirty_since = Some(Instant::now());
                         }
 
-                        // Tier 3: 通栏静谧运行日志（吃满剩余全部高度）
+                        // Tier 3: 通栏静谧运行日志（严格取当前剩余可用高度，杜绝底部圆角被窗口边缘裁切）
+                        let log_h = ui.available_height().floor().max(110.0);
                         logs_page::draw_card(
                             ui,
                             &p,
