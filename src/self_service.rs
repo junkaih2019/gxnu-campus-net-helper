@@ -223,6 +223,8 @@ fn parse_login_page(page: &str) -> Result<String, PortalError> {
 struct RawDashboardUserGroup {
     #[serde(rename = "ipMaxCount", default)]
     ip_max_count: Option<u32>,
+    #[serde(rename = "userGroupName", default)]
+    name: Option<String>,
     #[serde(rename = "userGroupDescription", default)]
     description: Option<String>,
 }
@@ -247,18 +249,20 @@ fn parse_dashboard_account(page: &str) -> Result<(SelfServiceTraffic, Option<u32
         let mut values =
             serde_json::Deserializer::from_str(json).into_iter::<RawDashboardAccount>();
         if let Some(Ok(acc)) = values.next() {
-            let (max_online, plan_desc) = match acc.user_group {
+            let (max_online, group_name, plan_desc) = match acc.user_group {
                 Some(group) => (
                     group.ip_max_count.filter(|&n| n > 0),
+                    normalize_user_group_name(group.name.as_deref()),
                     group.description.unwrap_or_default().trim().to_string(),
                 ),
-                None => (None, String::new()),
+                None => (None, String::new(), String::new()),
             };
             let traffic_info = SelfServiceTraffic {
                 campus_used_mb: sanitize_flow(acc.use_flow),
                 campus_remaining_mb: sanitize_flow(acc.left_flow),
                 month_down_mb: sanitize_flow(acc.internet_down_flow),
                 month_up_mb: sanitize_flow(acc.internet_up_flow),
+                user_group_name: group_name,
                 plan_description: plan_desc,
                 month_session_count: None,
             };
@@ -524,6 +528,17 @@ fn sanitize_flow(v: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+fn normalize_user_group_name(raw: Option<&str>) -> String {
+    raw.unwrap_or("")
+        .split('|')
+        .next()
+        .unwrap_or("")
+        .trim()
+        .trim_matches('-')
+        .trim()
+        .to_string()
 }
 
 fn normalize_terminal_type(raw: Option<&str>) -> String {
@@ -1101,13 +1116,18 @@ mod tests {
             "internetDownFlow": 285092.923,
             "internetUpFlow": 79914.447,
             "userPassword": "fake-secret-never-read",
-            "userGroup": { "ipMaxCount": 3, "userGroupDescription": "每月免费30G" }
+            "userGroup": {
+                "ipMaxCount": 3,
+                "userGroupName": "硕士-计算机|um|ul|",
+                "userGroupDescription": "每月免费30G"
+            }
         });</script>"#;
         let (traffic, max_online) = parse_dashboard_account(html).unwrap();
         assert!((traffic.campus_used_mb - 535.203).abs() < 0.001);
         assert!((traffic.campus_remaining_mb - 553035.463).abs() < 0.001);
         assert!((traffic.month_down_mb - 285092.923).abs() < 0.001);
         assert!((traffic.month_up_mb - 79914.447).abs() < 0.001);
+        assert_eq!(traffic.user_group_name, "硕士-计算机");
         assert_eq!(traffic.plan_description, "每月免费30G");
         assert_eq!(max_online, Some(3));
     }

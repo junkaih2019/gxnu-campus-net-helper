@@ -252,6 +252,9 @@ pub struct SelfServiceTraffic {
     pub month_down_mb: f64,
     /// 本月全账号实际上行总流量（MB，含电信/联通/移动运营商出口）。
     pub month_up_mb: f64,
+    /// 门户返回的用户身份/用户组名（已去掉内部 `|um|ul|` 标记，如「硕士-计算机」）。
+    #[serde(default)]
+    pub user_group_name: String,
     /// 门户返回的校园网套餐说明（如「每月免费30G」）。
     #[serde(default)]
     pub plan_description: String,

@@ -16,7 +16,7 @@ use crate::models::{
 };
 use crate::ui::icons::Icon;
 use crate::ui::theme::{
-    body_text, bold_text, mono_text, reason_hint, reason_label, with_alpha, Palette, ThemeMode,
+    body_text, bold_text, reason_hint, reason_label, with_alpha, Palette, ThemeMode,
     DEFAULT_TRAFFIC_SPLIT, RADIUS_MD,
 };
 use crate::ui::widgets::{
@@ -336,6 +336,9 @@ fn draw_account_traffic_card(
                                     "上行流量",
                                     &format!("{} ({ul_pct}%)", format_mb_compact(up)),
                                 );
+                                if !t.user_group_name.is_empty() {
+                                    detail_kv_row(ui, p, "用户身份", &t.user_group_name);
+                                }
                                 if let Some(n) = t.month_session_count {
                                     detail_kv_row(ui, p, "本月认证次数", &format!("{n} 次"));
                                 }
@@ -346,6 +349,22 @@ fn draw_account_traffic_card(
                                     &format_mb_compact(t.campus_remaining_mb),
                                 );
                             });
+
+                            let carrier_sub = match (
+                                !t.user_group_name.is_empty(),
+                                t.month_session_count,
+                            ) {
+                                (true, Some(n)) => {
+                                    format!("身份：{} · 本月认证 {n} 次", t.user_group_name)
+                                }
+                                (true, None) => {
+                                    format!("身份：{} · 统计同一学号全部终端", t.user_group_name)
+                                }
+                                (false, Some(n)) => {
+                                    format!("本月认证 {n} 次 · 统计同一学号全部终端")
+                                }
+                                (false, None) => "统计同一学号全部终端的实际吞吐".to_string(),
+                            };
 
                             draw_traffic_info_column(
                                 ui,
@@ -372,16 +391,7 @@ fn draw_account_traffic_card(
                                     },
                                 ),
                                 "运营商出口不限流量 · 统计全账号实际吞吐",
-                                &match t.month_session_count {
-                                    Some(n) => format!(
-                                        "本月认证 {n} 次 · 校园网免费额度余 {}",
-                                        format_mb_compact(t.campus_remaining_mb)
-                                    ),
-                                    None => format!(
-                                        "校园网免费额度余 {} · 点右上角切换查看",
-                                        format_mb_compact(t.campus_remaining_mb)
-                                    ),
-                                },
+                                &carrier_sub,
                                 Some(
                                     "数据源自校园网自助服务上网明细，汇总同一学号下全部终端与运营商出口的实际流量",
                                 ),
@@ -432,8 +442,11 @@ fn draw_account_traffic_card(
                                     &format!("{} ({used_pct:.1}%)", format_mb_compact(used)),
                                 );
                                 detail_kv_row(ui, p, "账户总额", &format_mb_compact(total));
+                                if !t.user_group_name.is_empty() {
+                                    detail_kv_row(ui, p, "用户身份", &t.user_group_name);
+                                }
                                 if !t.plan_description.is_empty() {
-                                    detail_kv_row(ui, p, "当前套餐", &t.plan_description);
+                                    detail_kv_row(ui, p, "免费额度", &t.plan_description);
                                 }
                                 detail_kv_row(
                                     ui,
@@ -443,17 +456,18 @@ fn draw_account_traffic_card(
                                 );
                             });
 
-                            let plan_line = if t.plan_description.is_empty() {
-                                "仅校园网出口计入套餐额度，运营商出口不扣费".to_string()
-                            } else {
-                                format!("套餐：{}（余量可结转）· 仅校园网计费", t.plan_description)
+                            let identity_line = match (
+                                !t.user_group_name.is_empty(),
+                                !t.plan_description.is_empty(),
+                            ) {
+                                (true, true) => {
+                                    format!("身份：{} · {}", t.user_group_name, t.plan_description)
+                                }
+                                (true, false) => format!("身份：{}", t.user_group_name),
+                                (false, true) => format!("校园网免费额度 · {}", t.plan_description),
+                                (false, false) => "校园网出口计费额度".to_string(),
                             };
-                            let actual_line = format!(
-                                "全账号本月实际 {}（↓{} ↑{}）",
-                                format_mb_compact(t.month_actual_total_mb()),
-                                format_mb_short(t.month_down_mb),
-                                format_mb_short(t.month_up_mb),
-                            );
+                            let billing_note = "仅校园网出口计费 · 剩余免费额度可结转";
                             let rem_str = if depleted {
                                 "已用尽".to_string()
                             } else {
@@ -479,8 +493,8 @@ fn draw_account_traffic_card(
                                     &format_mb_compact(used),
                                     Some(format!("{used_pct:.1}%")),
                                 ),
-                                &plan_line,
-                                &actual_line,
+                                &identity_line,
+                                billing_note,
                                 Some(
                                     "校园网出口独立计费；若同时办理电信/联通/移动宽带，该宽带流量不扣此额度",
                                 ),
@@ -1134,16 +1148,18 @@ fn draw_featured_device_card(
             painter,
             x,
             top_y,
+            34.0,
             &dev.terminal_type,
             p.text_secondary,
             p.card,
             p.border,
-        ) + 6.0;
+        ) + 7.0;
     }
 
+    // 统一使用微软雅黑字族绘制 IP 与中文，确保数字、图标与汉字基线严格对齐
     let ip_galley = painter.layout_no_wrap(
         dev.ip.clone(),
-        egui::FontId::new(12.2, egui::FontFamily::Monospace),
+        egui::FontId::new(11.8, crate::ui::theme::bold_family()),
         p.text,
     );
     painter.galley(
@@ -1151,7 +1167,7 @@ fn draw_featured_device_card(
         ip_galley.clone(),
         p.text,
     );
-    x += ip_galley.size().x + 6.0;
+    x += ip_galley.size().x + 7.0;
 
     let (id_lbl, id_fg, id_bg, id_bd) = if is_local {
         ("本机", p.ok, p.ok_soft, p.ok_border)
@@ -1165,15 +1181,21 @@ fn draw_featured_device_card(
             p.neutral_border,
         )
     };
-    let _ = paint_mini_pill(painter, x, top_y, id_lbl, id_fg, id_bg, id_bd);
+    let _ = paint_mini_pill(painter, x, top_y, 34.0, id_lbl, id_fg, id_bg, id_bd);
 
     let elapsed_secs = device_elapsed_secs(dev, fetched_at_unix, now_unix);
     if elapsed_secs > 0 {
-        painter.text(
-            Pos2::new(rect.right() - 11.0, top_y),
-            egui::Align2::RIGHT_CENTER,
+        let dur_g = painter.layout_no_wrap(
             format!("已在线 {}", format_duration_short(elapsed_secs)),
             egui::FontId::new(10.8, crate::ui::theme::bold_family()),
+            p.text_secondary,
+        );
+        painter.galley(
+            Pos2::new(
+                rect.right() - 11.0 - dur_g.size().x,
+                top_y - dur_g.size().y * 0.5,
+            ),
+            dur_g,
             p.text_secondary,
         );
     }
@@ -1186,11 +1208,10 @@ fn draw_featured_device_card(
     } else {
         format!("{start_hm} 上线 · 同账号另一终端当前在线")
     };
-    painter.text(
-        Pos2::new(rect.left() + 23.0, bot_y),
-        egui::Align2::LEFT_CENTER,
-        sub_text,
-        egui::FontId::proportional(10.0),
+    let sub_g = painter.layout_no_wrap(sub_text, egui::FontId::proportional(10.0), p.text_muted);
+    painter.galley(
+        Pos2::new(rect.left() + 23.0, bot_y - sub_g.size().y * 0.5),
+        sub_g,
         p.text_muted,
     );
 
@@ -1227,7 +1248,7 @@ fn draw_devices_placeholder(
                         let (dr, _) = ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
                         ui.painter().circle_filled(dr.center(), 3.2, p.ok);
                         ui.label(body_text("本机校园网 IP", 10.8, p.text_secondary));
-                        ui.label(mono_text(local_campus_ip, 11.4, p.text));
+                        ui.label(bold_text(local_campus_ip, 11.2, p.text));
                     });
                 }
                 let hint = match self_service.status {
@@ -1271,8 +1292,8 @@ fn draw_online_device_row(
 
     let cy = rect.center().y;
     let painter = ui.painter();
-    let mut x = rect.left() + 9.0;
 
+    // 固定栅格列坐标：保证多行间圆点、终端标签、IP 数字、身份徽章与右侧时刻/时长纵向严格对齐
     let dot_c = if is_local {
         p.ok
     } else if highlight_conflict {
@@ -1280,33 +1301,40 @@ fn draw_online_device_row(
     } else {
         p.accent
     };
-    painter.circle_filled(Pos2::new(x + 3.0, cy), 3.0, dot_c);
-    x += 12.0;
+    painter.circle_filled(Pos2::new(rect.left() + 12.0, cy), 3.0, dot_c);
 
-    if !dev.terminal_type.is_empty() {
-        x = paint_mini_pill(
-            painter,
-            x,
-            cy,
-            &dev.terminal_type,
-            p.text_secondary,
-            p.card,
-            p.border,
-        ) + 6.0;
-    }
+    let term_x = rect.left() + 21.0;
+    let term_col_w = 34.0_f32;
+    let term_label = if dev.terminal_type.is_empty() {
+        "终端"
+    } else {
+        dev.terminal_type.as_str()
+    };
+    let _ = paint_mini_pill(
+        painter,
+        term_x,
+        cy,
+        term_col_w,
+        term_label,
+        p.text_secondary,
+        p.card,
+        p.border,
+    );
 
+    let ip_x = term_x + term_col_w + 7.0;
     let ip_galley = painter.layout_no_wrap(
         dev.ip.clone(),
-        egui::FontId::new(11.3, egui::FontFamily::Monospace),
+        egui::FontId::new(11.2, crate::ui::theme::bold_family()),
         p.text,
     );
     painter.galley(
-        Pos2::new(x, cy - ip_galley.size().y * 0.5),
+        Pos2::new(ip_x, cy - ip_galley.size().y * 0.5),
         ip_galley.clone(),
         p.text,
     );
-    x += ip_galley.size().x + 6.0;
 
+    // 固定 IP 列宽（90px，足以容纳最长 IPv4），保证每行「本机 / 其他」徽章严格竖直齐平
+    let badge_x = ip_x + ip_galley.size().x.max(90.0) + 6.0;
     let (id_lbl, id_fg, id_bg, id_bd) = if is_local {
         ("本机", p.ok, p.ok_soft, p.ok_border)
     } else if highlight_conflict {
@@ -1314,26 +1342,55 @@ fn draw_online_device_row(
     } else {
         ("其他", p.text_secondary, p.neutral_soft, p.neutral_border)
     };
-    let _ = paint_mini_pill(painter, x, cy, id_lbl, id_fg, id_bg, id_bd);
+    let _ = paint_mini_pill(painter, badge_x, cy, 34.0, id_lbl, id_fg, id_bg, id_bd);
 
+    // 右侧分列对齐：「06:29 上线」 + 固定居中「·」 + 固定右列「42m46s / 1h30m」
     let start_hm = device_start_hm(dev);
     let elapsed_secs = device_elapsed_secs(dev, fetched_at_unix, now_unix);
-    let right_txt = if elapsed_secs > 0 {
-        if row_w >= 330.0 {
-            format!("{start_hm} 上线 · {}", format_duration_short(elapsed_secs))
+    let meta_font = egui::FontId::proportional(10.2);
+    let right_edge = rect.right() - 10.0;
+
+    if elapsed_secs > 0 {
+        let dur_col_w = 40.0_f32;
+        let dur_x = right_edge - dur_col_w;
+        let dur_g = painter.layout_no_wrap(
+            format_duration_short(elapsed_secs),
+            meta_font.clone(),
+            p.text_muted,
+        );
+        painter.galley(
+            Pos2::new(dur_x, cy - dur_g.size().y * 0.5),
+            dur_g,
+            p.text_muted,
+        );
+
+        let dot_cx = dur_x - 5.0;
+        let dot_g = painter.layout_no_wrap("·".to_string(), meta_font.clone(), p.text_muted);
+        painter.galley(
+            Pos2::new(dot_cx - dot_g.size().x * 0.5, cy - dot_g.size().y * 0.5),
+            dot_g,
+            p.text_muted,
+        );
+
+        let time_txt = if row_w >= 316.0 {
+            format!("{start_hm} 上线")
         } else {
-            format!("{start_hm} · {}", format_duration_short(elapsed_secs))
-        }
+            start_hm.to_string()
+        };
+        let time_g = painter.layout_no_wrap(time_txt, meta_font, p.text_muted);
+        painter.galley(
+            Pos2::new(dot_cx - 5.0 - time_g.size().x, cy - time_g.size().y * 0.5),
+            time_g,
+            p.text_muted,
+        );
     } else {
-        format!("{start_hm} 上线")
-    };
-    painter.text(
-        Pos2::new(rect.right() - 9.0, cy),
-        egui::Align2::RIGHT_CENTER,
-        right_txt,
-        egui::FontId::proportional(10.2),
-        p.text_muted,
-    );
+        let time_g = painter.layout_no_wrap(format!("{start_hm} 上线"), meta_font, p.text_muted);
+        painter.galley(
+            Pos2::new(right_edge - time_g.size().x, cy - time_g.size().y * 0.5),
+            time_g,
+            p.text_muted,
+        );
+    }
 
     if resp.hovered() {
         resp.on_hover_ui(|ui| {
@@ -1415,10 +1472,12 @@ fn draw_recent_sessions_full_tooltip(ui: &mut egui::Ui, p: &Palette, data: &Self
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_mini_pill(
     painter: &egui::Painter,
     left: f32,
     cy: f32,
+    min_width: f32,
     text: &str,
     fg: Color32,
     bg: Color32,
@@ -1426,7 +1485,7 @@ fn paint_mini_pill(
 ) -> f32 {
     let font = egui::FontId::new(9.5, crate::ui::theme::bold_family());
     let g = painter.layout_no_wrap(text.to_string(), font, fg);
-    let w = g.size().x + 10.0;
+    let w = (g.size().x + 10.0).max(min_width);
     let rect = Rect::from_min_size(Pos2::new(left, cy - 8.5), Vec2::new(w, 17.0));
     painter.rect(
         rect,
@@ -2130,22 +2189,6 @@ fn format_mb_ring(mb: f64) -> String {
         format!("{mb:.0}M")
     } else if mb > 0.0 {
         format!("{mb:.1}M")
-    } else {
-        "0M".to_string()
-    }
-}
-
-fn format_mb_short(mb: f64) -> String {
-    let mb = if mb.is_finite() && mb > 0.0 { mb } else { 0.0 };
-    if mb >= 1024.0 {
-        let gb = mb / 1024.0;
-        if gb >= 100.0 {
-            format!("{gb:.0}G")
-        } else {
-            format!("{gb:.1}G")
-        }
-    } else if mb >= 1.0 {
-        format!("{mb:.0}M")
     } else {
         "0M".to_string()
     }
