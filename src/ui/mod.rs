@@ -1,7 +1,7 @@
 //! 主窗口双视图架构（极简薄顶栏 + 主页 / 成熟版 Windows 11 Fluent 设置中心）：
 //! - 顶部：36px 无边框自定义标题栏（主页右侧提供「设置」入口，设置页左上角提供「← 返回主页」）
-//! - 主页：上窄状态条（含当前账号入口）→ 中 62:38 非对称图文双卡（连接稳定性 + 双模式环形流量）→ 下通栏运行日志
-//! - 设置页：左侧分组目录（账号管理 / 监控与自启 / 通知与数据）+ 右侧分组卡片 + 底部常驻保存栏
+//! - 主页：状态主条 → 账号流量（单圆环可切换运营商/校园网）+ 在线设备双卡 → 纤薄连接稳定性时间轴 → 通栏运行日志
+//! - 设置页：左侧分组目录（账号管理 / 监控与自启 / 外观与显示 / 通知与数据）+ 右侧分组卡片 + 底部常驻保存栏
 
 mod charts;
 mod icons;
@@ -1419,14 +1419,14 @@ impl eframe::App for GuardApp {
                         let login_rejected = self.latest.as_ref().and_then(|s| s.reason)
                             == Some(crate::models::DisconnectReason::LoginRejected);
 
-                        // Tier 2: 账号流量 + 在线设备与记录双卡（可左右拖拽分栏，上下可由底部分隔条调节高度）
+                        // Tier 2: 账号流量 + 在线设备双卡（可左右拖拽分栏，上下可由底部分隔条调节高度）
                         let mut ss_h_opt: Option<(f32, f32, f32)> = None;
                         if show_self_service {
-                            let avail_h = ui.available_height().max(360.0);
-                            let stability_reserved = 104.0_f32;
-                            let min_log = 136.0_f32;
-                            let min_ss = 174.0_f32;
-                            let default_ss = 176.0_f32;
+                            let avail_h = ui.available_height().max(340.0);
+                            let stability_reserved = 78.0_f32;
+                            let min_log = 140.0_f32;
+                            let min_ss = 136.0_f32;
+                            let default_ss = 140.0_f32;
                             let max_ss =
                                 (avail_h - stability_reserved - min_log - 18.0).max(min_ss);
                             let ss_h = self

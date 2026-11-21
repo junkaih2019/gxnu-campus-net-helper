@@ -1,6 +1,8 @@
 //! 主页核心可视化模块（v0.2.1）：
-//! - Tier 2：双栏自助服务卡片（左 47%「账号流量」自适应运营商/校园网双视角 + 右 53%「在线设备与记录」含并发配额与真实流量历史）
-//! - Tier 3：通栏紧凑「连接稳定性」胶囊时间轴（位于双卡之下、运行日志之上，悬停黄格即看完整断联卡片）
+//! - Tier 2：均衡双栏自助服务卡片（左「账号流量」单圆环 + 运营商/校园网切换 + 口径说明 | 右「在线设备」并发配额与终端列表）
+//! - Tier 3：通栏纤薄「连接稳定性」胶囊时间轴（位于双卡之下、运行日志之上，悬停黄格即看完整断联卡片）
+
+use std::f32::consts::{FRAC_PI_2, TAU};
 
 use chrono::{Local, TimeZone, Timelike};
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
@@ -10,21 +12,20 @@ use crate::metrics_store::{
     TimeRange, TrackSegment, TrackState,
 };
 use crate::models::{
-    OnlineDevice, RecentSession, SelfServiceData, SelfServiceState, SelfServiceStatus,
-    TrafficSummary,
+    OnlineDevice, SelfServiceData, SelfServiceState, SelfServiceStatus, TrafficSummary,
 };
 use crate::ui::icons::Icon;
 use crate::ui::theme::{
-    body_text, bold_text, mono_text, reason_hint, reason_label, with_alpha, Palette,
-    DEFAULT_TRAFFIC_SPLIT,
+    body_text, bold_text, mono_text, reason_hint, reason_label, with_alpha, Palette, ThemeMode,
+    DEFAULT_TRAFFIC_SPLIT, RADIUS_MD,
 };
 use crate::ui::widgets::{
     badge, card_padded, icon_button, section_heading, segmented_control, vertical_splitter,
 };
 
-/// 账号流量卡展示视角：
-/// - `Carrier`：运营商出口视角（主显本月全账号实际流量 + 上下行比例，次行附校园网免费额度）
-/// - `Campus`：校园用户出口视角（主显校园网剩余额度 + 进度条，次行附全账号实际流量）
+/// 账号流量卡展示视角（默认跟随当前活跃账号运营商，支持点击按钮随时切换）：
+/// - `Carrier`：运营商视角（蓝/绿双色圆环展示全账号本月实际下行/上行与吞吐说明）
+/// - `Campus`：校园网视角（余量进度圆环展示校园网套餐剩余/已用与计费说明）
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrafficViewMode {
     #[default]
@@ -63,7 +64,7 @@ pub struct HomeVisualActions {
     pub traffic_view_changed: bool,
 }
 
-/// Tier 2：账号流量（左） + 在线设备与记录（右）双栏卡片（可左右拖拽调整比例）。
+/// Tier 2：账号流量（左） + 在线设备（右）双栏卡片（可左右拖拽调整比例）。
 #[allow(clippy::too_many_arguments)]
 pub fn draw_self_service_row(
     ui: &mut egui::Ui,
@@ -81,9 +82,9 @@ pub fn draw_self_service_row(
     let total_w = ui.available_width();
     let splitter_w = 10.0_f32;
     let usable_w = (total_w - splitter_w).max(460.0);
-    let min_left = 250.0_f32.min(usable_w * 0.44);
-    let min_right = 260.0_f32.min(usable_w * 0.46);
-    let left_w = (usable_w * (*split_ratio).clamp(0.36, 0.64))
+    let min_left = 280.0_f32.min(usable_w * 0.44);
+    let min_right = 260.0_f32.min(usable_w * 0.44);
+    let left_w = (usable_w * (*split_ratio).clamp(0.38, 0.64))
         .clamp(min_left, (usable_w - min_right).max(min_left))
         .floor();
     let right_w = (usable_w - left_w).max(min_right);
@@ -117,7 +118,7 @@ pub fn draw_self_service_row(
             *split_ratio = DEFAULT_TRAFFIC_SPLIT;
             actions.split_changed = true;
         } else if dx.abs() > 0.01 && usable_w > 1.0 {
-            *split_ratio = ((left_w + dx) / usable_w).clamp(0.36, 0.64);
+            *split_ratio = ((left_w + dx) / usable_w).clamp(0.38, 0.64);
             actions.split_changed = true;
         }
 
@@ -143,7 +144,7 @@ pub fn draw_self_service_row(
     actions
 }
 
-/// 左卡：账号流量（融合校园网自助服务双口径 + 本机今日物理网卡参考）。
+/// 左卡：账号流量（单圆环 + 清晰数据与口径说明，支持「运营商 / 校园网」一键切换）。
 fn draw_account_traffic_card(
     ui: &mut egui::Ui,
     p: &Palette,
@@ -156,7 +157,7 @@ fn draw_account_traffic_card(
     let mut view_changed = false;
 
     card_padded(ui, p, 12, |ui| {
-        let inner_h = (target_height - 26.0).max(148.0);
+        let inner_h = (target_height - 26.0).max(110.0);
         ui.set_min_height(inner_h);
         ui.set_max_height(inner_h);
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -164,7 +165,7 @@ fn draw_account_traffic_card(
         let card_w = ui.available_width();
         let has_data = self_service.data.is_some();
 
-        // 1. 顶部标题行（26px）
+        // 1. 顶部标题行（26px）：标题 + 状态小徽章 + 「运营商 | 校园网」切换 + 刷新按钮
         ui.allocate_ui_with_layout(
             Vec2::new(card_w, 26.0),
             egui::Layout::left_to_right(egui::Align::Center),
@@ -172,7 +173,11 @@ fn draw_account_traffic_card(
                 ui.spacing_mut().item_spacing.x = 6.0;
                 section_heading(ui, Icon::ArrowUpDown, p.accent, "账号流量", p.text, 26.0);
 
-                if card_w >= 305.0 {
+                if card_w >= 318.0 {
+                    let campus_depleted = self_service
+                        .data
+                        .as_ref()
+                        .is_some_and(|d| d.traffic.campus_remaining_mb <= 0.1);
                     let (lbl, fg, bg, bd, tip) = match (self_service.status, has_data) {
                         (SelfServiceStatus::Refreshing, _) => (
                             "同步中",
@@ -182,18 +187,25 @@ fn draw_account_traffic_card(
                             "正在向校园网自助服务同步最新数据",
                         ),
                         (_, true) if *view_mode == TrafficViewMode::Carrier => (
-                            "运营商不限量",
+                            "不限流量",
                             p.ok,
                             p.ok_soft,
                             p.ok_border,
-                            "电信/联通/移动宽带出口不限流量，上方为全账号本月实际总流量",
+                            "电信/联通/移动宽带出口不限流量，圆环展示本月全账号实际上下行总流量",
+                        ),
+                        (_, true) if campus_depleted => (
+                            "额度用尽",
+                            p.danger,
+                            p.danger_soft,
+                            p.danger_border,
+                            "校园网套餐剩余流量已用尽，仅校园网出口受限",
                         ),
                         (_, true) => (
-                            "校园网限额",
+                            "套餐计费",
                             p.accent,
                             p.accent_soft,
                             p.accent_border,
-                            "仅校园网出口计入套餐额度，上方为自助服务官方剩余流量",
+                            "仅校园网出口计入套餐额度，圆环展示自助服务官方剩余可用比例",
                         ),
                         (SelfServiceStatus::CaptchaCooldown, false) => (
                             "需验证码",
@@ -222,11 +234,11 @@ fn draw_account_traffic_card(
                             self_service.message.as_str(),
                         ),
                         _ => (
-                            "本地参考",
+                            "网卡参考",
                             p.neutral,
                             p.neutral_soft,
                             p.neutral_border,
-                            "等待自助服务同步，当前展示本机物理网卡流量",
+                            "等待自助服务同步，当前展示本机物理网卡今日流量参考",
                         ),
                     };
                     let resp = badge(ui, fg, bg, bd, lbl);
@@ -250,7 +262,7 @@ fn draw_account_traffic_card(
                     {
                         refresh_clicked = true;
                     }
-                    if has_data && card_w >= 260.0 {
+                    if has_data && card_w >= 265.0 {
                         let mut idx = view_mode.index();
                         if segmented_control(
                             ui,
@@ -267,143 +279,216 @@ fn draw_account_traffic_card(
             },
         );
 
-        ui.add_space(7.0);
+        ui.add_space(8.0);
 
-        // 2. 主指标与底部两行参考（预留微软雅黑粗体真实行高，保证左右双卡底边 0 像素齐平）
-        let body_h = (inner_h - 33.0).max(115.0);
-        let footer_h = 50.0_f32;
-        let top_h = (body_h - footer_h).max(65.0);
+        // 2. 主体区（默认 80px）：左 76×76 抗锯齿圆环 + 右侧指标与口径说明
+        let body_h = (inner_h - 34.0).max(76.0);
+        let ring_size = 76.0_f32;
+        let ring_gap = 14.0_f32;
+        let info_w = (card_w - ring_size - ring_gap).max(120.0);
 
         ui.allocate_ui_with_layout(
-            Vec2::new(card_w, top_h),
-            egui::Layout::top_down(egui::Align::LEFT),
+            Vec2::new(card_w, body_h),
+            egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.spacing_mut().item_spacing.y = 0.0;
+                ui.spacing_mut().item_spacing.x = ring_gap;
+
                 if let Some(data) = &self_service.data {
                     let t = &data.traffic;
                     match *view_mode {
                         TrafficViewMode::Carrier => {
-                            let actual_total = t.month_actual_total_mb();
                             let down = t.month_down_mb.max(0.0);
                             let up = t.month_up_mb.max(0.0);
-                            let sum = (down + up).max(0.001);
-                            let dl_frac = (down / sum) as f32;
+                            let total = down + up;
+                            let dl_frac = if total > 0.001 {
+                                (down / total) as f32
+                            } else {
+                                0.0
+                            };
+                            let dl_pct = (dl_frac * 100.0).round() as u32;
+                            let ul_pct = 100u32.saturating_sub(dl_pct);
 
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(card_w, 25.0),
-                                egui::Layout::left_to_right(egui::Align::BOTTOM),
-                                |ui| {
-                                    ui.spacing_mut().item_spacing.x = 6.0;
-                                    ui.label(bold_text(
-                                        format_mb_compact(actual_total),
-                                        21.0,
-                                        p.text,
-                                    ));
-                                    ui.label(body_text("本月全账号实际", 10.5, p.text_muted));
-                                },
+                            let ring_resp = draw_dual_donut_ring(
+                                ui,
+                                p,
+                                ring_size,
+                                dl_frac,
+                                down > 0.0,
+                                up > 0.0,
+                                &format_mb_ring(total),
+                                "本月实际",
+                                p.text,
                             );
+                            ring_resp.on_hover_ui(|ui| {
+                                ui.set_min_width(226.0);
+                                ui.spacing_mut().item_spacing.y = 4.0;
+                                ui.label(bold_text("本月全账号实际流量", 11.5, p.text));
+                                detail_kv_row(ui, p, "实际总流量", &format_mb_compact(total));
+                                detail_kv_row(
+                                    ui,
+                                    p,
+                                    "下行流量",
+                                    &format!("{} ({dl_pct}%)", format_mb_compact(down)),
+                                );
+                                detail_kv_row(
+                                    ui,
+                                    p,
+                                    "上行流量",
+                                    &format!("{} ({ul_pct}%)", format_mb_compact(up)),
+                                );
+                                if let Some(n) = t.month_session_count {
+                                    detail_kv_row(ui, p, "本月认证次数", &format!("{n} 次"));
+                                }
+                                detail_kv_row(
+                                    ui,
+                                    p,
+                                    "校园网余量",
+                                    &format_mb_compact(t.campus_remaining_mb),
+                                );
+                            });
 
-                            ui.add_space(7.0);
-                            draw_dual_bar(ui, p, card_w, 6.0, dl_frac, down > 0.0, up > 0.0);
-                            ui.add_space(6.0);
-
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(card_w, 15.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    ui.spacing_mut().item_spacing.x = 12.0;
-                                    inline_dot_metric(
-                                        ui,
-                                        p,
-                                        p.accent,
-                                        "下行",
-                                        &format_mb_compact(down),
-                                    );
-                                    inline_dot_metric(ui, p, p.ok, "上行", &format_mb_compact(up));
+                            draw_traffic_info_column(
+                                ui,
+                                p,
+                                info_w,
+                                (
+                                    p.accent,
+                                    "下行流量",
+                                    &format_mb_compact(down),
+                                    if total > 0.001 {
+                                        Some(format!("{dl_pct}%"))
+                                    } else {
+                                        None
+                                    },
+                                ),
+                                (
+                                    p.ok,
+                                    "上行流量",
+                                    &format_mb_compact(up),
+                                    if total > 0.001 {
+                                        Some(format!("{ul_pct}%"))
+                                    } else {
+                                        None
+                                    },
+                                ),
+                                "运营商出口不限流量 · 统计全账号实际吞吐",
+                                &match t.month_session_count {
+                                    Some(n) => format!(
+                                        "本月认证 {n} 次 · 校园网免费额度余 {}",
+                                        format_mb_compact(t.campus_remaining_mb)
+                                    ),
+                                    None => format!(
+                                        "校园网免费额度余 {} · 点右上角切换查看",
+                                        format_mb_compact(t.campus_remaining_mb)
+                                    ),
                                 },
+                                Some(
+                                    "数据源自校园网自助服务上网明细，汇总同一学号下全部终端与运营商出口的实际流量",
+                                ),
                             );
                         }
                         TrafficViewMode::Campus => {
                             let rem = t.campus_remaining_mb.max(0.0);
                             let used = t.campus_used_mb.max(0.0);
                             let total = t.campus_total_mb().max(0.001);
-                            let used_ratio = (used / total).clamp(0.0, 1.0) as f32;
+                            let rem_ratio = (rem / total).clamp(0.0, 1.0) as f32;
+                            let used_pct = ((used / total) * 100.0).clamp(0.0, 100.0);
                             let depleted = rem <= 0.1;
 
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(card_w, 25.0),
-                                egui::Layout::left_to_right(egui::Align::BOTTOM),
-                                |ui| {
-                                    ui.spacing_mut().item_spacing.x = 6.0;
-                                    let (hero_val, hero_col) = if depleted {
-                                        ("已用尽".to_string(), p.danger)
-                                    } else {
-                                        (format_mb_compact(rem), p.text)
-                                    };
-                                    ui.label(bold_text(hero_val, 21.0, hero_col));
-                                    ui.label(body_text("校园网剩余", 10.5, p.text_muted));
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::BOTTOM),
-                                        |ui| {
-                                            ui.label(bold_text(
-                                                format_mb_compact(used),
-                                                11.0,
-                                                p.text,
-                                            ));
-                                            ui.label(body_text("已用", 10.2, p.text_muted));
-                                        },
-                                    );
-                                },
-                            );
-
-                            ui.add_space(7.0);
-                            let bar_color = if depleted || used_ratio >= 0.95 {
+                            let ring_color = if depleted || rem_ratio <= 0.05 {
                                 p.danger
-                            } else if used_ratio >= 0.80 {
+                            } else if rem_ratio <= 0.20 {
                                 p.warn
                             } else {
-                                p.accent
+                                p.ok
                             };
-                            draw_single_bar(
+                            let center_val = if depleted {
+                                "已用尽".to_string()
+                            } else if used <= 0.01 {
+                                "100%".to_string()
+                            } else {
+                                format!("{:.1}%", (rem_ratio * 100.0).min(99.9))
+                            };
+
+                            let ring_resp = draw_single_donut_ring(
                                 ui,
                                 p,
-                                card_w,
-                                6.0,
-                                if depleted { 1.0 } else { used_ratio },
-                                used > 0.0 || depleted,
-                                bar_color,
+                                ring_size,
+                                if depleted { 0.0 } else { rem_ratio },
+                                ring_color,
+                                &center_val,
+                                "剩余可用",
+                                if depleted { p.danger } else { p.text },
                             );
-                            ui.add_space(6.0);
+                            ring_resp.on_hover_ui(|ui| {
+                                ui.set_min_width(226.0);
+                                ui.spacing_mut().item_spacing.y = 4.0;
+                                ui.label(bold_text("校园网出口套餐明细", 11.5, p.text));
+                                detail_kv_row(ui, p, "剩余可用", &format_mb_compact(rem));
+                                detail_kv_row(
+                                    ui,
+                                    p,
+                                    "本月已用",
+                                    &format!("{} ({used_pct:.1}%)", format_mb_compact(used)),
+                                );
+                                detail_kv_row(ui, p, "账户总额", &format_mb_compact(total));
+                                if !t.plan_description.is_empty() {
+                                    detail_kv_row(ui, p, "当前套餐", &t.plan_description);
+                                }
+                                detail_kv_row(
+                                    ui,
+                                    p,
+                                    "全账号实际",
+                                    &format_mb_compact(t.month_actual_total_mb()),
+                                );
+                            });
 
-                            ui.allocate_ui_with_layout(
-                                Vec2::new(card_w, 15.0),
-                                egui::Layout::left_to_right(egui::Align::Center),
-                                |ui| {
-                                    let plan = if t.plan_description.is_empty() {
-                                        "校园网套餐额度"
-                                    } else {
-                                        t.plan_description.as_str()
-                                    };
-                                    ui.add(
-                                        egui::Label::new(body_text(plan, 10.3, p.text_muted))
-                                            .truncate(),
-                                    );
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.label(body_text(
-                                                format!("已用 {:.1}%", used_ratio * 100.0),
-                                                10.3,
-                                                p.text_muted,
-                                            ));
-                                        },
-                                    );
-                                },
+                            let plan_line = if t.plan_description.is_empty() {
+                                "仅校园网出口计入套餐额度，运营商出口不扣费".to_string()
+                            } else {
+                                format!("套餐：{}（余量可结转）· 仅校园网计费", t.plan_description)
+                            };
+                            let actual_line = format!(
+                                "全账号本月实际 {}（↓{} ↑{}）",
+                                format_mb_compact(t.month_actual_total_mb()),
+                                format_mb_short(t.month_down_mb),
+                                format_mb_short(t.month_up_mb),
+                            );
+                            let rem_str = if depleted {
+                                "已用尽".to_string()
+                            } else {
+                                format_mb_compact(rem)
+                            };
+
+                            let rem_pct = if depleted {
+                                "0%".to_string()
+                            } else if used <= 0.01 {
+                                "100%".to_string()
+                            } else {
+                                format!("{:.1}%", (rem_ratio * 100.0).min(99.9))
+                            };
+
+                            draw_traffic_info_column(
+                                ui,
+                                p,
+                                info_w,
+                                (ring_color, "剩余可用", &rem_str, Some(rem_pct)),
+                                (
+                                    p.accent,
+                                    "本月已用",
+                                    &format_mb_compact(used),
+                                    Some(format!("{used_pct:.1}%")),
+                                ),
+                                &plan_line,
+                                &actual_line,
+                                Some(
+                                    "校园网出口独立计费；若同时办理电信/联通/移动宽带，该宽带流量不扣此额度",
+                                ),
                             );
                         }
                     }
                 } else {
-                    // 无门户缓存时优雅降级：展示本机物理网卡今日流量
+                    // 无门户缓存时优雅降级：展示本机物理网卡今日流量圆环与原因说明
                     let rx = local_traffic.today_rx_bytes;
                     let tx = local_traffic.today_tx_bytes;
                     let total = rx.saturating_add(tx);
@@ -412,112 +497,301 @@ fn draw_account_traffic_card(
                     } else {
                         0.0
                     };
-
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(card_w, 25.0),
-                        egui::Layout::left_to_right(egui::Align::BOTTOM),
-                        |ui| {
-                            ui.spacing_mut().item_spacing.x = 6.0;
-                            ui.label(bold_text(format_bytes_compact(total), 21.0, p.text));
-                            ui.label(body_text("本机今日（网卡统计）", 10.5, p.text_muted));
-                        },
+                    let _ = draw_dual_donut_ring(
+                        ui,
+                        p,
+                        ring_size,
+                        dl_frac,
+                        rx > 0,
+                        tx > 0,
+                        &format_bytes_ring(total),
+                        "本机今日",
+                        p.text,
                     );
-                    ui.add_space(7.0);
-                    draw_dual_bar(ui, p, card_w, 6.0, dl_frac, rx > 0, tx > 0);
-                    ui.add_space(6.0);
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(card_w, 15.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.spacing_mut().item_spacing.x = 12.0;
-                            inline_dot_metric(ui, p, p.accent, "下载", &format_bytes_compact(rx));
-                            inline_dot_metric(ui, p, p.ok, "上传", &format_bytes_compact(tx));
-                        },
+                    let hint = if self_service.message.is_empty() {
+                        "连入校园网后自动拉取官方流量与在线设备"
+                    } else {
+                        self_service.message.as_str()
+                    };
+                    draw_traffic_info_column(
+                        ui,
+                        p,
+                        info_w,
+                        (p.accent, "本机下载", &format_bytes_compact(rx), None),
+                        (p.ok, "本机上传", &format_bytes_compact(tx), None),
+                        "暂未同步自助服务 · 显示本机物理网卡参考",
+                        hint,
+                        Some(hint),
                     );
                 }
             },
         );
-
-        // 3. 底部固定两行对照（严格控制总高 = 46px，与右侧卡片底线严格齐平）
-        ui.add_space(3.0);
-        let sep = ui.allocate_space(Vec2::new(card_w, 1.0)).1;
-        ui.painter().line_segment(
-            [sep.left_center(), sep.right_center()],
-            Stroke::new(1.0_f32, p.divider),
-        );
-        ui.add_space(6.0);
-
-        if let Some(data) = &self_service.data {
-            let t = &data.traffic;
-            match *view_mode {
-                TrafficViewMode::Carrier => {
-                    let row_tip = if t.plan_description.is_empty() {
-                        "校园网出口套餐余量（与运营商出口独立计费）".to_string()
-                    } else {
-                        format!("校园网套餐：{}（仅校园网出口计费）", t.plan_description)
-                    };
-                    compact_kv_row(
-                        ui,
-                        p,
-                        "校园网免费额度",
-                        &format!(
-                            "余 {} · 已用 {}",
-                            format_mb_compact(t.campus_remaining_mb),
-                            format_mb_compact(t.campus_used_mb)
-                        ),
-                        Some(&row_tip),
-                    );
-                }
-                TrafficViewMode::Campus => {
-                    compact_kv_row(
-                        ui,
-                        p,
-                        "本月全账号实际",
-                        &format!(
-                            "{} · ↓{} ↑{}",
-                            format_mb_compact(t.month_actual_total_mb()),
-                            format_mb_short(t.month_down_mb),
-                            format_mb_short(t.month_up_mb),
-                        ),
-                        Some("含电信/联通/移动运营商与校园网出口的全部实际上下行总流量"),
-                    );
-                }
-            }
-            ui.add_space(4.0);
-            compact_kv_row(
-                ui,
-                p,
-                "本机今日（网卡参考）",
-                &format!(
-                    "{} · ↓{} ↑{}",
-                    format_bytes_compact(local_traffic.today_total_bytes()),
-                    format_bytes_short(local_traffic.today_rx_bytes),
-                    format_bytes_short(local_traffic.today_tx_bytes),
-                ),
-                Some("本机物理网卡今日在线增量（已自动排除 Clash/Mihomo TUN 虚拟网卡）"),
-            );
-        } else {
-            compact_kv_row(
-                ui,
-                p,
-                "本机本月累计",
-                &format_bytes_compact(local_traffic.month_total_bytes()),
-                None,
-            );
-            ui.add_space(4.0);
-            let hint = if self_service.message.is_empty() {
-                "连入校园网后自动同步自助服务"
-            } else {
-                self_service.message.as_str()
-            };
-            compact_kv_row(ui, p, "自助服务", hint, Some(hint));
-        }
     });
 
     (refresh_clicked, view_changed)
 }
 
-/// 右卡：在线设备与近期上网记录（带并发上限配额 `N / M 台在线` + 真实流量历史会话）。
+#[allow(clippy::too_many_arguments)]
+fn draw_traffic_info_column(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    width: f32,
+    row1: (Color32, &str, &str, Option<String>),
+    row2: (Color32, &str, &str, Option<String>),
+    note_primary: &str,
+    note_secondary: &str,
+    note_tooltip: Option<&str>,
+) {
+    // 严格 80px 高度（19 + 2 + 19 + 5 + 1 + 5 + 14.5 + 14.5 = 80.0），与左圆环垂直居中对齐
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, 80.0),
+        egui::Layout::top_down(egui::Align::LEFT),
+        |ui| {
+            ui.spacing_mut().item_spacing.y = 0.0;
+
+            draw_ring_metric_row(ui, p, width, row1.0, row1.1, row1.2, row1.3.as_deref());
+            ui.add_space(2.0);
+            draw_ring_metric_row(ui, p, width, row2.0, row2.1, row2.2, row2.3.as_deref());
+            ui.add_space(5.0);
+
+            let sep = ui.allocate_space(Vec2::new(width, 1.0)).1;
+            ui.painter().line_segment(
+                [sep.left_center(), sep.right_center()],
+                Stroke::new(1.0_f32, p.divider),
+            );
+            ui.add_space(5.0);
+
+            let resp1 = ui
+                .allocate_ui_with_layout(
+                    Vec2::new(width, 14.5),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(body_text(note_primary, 10.2, p.text_secondary))
+                                .truncate(),
+                        )
+                    },
+                )
+                .inner;
+            let resp2 = ui
+                .allocate_ui_with_layout(
+                    Vec2::new(width, 14.5),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(body_text(note_secondary, 9.8, p.text_muted))
+                                .truncate(),
+                        )
+                    },
+                )
+                .inner;
+            if let Some(tip) = note_tooltip {
+                let full_tip = format!("{note_primary}\n{note_secondary}\n{tip}");
+                resp1.on_hover_text(&full_tip);
+                resp2.on_hover_text(&full_tip);
+            }
+        },
+    );
+}
+
+fn draw_ring_metric_row(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    width: f32,
+    dot_color: Color32,
+    label: &str,
+    value: &str,
+    suffix: Option<&str>,
+) {
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, 19.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 5.0;
+            let (dr, _) = ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
+            ui.painter().circle_filled(dr.center(), 3.2, dot_color);
+            ui.label(body_text(label, 11.0, p.text_secondary));
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 5.0;
+                if let Some(suf) = suffix {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(32.0, 19.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.label(body_text(suf, 10.0, p.text_muted));
+                        },
+                    );
+                }
+                ui.label(bold_text(value, 12.0, p.text));
+            });
+        },
+    );
+}
+
+/// 抗锯齿双色环形图（蓝=下行，绿=上行），带柔和圆头与清晰间隙。
+#[allow(clippy::too_many_arguments)]
+fn draw_dual_donut_ring(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    size: f32,
+    left_frac: f32,
+    has_left: bool,
+    has_right: bool,
+    center_value: &str,
+    center_caption: &str,
+    value_color: Color32,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let painter = ui.painter();
+    let center = rect.center();
+    let thickness = 7.0_f32;
+    let radius = (size * 0.5 - thickness * 0.5 - 1.0).max(16.0);
+    let track = ring_track_color(p);
+    painter.circle_stroke(center, radius, Stroke::new(thickness, track));
+
+    if has_left && has_right {
+        let gap = 0.12_f32;
+        let usable = TAU - 2.0 * gap;
+        let f = left_frac.clamp(0.08, 0.92);
+        let sweep1 = usable * f;
+        let sweep2 = usable * (1.0 - f);
+        let start1 = -FRAC_PI_2 + gap * 0.5;
+        let start2 = start1 + sweep1 + gap;
+        paint_ring_arc(painter, center, radius, thickness, start1, sweep1, p.accent);
+        paint_ring_arc(painter, center, radius, thickness, start2, sweep2, p.ok);
+    } else if has_left {
+        painter.circle_stroke(center, radius, Stroke::new(thickness, p.accent));
+    } else if has_right {
+        painter.circle_stroke(center, radius, Stroke::new(thickness, p.ok));
+    }
+
+    paint_ring_center_text(
+        painter,
+        center,
+        center_value,
+        center_caption,
+        value_color,
+        p.text_muted,
+    );
+    resp
+}
+
+/// 抗锯齿单色进度环形图（校园网套餐余量）。
+#[allow(clippy::too_many_arguments)]
+fn draw_single_donut_ring(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    size: f32,
+    ratio: f32,
+    color: Color32,
+    center_value: &str,
+    center_caption: &str,
+    value_color: Color32,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::hover());
+    let painter = ui.painter();
+    let center = rect.center();
+    let thickness = 7.0_f32;
+    let radius = (size * 0.5 - thickness * 0.5 - 1.0).max(16.0);
+    let track = ring_track_color(p);
+    painter.circle_stroke(center, radius, Stroke::new(thickness, track));
+
+    let clamped = ratio.clamp(0.0, 1.0);
+    if clamped >= 0.996 {
+        painter.circle_stroke(center, radius, Stroke::new(thickness, color));
+    } else if clamped > 0.005 {
+        let sweep = (clamped * TAU).max(0.18);
+        paint_ring_arc(painter, center, radius, thickness, -FRAC_PI_2, sweep, color);
+    }
+
+    paint_ring_center_text(
+        painter,
+        center,
+        center_value,
+        center_caption,
+        value_color,
+        p.text_muted,
+    );
+    resp
+}
+
+fn ring_track_color(p: &Palette) -> Color32 {
+    match p.mode {
+        ThemeMode::Light => Color32::from_rgb(0xE5, 0xEA, 0xF2),
+        ThemeMode::Dark => with_alpha(p.border_strong, 105),
+    }
+}
+
+fn paint_ring_arc(
+    painter: &egui::Painter,
+    center: Pos2,
+    radius: f32,
+    thickness: f32,
+    start_angle: f32,
+    sweep: f32,
+    color: Color32,
+) {
+    if sweep <= 0.01 {
+        return;
+    }
+    let cap_r = thickness * 0.5;
+    let cap_angle = (cap_r / radius).min(sweep * 0.42);
+    let a0 = start_angle + cap_angle;
+    let a1 = start_angle + sweep - cap_angle;
+    if a1 <= a0 {
+        let mid = start_angle + sweep * 0.5;
+        let pt = Pos2::new(center.x + radius * mid.cos(), center.y + radius * mid.sin());
+        painter.circle_filled(pt, cap_r, color);
+        return;
+    }
+    let span = a1 - a0;
+    let steps = ((span / TAU) * 72.0).ceil().clamp(10.0, 72.0) as usize;
+    let mut pts = Vec::with_capacity(steps + 1);
+    for i in 0..=steps {
+        let ang = a0 + span * (i as f32 / steps as f32);
+        pts.push(Pos2::new(
+            center.x + radius * ang.cos(),
+            center.y + radius * ang.sin(),
+        ));
+    }
+    if let (Some(&first), Some(&last)) = (pts.first(), pts.last()) {
+        painter.add(egui::Shape::line(pts, Stroke::new(thickness, color)));
+        painter.circle_filled(first, cap_r, color);
+        painter.circle_filled(last, cap_r, color);
+    }
+}
+
+fn paint_ring_center_text(
+    painter: &egui::Painter,
+    center: Pos2,
+    value: &str,
+    caption: &str,
+    value_color: Color32,
+    caption_color: Color32,
+) {
+    let val_size = if value.chars().count() >= 6 {
+        11.8
+    } else {
+        13.0
+    };
+    painter.text(
+        Pos2::new(center.x, center.y - 6.0),
+        egui::Align2::CENTER_CENTER,
+        value,
+        egui::FontId::new(val_size, crate::ui::theme::bold_family()),
+        value_color,
+    );
+    painter.text(
+        Pos2::new(center.x, center.y + 10.5),
+        egui::Align2::CENTER_CENTER,
+        caption,
+        egui::FontId::proportional(9.4),
+        caption_color,
+    );
+}
+
+/// 右卡：在线设备（聚焦当前在线终端、并发配额与清晰状态说明，悬停页脚入口可按需查看近期上网记录）。
 fn draw_online_devices_card(
     ui: &mut egui::Ui,
     p: &Palette,
@@ -531,20 +805,20 @@ fn draw_online_devices_card(
     let now_unix = Local::now().timestamp();
 
     card_padded(ui, p, 12, |ui| {
-        let inner_h = (target_height - 26.0).max(148.0);
+        let inner_h = (target_height - 26.0).max(110.0);
         ui.set_min_height(inner_h);
         ui.set_max_height(inner_h);
         ui.spacing_mut().item_spacing.y = 0.0;
 
         let card_w = ui.available_width();
 
-        // 1. 顶部标题行（26px）
+        // 1. 顶部标题行（26px）：在线设备 + 并发配额徽章 + 同步时间 + 刷新按钮
         ui.allocate_ui_with_layout(
             Vec2::new(card_w, 26.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
-                section_heading(ui, Icon::Monitor, p.ok, "在线设备与记录", p.text, 26.0);
+                section_heading(ui, Icon::Monitor, p.ok, "在线设备", p.text, 26.0);
 
                 if let Some(data) = &self_service.data {
                     let count = data.online_devices.len();
@@ -573,7 +847,7 @@ fn draw_online_devices_card(
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
+                    ui.spacing_mut().item_spacing.x = 5.0;
                     if icon_button(
                         ui,
                         p,
@@ -581,7 +855,7 @@ fn draw_online_devices_card(
                         Vec2::splat(24.0),
                         12.0,
                         false,
-                        "刷新在线终端与近期上网记录",
+                        "刷新在线终端列表",
                     )
                     .clicked()
                     {
@@ -608,16 +882,15 @@ fn draw_online_devices_card(
             },
         );
 
-        ui.add_space(7.0);
+        ui.add_space(8.0);
 
-        let body_h = (inner_h - 33.0).max(90.0);
+        let body_h = (inner_h - 34.0).max(76.0);
 
         let Some(data) = &self_service.data else {
             draw_devices_placeholder(ui, p, self_service, local_campus_ip, card_w, body_h);
             return;
         };
 
-        // 2. 上半区：当前在线设备（1–2 台直出不建 ScrollArea，避免 egui 默认 64px 最小高度撑高卡片；超 2 台可滚）
         let mut devices: Vec<(&OnlineDevice, bool)> = data
             .online_devices
             .iter()
@@ -631,37 +904,36 @@ fn draw_online_devices_card(
             .collect();
         devices.sort_by_key(|(_, is_local)| !*is_local);
 
-        let at_limit = data
-            .max_online_devices
-            .is_some_and(|m| devices.len() >= m as usize);
-        let online_area_h = match devices.len() {
-            0 | 1 => 28.0_f32,
-            2 => 60.0_f32.min(body_h * 0.56),
-            _ => 62.0_f32.min(body_h * 0.56),
-        };
+        let count = devices.len();
+        let local_present = devices.iter().any(|(_, is_local)| *is_local);
+        let other_count = devices.iter().filter(|(_, is_local)| !*is_local).count();
+        let at_limit = data.max_online_devices.is_some_and(|m| count >= m as usize);
+
+        // 2. 在线终端列表区（默认 58px：1 台舒展双行卡片 / 2 台两行齐平直出 / 3+ 台平滑滚动）
+        let footer_total_h = 22.0_f32;
+        let dev_area_h = (body_h - footer_total_h).max(52.0);
 
         ui.allocate_ui_with_layout(
-            Vec2::new(card_w, online_area_h),
+            Vec2::new(card_w, dev_area_h),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
                 ui.spacing_mut().item_spacing.y = 4.0;
                 if devices.is_empty() {
-                    let (rect, _) = ui.allocate_exact_size(Vec2::new(card_w, 28.0), Sense::hover());
-                    ui.painter().rect(
-                        rect,
-                        CornerRadius::same(6),
-                        p.subtle,
-                        Stroke::new(1.0_f32, p.divider),
-                        StrokeKind::Inside,
+                    draw_empty_devices_box(ui, p, card_w, dev_area_h.min(54.0));
+                } else if devices.len() == 1 {
+                    let (dev, is_local) = devices[0];
+                    draw_featured_device_card(
+                        ui,
+                        p,
+                        dev,
+                        is_local,
+                        at_limit || login_rejected,
+                        data.fetched_at_unix,
+                        now_unix,
+                        card_w,
+                        dev_area_h.min(56.0),
                     );
-                    ui.painter().text(
-                        Pos2::new(rect.left() + 10.0, rect.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        "当前账号暂无在线终端会话",
-                        egui::FontId::proportional(10.8),
-                        p.text_muted,
-                    );
-                } else if devices.len() <= 2 {
+                } else if devices.len() == 2 && dev_area_h >= 56.0 {
                     for (dev, is_local) in &devices {
                         draw_online_device_row(
                             ui,
@@ -677,7 +949,7 @@ fn draw_online_devices_card(
                     egui::ScrollArea::vertical()
                         .id_salt("online_devices_scroll")
                         .min_scrolled_height(0.0)
-                        .max_height(online_area_h)
+                        .max_height(dev_area_h)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.set_width(card_w);
@@ -698,73 +970,235 @@ fn draw_online_devices_card(
             },
         );
 
-        ui.add_space(7.0);
+        // 3. 底部固定 22px 并发余量说明 + 悬停查看近期记录轻入口（保证与左卡底边 0.0px 齐平）
+        ui.add_space(4.0);
         let sep = ui.allocate_space(Vec2::new(card_w, 1.0)).1;
         ui.painter().line_segment(
             [sep.left_center(), sep.right_center()],
             Stroke::new(1.0_f32, p.divider),
         );
-        ui.add_space(5.0);
+        ui.add_space(3.0);
 
-        // 3. 下半区：门户最近上网记录（带真实运营商流量，严控剩余高度与左卡底部严格齐平）
+        let (summary_text, summary_color) = if login_rejected && count > 0 {
+            (
+                "认证被拒 · 检测到占线设备，请检查并发上限".to_string(),
+                p.danger,
+            )
+        } else if let Some(max) = data.max_online_devices {
+            let max_u = max as usize;
+            let rem = max_u.saturating_sub(count);
+            if count >= max_u {
+                (
+                    format!("已达并发上限（{count}/{max}），再登新设备可能挤线"),
+                    p.warn,
+                )
+            } else if other_count > 0 {
+                (
+                    format!("含 {other_count} 台其他终端并发 · 还可再连 {rem} 台"),
+                    p.text_secondary,
+                )
+            } else if count == 1 && local_present {
+                (
+                    format!("仅本机在线 · 同账号还可同时连 {rem} 台终端"),
+                    p.text_muted,
+                )
+            } else if count == 0 {
+                (
+                    format!("当前无在线终端 · 最多支持 {max} 台并发登录"),
+                    p.text_muted,
+                )
+            } else {
+                (
+                    format!("当前 {count} 台在线 · 还可再连 {rem} 台"),
+                    p.text_muted,
+                )
+            }
+        } else if other_count > 0 {
+            (
+                format!("含 {other_count} 台其他终端并发在线"),
+                p.text_secondary,
+            )
+        } else if count == 1 && local_present {
+            (
+                "仅本机在线 · 同一学号支持多运营商并发".to_string(),
+                p.text_muted,
+            )
+        } else {
+            ("认证成功后自动同步当前在线终端".to_string(), p.text_muted)
+        };
+
         ui.allocate_ui_with_layout(
-            Vec2::new(card_w, 15.0),
+            Vec2::new(card_w, 14.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(body_text("最近上网记录（实际流量）", 10.0, p.text_muted));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let count_str = match data.traffic.month_session_count {
-                        Some(n) => format!("本月 {n} 次"),
-                        None if !data.recent_sessions.is_empty() => {
-                            format!("最近 {} 条", data.recent_sessions.len())
-                        }
-                        None => String::new(),
-                    };
-                    if !count_str.is_empty() {
-                        let resp = ui.label(body_text(&count_str, 10.0, p.text_muted));
-                        if !data.recent_sessions.is_empty() {
-                            resp.on_hover_ui(|ui| {
-                                draw_recent_sessions_full_tooltip(ui, p, data);
-                            });
-                        }
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if !data.recent_sessions.is_empty() {
+                        let resp = ui.add(
+                            egui::Label::new(body_text("近期记录", 10.0, p.accent))
+                                .sense(Sense::hover()),
+                        );
+                        resp.on_hover_ui(|ui| {
+                            draw_recent_sessions_full_tooltip(ui, p, data);
+                        });
                     }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                        ui.add(
+                            egui::Label::new(body_text(&summary_text, 10.0, summary_color))
+                                .truncate(),
+                        )
+                        .on_hover_text(&summary_text);
+                    });
                 });
             },
         );
-        ui.add_space(3.0);
-
-        let hist_h = (body_h - online_area_h - 31.0).max(20.0);
-        if data.recent_sessions.is_empty() {
-            ui.allocate_ui_with_layout(
-                Vec2::new(card_w, hist_h),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.label(body_text("暂无近期上网记录", 10.5, p.text_muted));
-                },
-            );
-        } else {
-            ui.allocate_ui_with_layout(
-                Vec2::new(card_w, hist_h),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt("recent_sessions_scroll")
-                        .min_scrolled_height(0.0)
-                        .max_height(hist_h)
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.set_width(card_w);
-                            ui.spacing_mut().item_spacing.y = 2.0;
-                            for rec in &data.recent_sessions {
-                                draw_recent_session_row(ui, p, rec, local_campus_ip);
-                            }
-                        });
-                },
-            );
-        }
     });
 
     refresh_clicked
+}
+
+fn draw_empty_devices_box(ui: &mut egui::Ui, p: &Palette, width: f32, height: f32) {
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(7),
+        p.subtle,
+        Stroke::new(1.0_f32, p.divider),
+        StrokeKind::Inside,
+    );
+    let cy = rect.center().y;
+    ui.painter()
+        .circle_filled(Pos2::new(rect.left() + 14.0, cy - 7.5), 3.0, p.neutral);
+    ui.painter().text(
+        Pos2::new(rect.left() + 24.0, cy - 7.5),
+        egui::Align2::LEFT_CENTER,
+        "当前账号暂无在线终端会话",
+        egui::FontId::new(11.2, crate::ui::theme::bold_family()),
+        p.text_secondary,
+    );
+    ui.painter().text(
+        Pos2::new(rect.left() + 24.0, cy + 9.0),
+        egui::Align2::LEFT_CENTER,
+        "连入并认证校园网后，将自动展示各终端 IP 与上线时长",
+        egui::FontId::proportional(10.0),
+        p.text_muted,
+    );
+}
+
+/// 仅 1 台终端在线时的舒展双行卡片（充分利用空间，杜绝空洞感）。
+#[allow(clippy::too_many_arguments)]
+fn draw_featured_device_card(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    dev: &OnlineDevice,
+    is_local: bool,
+    highlight_conflict: bool,
+    fetched_at_unix: i64,
+    now_unix: i64,
+    width: f32,
+    height: f32,
+) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    let (fill, stroke) = if resp.hovered() {
+        (p.card_hover, Stroke::new(1.0_f32, p.border_strong))
+    } else if !is_local && highlight_conflict {
+        (p.warn_soft, Stroke::new(1.0_f32, p.warn_border))
+    } else {
+        (p.subtle, Stroke::new(1.0_f32, p.divider))
+    };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(7),
+        fill,
+        stroke,
+        StrokeKind::Inside,
+    );
+
+    let painter = ui.painter();
+    let top_y = rect.top() + height * 0.34;
+    let bot_y = rect.top() + height * 0.72;
+    let mut x = rect.left() + 11.0;
+
+    let dot_c = if is_local {
+        p.ok
+    } else if highlight_conflict {
+        p.warn
+    } else {
+        p.accent
+    };
+    painter.circle_filled(Pos2::new(x + 3.0, top_y), 3.3, dot_c);
+    x += 12.0;
+
+    if !dev.terminal_type.is_empty() {
+        x = paint_mini_pill(
+            painter,
+            x,
+            top_y,
+            &dev.terminal_type,
+            p.text_secondary,
+            p.card,
+            p.border,
+        ) + 6.0;
+    }
+
+    let ip_galley = painter.layout_no_wrap(
+        dev.ip.clone(),
+        egui::FontId::new(12.2, egui::FontFamily::Monospace),
+        p.text,
+    );
+    painter.galley(
+        Pos2::new(x, top_y - ip_galley.size().y * 0.5),
+        ip_galley.clone(),
+        p.text,
+    );
+    x += ip_galley.size().x + 6.0;
+
+    let (id_lbl, id_fg, id_bg, id_bd) = if is_local {
+        ("本机", p.ok, p.ok_soft, p.ok_border)
+    } else if highlight_conflict {
+        ("占线终端", p.warn, p.warn_soft, p.warn_border)
+    } else {
+        (
+            "其他终端",
+            p.text_secondary,
+            p.neutral_soft,
+            p.neutral_border,
+        )
+    };
+    let _ = paint_mini_pill(painter, x, top_y, id_lbl, id_fg, id_bg, id_bd);
+
+    let elapsed_secs = device_elapsed_secs(dev, fetched_at_unix, now_unix);
+    if elapsed_secs > 0 {
+        painter.text(
+            Pos2::new(rect.right() - 11.0, top_y),
+            egui::Align2::RIGHT_CENTER,
+            format!("已在线 {}", format_duration_short(elapsed_secs)),
+            egui::FontId::new(10.8, crate::ui::theme::bold_family()),
+            p.text_secondary,
+        );
+    }
+
+    let start_hm = device_start_hm(dev);
+    let sub_text = if is_local {
+        format!("{start_hm} 上线 · 自助服务已核验本机活跃会话")
+    } else if highlight_conflict {
+        format!("{start_hm} 上线 · 其他终端占线，若登录被拒请排查并发名额")
+    } else {
+        format!("{start_hm} 上线 · 同账号另一终端当前在线")
+    };
+    painter.text(
+        Pos2::new(rect.left() + 23.0, bot_y),
+        egui::Align2::LEFT_CENTER,
+        sub_text,
+        egui::FontId::proportional(10.0),
+        p.text_muted,
+    );
+
+    if resp.hovered() {
+        resp.on_hover_ui(|ui| {
+            draw_device_detail_tooltip(ui, p, dev, is_local, elapsed_secs);
+        });
+    }
 }
 
 fn draw_devices_placeholder(
@@ -779,31 +1213,31 @@ fn draw_devices_placeholder(
         .fill(p.subtle)
         .stroke(Stroke::new(1.0_f32, p.divider))
         .corner_radius(CornerRadius::same(7))
-        .inner_margin(egui::Margin::symmetric(12, 10))
+        .inner_margin(egui::Margin::symmetric(12, 9))
         .show(ui, |ui| {
             let iw = (width - 26.0).max(120.0);
-            let ih = (height - 22.0).max(60.0);
+            let ih = (height - 20.0).max(52.0);
             ui.set_min_size(Vec2::new(iw, ih));
             ui.set_max_size(Vec2::new(iw, ih));
             ui.vertical(|ui| {
-                ui.spacing_mut().item_spacing.y = 6.0;
+                ui.spacing_mut().item_spacing.y = 5.0;
                 if !local_campus_ip.is_empty() {
                     ui.horizontal(|ui| {
                         ui.spacing_mut().item_spacing.x = 6.0;
                         let (dr, _) = ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
                         ui.painter().circle_filled(dr.center(), 3.2, p.ok);
-                        ui.label(body_text("本机校园网 IP", 11.0, p.text_secondary));
-                        ui.label(mono_text(local_campus_ip, 11.5, p.text));
+                        ui.label(body_text("本机校园网 IP", 10.8, p.text_secondary));
+                        ui.label(mono_text(local_campus_ip, 11.4, p.text));
                     });
                 }
                 let hint = match self_service.status {
-                    SelfServiceStatus::Refreshing => "正在向校园网自助服务拉取在线终端与上网记录…",
+                    SelfServiceStatus::Refreshing => "正在向校园网自助服务拉取在线终端列表…",
                     SelfServiceStatus::CaptchaCooldown => self_service.message.as_str(),
                     SelfServiceStatus::NoCredentials => "请先在设置中保存校园网学号与密码",
                     _ if !self_service.message.is_empty() => self_service.message.as_str(),
-                    _ => "连入校园网内网后，将自动同步当前在线终端、并发上限与近期记录",
+                    _ => "连入校园网内网后，将自动同步当前在线终端与并发配额",
                 };
-                ui.add(egui::Label::new(body_text(hint, 10.8, p.text_muted)).wrap());
+                ui.add(egui::Label::new(body_text(hint, 10.4, p.text_muted)).wrap());
             });
         });
 }
@@ -818,7 +1252,7 @@ fn draw_online_device_row(
     now_unix: i64,
 ) {
     let row_w = ui.available_width();
-    let row_h = 28.0_f32;
+    let row_h = 27.0_f32;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(row_w, row_h), Sense::hover());
     let (fill, stroke) = if resp.hovered() {
         (p.card_hover, Stroke::new(1.0_f32, p.border_strong))
@@ -839,7 +1273,6 @@ fn draw_online_device_row(
     let painter = ui.painter();
     let mut x = rect.left() + 9.0;
 
-    // 1. 状态圆点
     let dot_c = if is_local {
         p.ok
     } else if highlight_conflict {
@@ -850,7 +1283,6 @@ fn draw_online_device_row(
     painter.circle_filled(Pos2::new(x + 3.0, cy), 3.0, dot_c);
     x += 12.0;
 
-    // 2. 终端类型小标签（如 PC / 手机）
     if !dev.terminal_type.is_empty() {
         x = paint_mini_pill(
             painter,
@@ -863,7 +1295,6 @@ fn draw_online_device_row(
         ) + 6.0;
     }
 
-    // 3. 等宽 IP
     let ip_galley = painter.layout_no_wrap(
         dev.ip.clone(),
         egui::FontId::new(11.3, egui::FontFamily::Monospace),
@@ -876,37 +1307,23 @@ fn draw_online_device_row(
     );
     x += ip_galley.size().x + 6.0;
 
-    // 4. 身份徽章（本机 / 其他终端）
     let (id_lbl, id_fg, id_bg, id_bd) = if is_local {
         ("本机", p.ok, p.ok_soft, p.ok_border)
     } else if highlight_conflict {
-        ("占线终端", p.warn, p.warn_soft, p.warn_border)
+        ("占线", p.warn, p.warn_soft, p.warn_border)
     } else {
-        (
-            "其他终端",
-            p.text_secondary,
-            p.neutral_soft,
-            p.neutral_border,
-        )
+        ("其他", p.text_secondary, p.neutral_soft, p.neutral_border)
     };
     let _ = paint_mini_pill(painter, x, cy, id_lbl, id_fg, id_bg, id_bd);
 
-    // 5. 右侧上线时刻 + 实时在线时长
-    let start_hm = dev
-        .login_time
-        .split_whitespace()
-        .nth(1)
-        .and_then(|t| t.get(..5))
-        .unwrap_or("--:--");
-    let elapsed_secs = if let Some(use_secs) = dev.use_time_secs {
-        use_secs.saturating_add((now_unix - fetched_at_unix).max(0) as u64)
-    } else if let Some(ts) = dev.login_unix {
-        (now_unix - ts).max(0) as u64
-    } else {
-        0
-    };
+    let start_hm = device_start_hm(dev);
+    let elapsed_secs = device_elapsed_secs(dev, fetched_at_unix, now_unix);
     let right_txt = if elapsed_secs > 0 {
-        format!("{start_hm} 上线 · {}", format_duration_short(elapsed_secs))
+        if row_w >= 330.0 {
+            format!("{start_hm} 上线 · {}", format_duration_short(elapsed_secs))
+        } else {
+            format!("{start_hm} · {}", format_duration_short(elapsed_secs))
+        }
     } else {
         format!("{start_hm} 上线")
     };
@@ -920,124 +1337,54 @@ fn draw_online_device_row(
 
     if resp.hovered() {
         resp.on_hover_ui(|ui| {
-            ui.set_min_width(210.0);
-            ui.spacing_mut().item_spacing.y = 4.0;
-            ui.label(bold_text(
-                if is_local {
-                    "当前本机在线会话"
-                } else {
-                    "同账号其他在线终端"
-                },
-                11.5,
-                p.text,
-            ));
-            detail_kv_row(ui, p, "校园网 IP", &dev.ip);
-            if !dev.terminal_type.is_empty() {
-                detail_kv_row(ui, p, "终端类型", &dev.terminal_type);
-            }
-            detail_kv_row(ui, p, "上线时间", &dev.login_time);
-            if elapsed_secs > 0 {
-                detail_kv_row(ui, p, "已在线时长", &format_duration_short(elapsed_secs));
-            }
+            draw_device_detail_tooltip(ui, p, dev, is_local, elapsed_secs);
         });
     }
 }
 
-fn draw_recent_session_row(
+fn device_start_hm(dev: &OnlineDevice) -> &str {
+    dev.login_time
+        .split_whitespace()
+        .nth(1)
+        .and_then(|t| t.get(..5))
+        .unwrap_or("--:--")
+}
+
+fn device_elapsed_secs(dev: &OnlineDevice, fetched_at_unix: i64, now_unix: i64) -> u64 {
+    if let Some(use_secs) = dev.use_time_secs {
+        use_secs.saturating_add((now_unix - fetched_at_unix).max(0) as u64)
+    } else if let Some(ts) = dev.login_unix {
+        (now_unix - ts).max(0) as u64
+    } else {
+        0
+    }
+}
+
+fn draw_device_detail_tooltip(
     ui: &mut egui::Ui,
     p: &Palette,
-    rec: &RecentSession,
-    local_campus_ip: &str,
+    dev: &OnlineDevice,
+    is_local: bool,
+    elapsed_secs: u64,
 ) {
-    let row_w = ui.available_width();
-    let row_h = 18.0_f32;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(row_w, row_h), Sense::hover());
-    if resp.hovered() {
-        ui.painter()
-            .rect_filled(rect, CornerRadius::same(4), p.subtle);
+    ui.set_min_width(214.0);
+    ui.spacing_mut().item_spacing.y = 4.0;
+    ui.label(bold_text(
+        if is_local {
+            "当前本机在线会话"
+        } else {
+            "同账号其他在线终端"
+        },
+        11.5,
+        p.text,
+    ));
+    detail_kv_row(ui, p, "校园网 IP", &dev.ip);
+    if !dev.terminal_type.is_empty() {
+        detail_kv_row(ui, p, "终端类型", &dev.terminal_type);
     }
-
-    let cy = rect.center().y;
-    let painter = ui.painter();
-    let start_hm = format_hm(rec.login_unix_ms / 1000);
-    let end_hm = rec
-        .logout_unix_ms
-        .map(|ms| format_hm(ms / 1000))
-        .unwrap_or_else(|| "在线".to_string());
-    let span = format!("{start_hm}–{end_hm}");
-
-    let mut x = rect.left() + 3.0;
-    let span_g = painter.layout_no_wrap(
-        span,
-        egui::FontId::new(10.2, egui::FontFamily::Monospace),
-        p.text,
-    );
-    painter.galley(
-        Pos2::new(x, cy - span_g.size().y * 0.5),
-        span_g.clone(),
-        p.text,
-    );
-    x += span_g.size().x + 5.0;
-
-    let dur_txt = if rec.duration_secs > 0 {
-        format_duration_short(rec.duration_secs)
-    } else {
-        "<1m".to_string()
-    };
-    let same_ip = !local_campus_ip.is_empty() && rec.ip == local_campus_ip;
-    let meta = format!("· {} · {dur_txt}", rec.ip);
-    painter.text(
-        Pos2::new(x, cy),
-        egui::Align2::LEFT_CENTER,
-        meta,
-        egui::FontId::proportional(10.2),
-        p.text_muted,
-    );
-
-    let flow_txt = format_mb_compact(rec.actual_total_mb());
-    painter.text(
-        Pos2::new(rect.right() - 3.0, cy),
-        egui::Align2::RIGHT_CENTER,
-        flow_txt,
-        egui::FontId::new(10.3, crate::ui::theme::bold_family()),
-        p.text,
-    );
-
-    if resp.hovered() {
-        resp.on_hover_ui(|ui| {
-            ui.set_min_width(226.0);
-            ui.spacing_mut().item_spacing.y = 4.0;
-            ui.label(bold_text("门户上网记录明细", 11.5, p.text));
-            detail_kv_row(ui, p, "上线时间", &format_md_hms(rec.login_unix_ms / 1000));
-            let logout_str = rec
-                .logout_unix_ms
-                .map(|ms| format_md_hms(ms / 1000))
-                .unwrap_or_else(|| "尚未下线".to_string());
-            detail_kv_row(ui, p, "下线时间", &logout_str);
-            detail_kv_row(
-                ui,
-                p,
-                "登录 IP",
-                &if same_ip {
-                    format!("{}（本机）", rec.ip)
-                } else {
-                    rec.ip.clone()
-                },
-            );
-            detail_kv_row(ui, p, "真实时长", &dur_txt);
-            detail_kv_row(
-                ui,
-                p,
-                "实际流量",
-                &format!(
-                    "{}（↓{} ↑{}）",
-                    format_mb_compact(rec.actual_total_mb()),
-                    format_mb_short(rec.actual_down_mb),
-                    format_mb_short(rec.actual_up_mb),
-                ),
-            );
-            detail_kv_row(ui, p, "校园网计费", &format_mb_compact(rec.campus_flow_mb));
-        });
+    detail_kv_row(ui, p, "上线时间", &dev.login_time);
+    if elapsed_secs > 0 {
+        detail_kv_row(ui, p, "已在线时长", &format_duration_short(elapsed_secs));
     }
 }
 
@@ -1045,7 +1392,7 @@ fn draw_recent_sessions_full_tooltip(ui: &mut egui::Ui, p: &Palette, data: &Self
     ui.set_min_width(276.0);
     ui.spacing_mut().item_spacing.y = 4.0;
     ui.label(bold_text(
-        "门户最近上网记录（含运营商实际流量）",
+        "门户近期上网记录（含运营商实际流量）",
         11.5,
         p.text,
     ));
@@ -1099,102 +1446,9 @@ fn paint_mini_pill(
     rect.right()
 }
 
-fn draw_dual_bar(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    width: f32,
-    height: f32,
-    left_frac: f32,
-    has_left: bool,
-    has_right: bool,
-) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
-    let r = CornerRadius::same((height * 0.5).round() as u8);
-    let painter = ui.painter();
-    painter.rect_filled(rect, r, p.subtle);
+// ── Tier 3：通栏纤薄「连接稳定性」胶囊时间轴 ────────────────────────────
 
-    if !has_left && !has_right {
-        return;
-    }
-    let gap = if has_left && has_right { 2.0_f32 } else { 0.0 };
-    let usable = (width - gap).max(4.0);
-    let lw = if has_left && has_right {
-        (usable * left_frac.clamp(0.06, 0.94)).round()
-    } else if has_left {
-        usable
-    } else {
-        0.0
-    };
-    let rw = if has_right {
-        (usable - lw).max(0.0)
-    } else {
-        0.0
-    };
-
-    if lw > 0.5 {
-        let lr = Rect::from_min_size(rect.min, Vec2::new(lw, height));
-        painter.rect_filled(lr, r, p.accent);
-    }
-    if rw > 0.5 {
-        let rr = Rect::from_min_size(
-            Pos2::new(rect.left() + lw + gap, rect.top()),
-            Vec2::new(rw, height),
-        );
-        painter.rect_filled(rr, r, p.ok);
-    }
-}
-
-fn draw_single_bar(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    width: f32,
-    height: f32,
-    ratio: f32,
-    has_value: bool,
-    color: Color32,
-) {
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
-    let r = CornerRadius::same((height * 0.5).round() as u8);
-    let painter = ui.painter();
-    painter.rect_filled(rect, r, p.subtle);
-    if has_value {
-        let fw = (width * ratio.clamp(0.0, 1.0)).max(8.0).min(width);
-        let fr = Rect::from_min_size(rect.min, Vec2::new(fw, height));
-        painter.rect_filled(fr, r, color);
-    }
-}
-
-fn inline_dot_metric(ui: &mut egui::Ui, p: &Palette, color: Color32, label: &str, value: &str) {
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = 4.0;
-        let (dr, _) = ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
-        ui.painter().circle_filled(dr.center(), 3.0, color);
-        ui.label(body_text(label, 10.5, p.text_muted));
-        ui.label(bold_text(value, 10.8, p.text));
-    });
-}
-
-fn compact_kv_row(ui: &mut egui::Ui, p: &Palette, key: &str, value: &str, tooltip: Option<&str>) {
-    let resp = ui
-        .allocate_ui_with_layout(
-            Vec2::new(ui.available_width(), 18.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.label(body_text(key, 10.4, p.text_muted));
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.add(egui::Label::new(bold_text(value, 10.5, p.text_secondary)).truncate());
-                });
-            },
-        )
-        .response;
-    if let Some(tip) = tooltip {
-        resp.on_hover_text(tip);
-    }
-}
-
-// ── Tier 3：通栏紧凑「连接稳定性」胶囊时间轴 ────────────────────────────
-
-/// 位于双卡之下、运行日志之上的通栏紧凑稳定性面板（固定自然高度，无冗余断联列表）。
+/// 位于双卡之下、运行日志之上的通栏纤薄稳定性条（~78px 高，悬停黄格即看完整断联卡片）。
 pub fn draw_stability_strip(
     ui: &mut egui::Ui,
     p: &Palette,
@@ -1208,76 +1462,98 @@ pub fn draw_stability_strip(
     let track = build_health_track(all_points, now, *range);
     let has_outages = !outages.events.is_empty();
 
-    card_padded(ui, p, 12, |ui| {
-        ui.spacing_mut().item_spacing.y = 0.0;
-        let card_w = ui.available_width();
+    let shadow = match p.mode {
+        ThemeMode::Light => egui::Shadow {
+            offset: [0, 1],
+            blur: 4,
+            spread: 0,
+            color: p.shadow,
+        },
+        ThemeMode::Dark => egui::Shadow::NONE,
+    };
 
-        // 1. 单行紧凑标题 + 在线率 + 主因摘要 + 图例 + 1h/7h/24h
-        ui.allocate_ui_with_layout(
-            Vec2::new(card_w, 26.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.spacing_mut().item_spacing.x = 7.0;
-                section_heading(ui, Icon::Shield, p.ok, "连接稳定性", p.text, 26.0);
+    egui::Frame::new()
+        .fill(p.card)
+        .stroke(Stroke::new(1.0_f32, p.border))
+        .corner_radius(CornerRadius::same(RADIUS_MD))
+        .inner_margin(egui::Margin::symmetric(12, 8))
+        .shadow(shadow)
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().item_spacing.y = 0.0;
+            let card_w = ui.available_width();
 
-                if let Some(pct) = stats.uptime_pct {
-                    let rate_color = if pct >= 98.0 {
-                        p.text
-                    } else if pct >= 90.0 {
-                        p.warn
+            // 1. 单行紧凑标题 + 在线率 + 主因摘要 + 图例 + 1h/7h/24h（26px 与分段器等高）
+            ui.allocate_ui_with_layout(
+                Vec2::new(card_w, 26.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.spacing_mut().item_spacing.x = 7.0;
+                    section_heading(ui, Icon::Shield, p.ok, "连接稳定性", p.text, 26.0);
+
+                    if let Some(pct) = stats.uptime_pct {
+                        let rate_color = if pct >= 98.0 {
+                            p.text
+                        } else if pct >= 90.0 {
+                            p.warn
+                        } else {
+                            p.danger
+                        };
+                        ui.label(bold_text(
+                            format_uptime_pct(pct, has_outages),
+                            14.5,
+                            rate_color,
+                        ));
                     } else {
-                        p.danger
-                    };
-                    ui.label(bold_text(
-                        format_uptime_pct(pct, has_outages),
-                        15.5,
-                        rate_color,
-                    ));
-                } else {
-                    ui.label(bold_text("—", 15.5, p.text_muted));
-                }
-
-                let summary = if let Some(primary) = outages.primary_reason() {
-                    format!(
-                        "在线率 · {} 次断联（主因：{}，悬停黄格看详情）",
-                        outages.events.len(),
-                        reason_label(primary)
-                    )
-                } else if stats.check_count > 0 {
-                    format!("在线率 · 过去 {} 全程稳定", range.label())
-                } else {
-                    "等待巡检采样".to_string()
-                };
-
-                // 右侧先留出固定宽度的图例 + 分段器，确保左侧摘要按剩余宽度干净截断
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 10.0;
-                    let mut idx = range.index();
-                    let labels = ["1h", "7h", "24h"];
-                    if segmented_control(ui, p, "stab_strip_range_seg", &mut idx, &labels) {
-                        *range = TimeRange::from_index(idx);
+                        ui.label(bold_text("—", 14.5, p.text_muted));
                     }
-                    if card_w >= 620.0 {
-                        // 在 right_to_left 容器中倒序放置，最终从左到右呈现：「● 在线  ● 断联  ○ 未运行」
-                        legend_dot_item(ui, p, None, "未运行");
-                        legend_dot_item(ui, p, Some(p.warn), "断联");
-                        legend_dot_item(ui, p, Some(Color32::from_rgb(0x10, 0xB9, 0x81)), "在线");
-                    }
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.add(
-                            egui::Label::new(body_text(&summary, 10.5, p.text_muted)).truncate(),
+
+                    let summary = if let Some(primary) = outages.primary_reason() {
+                        format!(
+                            "在线率 · {} 次断联（主因：{}，悬停黄格看详情）",
+                            outages.events.len(),
+                            reason_label(primary)
                         )
-                        .on_hover_text(&summary);
+                    } else if stats.check_count > 0 {
+                        format!("在线率 · 过去 {} 全程稳定", range.label())
+                    } else {
+                        "等待巡检采样".to_string()
+                    };
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        ui.spacing_mut().item_spacing.x = 10.0;
+                        let mut idx = range.index();
+                        let labels = ["1h", "7h", "24h"];
+                        if segmented_control(ui, p, "stab_strip_range_seg", &mut idx, &labels) {
+                            *range = TimeRange::from_index(idx);
+                        }
+                        if card_w >= 620.0 {
+                            // right_to_left 容器中倒序放置，最终从左到右呈现：「● 在线  ● 断联  ○ 未运行」
+                            legend_dot_item(ui, p, None, "未运行");
+                            legend_dot_item(ui, p, Some(p.warn), "断联");
+                            legend_dot_item(
+                                ui,
+                                p,
+                                Some(Color32::from_rgb(0x10, 0xB9, 0x81)),
+                                "在线",
+                            );
+                        }
+                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                            ui.add(
+                                egui::Label::new(body_text(&summary, 10.3, p.text_muted))
+                                    .truncate(),
+                            )
+                            .on_hover_text(&summary);
+                        });
                     });
-                });
-            },
-        );
+                },
+            );
 
-        ui.add_space(6.0);
+            ui.add_space(4.0);
 
-        // 2. 通栏 48/42/30 枚细胶囊时间轴 + 真实时刻标尺
-        draw_capsule_timeline(ui, p, &track, &points, &outages.events, now, *range);
-    });
+            // 2. 通栏纤薄胶囊时间轴 + 真实时刻标尺（30px）
+            draw_capsule_timeline(ui, p, &track, &points, &outages.events, now, *range);
+        });
 }
 
 fn format_uptime_pct(pct: f64, has_outages: bool) -> String {
@@ -1321,9 +1597,9 @@ fn legend_dot_item(ui: &mut egui::Ui, p: &Palette, filled: Option<Color32>, text
     );
 }
 
-/// 细粒度胶囊时间轴：
+/// 纤薄胶囊时间轴：
 /// - 24h = 48 枚细胶囊（30m/枚）、7h = 42 枚（10m/枚）、1h = 30 枚（2m/枚）
-/// - 悬停黄色/红色胶囊即弹出完整断联详情小卡（同槽多起断联全部在浮层内展示）
+/// - 胶囊高度压缩至 12px，整体仅 30px 高，悬停黄色/红色胶囊即弹出完整断联详情小卡
 fn draw_capsule_timeline(
     ui: &mut egui::Ui,
     p: &Palette,
@@ -1344,10 +1620,10 @@ fn draw_capsule_timeline(
     };
     let slot_secs = window_secs as f64 / slot_count as f64;
 
-    let top_lift = 3.0_f32;
-    let bar_h = 19.0_f32;
-    let ruler_gap = 4.0_f32;
-    let ruler_h = 16.0_f32;
+    let top_lift = 2.0_f32;
+    let bar_h = 12.0_f32;
+    let ruler_gap = 3.0_f32;
+    let ruler_h = 13.0_f32;
     let total_h = top_lift + bar_h + ruler_gap + ruler_h;
 
     let (full_rect, _) = ui.allocate_exact_size(Vec2::new(total_w, total_h), Sense::hover());
@@ -1360,7 +1636,7 @@ fn draw_capsule_timeline(
 
     let gap = if total_w < 500.0 { 2.0_f32 } else { 2.8_f32 };
     let slot_w = ((total_w - gap * (slot_count as f32 - 1.0)) / slot_count as f32).max(2.0);
-    let pill_r = CornerRadius::same((slot_w * 0.35).clamp(2.0, 3.0).round() as u8);
+    let pill_r = CornerRadius::same((slot_w * 0.30).clamp(2.0, 3.0).round() as u8);
     let online_green = Color32::from_rgb(0x10, 0xB9, 0x81);
 
     struct HoveredSlotInfo {
@@ -1444,9 +1720,9 @@ fn draw_capsule_timeline(
             );
             (r, color)
         } else if is_online {
-            let lift = if is_hovered { 2.0 } else { 0.0 };
+            let lift = if is_hovered { 1.5 } else { 0.0 };
             let r = Rect::from_min_max(
-                Pos2::new(x0, bar_rect.top() + 1.0 - lift),
+                Pos2::new(x0, bar_rect.top() + 0.5 - lift),
                 Pos2::new(x0 + slot_w, bar_rect.bottom()),
             );
             let fill = if is_hovered {
@@ -1456,20 +1732,20 @@ fn draw_capsule_timeline(
             };
             (r, fill)
         } else {
-            let idle_h = (bar_h * 0.46).max(8.0);
+            let idle_h = (bar_h * 0.45).max(5.0);
             let r = Rect::from_min_max(
                 Pos2::new(x0, bar_rect.bottom() - idle_h),
                 Pos2::new(x0 + slot_w, bar_rect.bottom()),
             );
             let fill = match p.mode {
-                crate::ui::theme::ThemeMode::Light => {
+                ThemeMode::Light => {
                     if is_hovered {
                         Color32::from_rgb(0xB8, 0xC2, 0xD1)
                     } else {
                         Color32::from_rgb(0xDC, 0xE2, 0xEB)
                     }
                 }
-                crate::ui::theme::ThemeMode::Dark => {
+                ThemeMode::Dark => {
                     if is_hovered {
                         with_alpha(p.border_strong, 175)
                     } else {
@@ -1569,13 +1845,13 @@ fn draw_capsule_timeline(
         Stroke::new(1.0_f32, p.divider),
     );
     let tick_stroke = Stroke::new(1.0_f32, with_alpha(p.text_muted, 130));
-    let tick_font = egui::FontId::proportional(9.5);
-    let label_y = ruler_top + 11.0;
+    let tick_font = egui::FontId::proportional(9.2);
+    let label_y = ruler_top + 9.0;
 
     painter.line_segment(
         [
             Pos2::new(bar_rect.left(), ruler_top),
-            Pos2::new(bar_rect.left(), ruler_top + 4.0),
+            Pos2::new(bar_rect.left(), ruler_top + 3.0),
         ],
         tick_stroke,
     );
@@ -1590,7 +1866,7 @@ fn draw_capsule_timeline(
     painter.line_segment(
         [
             Pos2::new(bar_rect.right(), ruler_top),
-            Pos2::new(bar_rect.right(), ruler_top + 4.0),
+            Pos2::new(bar_rect.right(), ruler_top + 3.0),
         ],
         tick_stroke,
     );
@@ -1598,7 +1874,7 @@ fn draw_capsule_timeline(
         Pos2::new(bar_rect.right(), label_y),
         egui::Align2::RIGHT_CENTER,
         "现在",
-        egui::FontId::new(9.5, crate::ui::theme::bold_family()),
+        egui::FontId::new(9.2, crate::ui::theme::bold_family()),
         p.text_secondary,
     );
 
@@ -1615,7 +1891,7 @@ fn draw_capsule_timeline(
             continue;
         }
         painter.line_segment(
-            [Pos2::new(tx, ruler_top), Pos2::new(tx, ruler_top + 4.0)],
+            [Pos2::new(tx, ruler_top), Pos2::new(tx, ruler_top + 3.0)],
             tick_stroke,
         );
         painter.text(
@@ -1839,6 +2115,26 @@ pub fn format_mb_compact(mb: f64) -> String {
     }
 }
 
+fn format_mb_ring(mb: f64) -> String {
+    let mb = if mb.is_finite() && mb > 0.0 { mb } else { 0.0 };
+    if mb >= 1024.0 * 1024.0 {
+        format!("{:.2}T", mb / (1024.0 * 1024.0))
+    } else if mb >= 1024.0 {
+        let gb = mb / 1024.0;
+        if gb >= 10.0 {
+            format!("{gb:.1}G")
+        } else {
+            format!("{gb:.2}G")
+        }
+    } else if mb >= 10.0 {
+        format!("{mb:.0}M")
+    } else if mb > 0.0 {
+        format!("{mb:.1}M")
+    } else {
+        "0M".to_string()
+    }
+}
+
 fn format_mb_short(mb: f64) -> String {
     let mb = if mb.is_finite() && mb > 0.0 { mb } else { 0.0 };
     if mb >= 1024.0 {
@@ -1883,7 +2179,7 @@ pub fn format_bytes_compact(bytes: u64) -> String {
     }
 }
 
-fn format_bytes_short(bytes: u64) -> String {
+fn format_bytes_ring(bytes: u64) -> String {
     const MB: f64 = 1024.0 * 1024.0;
     const GB: f64 = 1024.0 * 1024.0 * 1024.0;
     let b = bytes as f64;
@@ -1913,6 +2209,7 @@ mod tests {
         assert_eq!(format_mb_compact(535.203), "535 MB");
         assert_eq!(format_mb_compact(553_035.463), "540.1 GB");
         assert_eq!(format_mb_compact(365_007.37), "356.5 GB");
+        assert_eq!(format_mb_ring(365_885.566), "357.3G");
         assert_eq!(format_duration_short(8), "8s");
         assert_eq!(format_duration_short(125), "2m5s");
         assert_eq!(format_duration_short(3660), "1h01m");

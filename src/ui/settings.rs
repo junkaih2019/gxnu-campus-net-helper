@@ -1319,7 +1319,7 @@ fn draw_display_page(
             ui,
             p,
             "主页展示「账号流量与在线设备」卡片",
-            "展示校园网自助服务的实际流量、套餐余量、在线终端与近期上网记录；关闭后仅保留连接稳定性与运行日志",
+            "展示校园网自助服务的运营商实际流量、校园网套餐余量与当前在线终端；关闭后仅保留连接稳定性与运行日志",
             &mut ui_prefs.show_home_traffic,
             true,
             None,
@@ -1442,14 +1442,14 @@ fn draw_notify_data_page(
                         ui.spacing_mut().item_spacing.y = 2.0;
                         ui.label(bold_text("流量与设备数据源", 12.0, p.text));
                         ui.label(body_text(
-                            "官方流量与在线终端来自校园网自助服务（5 分钟低频缓存）；本机今日参考来自物理网卡增量（自动排除 TUN）",
+                            "账号流量与在线终端来自校园网自助服务（5 分钟低频缓存）；离校或未同步时自动降级展示本机网卡参考",
                             10.5,
                             p.text_muted,
                         ));
                     },
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    badge(ui, p.ok, p.ok_soft, p.ok_border, "自助服务 + 网卡");
+                    badge(ui, p.ok, p.ok_soft, p.ok_border, "自助服务直连");
                 });
             },
         );
