@@ -784,8 +784,8 @@ impl GuardApp {
                     ui.allocate_exact_size(Vec2::new(total_w, TITLEBAR_HEIGHT), Sense::hover());
                 let cy = text_rect.center().y;
                 let title_y = cy - title_g.size().y * 0.5;
-                // 同族微软雅黑不同字号按基线对齐（约 79% 行高处为基线）
-                let ver_y = title_y + (title_g.size().y - ver_g.size().y) * 0.79;
+                // 让版本号底部与左侧中文标题的最底边缘严格齐平（补偿汉字全字身相对拉丁基线的下探）
+                let ver_y = title_y + (title_g.size().y - ver_g.size().y) + 1.15;
                 let ver_x = text_rect.left() + title_g.size().x + gap;
                 ui.painter()
                     .galley(Pos2::new(text_rect.left(), title_y), title_g, p.text);
