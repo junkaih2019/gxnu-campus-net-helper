@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{MonitorSnapshot, Settings, TrafficSummary};
+use crate::models::{MonitorSnapshot, SelfServiceState, Settings, TrafficSummary};
 
 const ENDPOINT_FILE: &str = "daemon.json";
 
@@ -33,6 +33,8 @@ pub struct SnapshotEnvelope {
     pub traffic: TrafficSummary,
     #[serde(default)]
     pub active_account_id: String,
+    #[serde(default)]
+    pub self_service: SelfServiceState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +53,9 @@ pub enum UiToDaemon {
     Start,
     Pause,
     ForceCheck,
+    RefreshSelfService {
+        force: bool,
+    },
     ReloadSettings {
         start: bool,
         password_changed: bool,
@@ -508,6 +513,7 @@ mod tests {
             last_check_unix: None,
             traffic: TrafficSummary::default(),
             active_account_id: String::new(),
+            self_service: SelfServiceState::default(),
         });
         let ep = server.endpoint();
         let (mut client, snapshots, logs) = IpcClient::connect(ep.port, &ep.token).unwrap();

@@ -47,14 +47,20 @@ impl CampusStatusProbe {
     /// 静默测量到校园网认证网关（yc.gxnu.edu.cn）的真实应用层往返延迟（毫秒）。
     /// 使用完整 HTTP 响应而非纯 TCP 握手，避免 TUN/代理虚拟网卡本地秒回 ACK 导致的假 1ms 延迟。
     pub fn measure_rtt_ms(&self) -> Option<u64> {
+        self.measure_rtt_and_ip().map(|(ms, _)| ms)
+    }
+
+    /// 静默测量网关 RTT，同时顺带解析门户看到的真实校园网 IPv4（穿透代理 TUN，零额外请求）。
+    pub fn measure_rtt_and_ip(&self) -> Option<(u64, Option<String>)> {
         let url = format!("{}?callback=dr1002&v=4532&lang=zh", self.url);
         let started = Instant::now();
         match http::get(&self.agent, &url) {
-            Ok(response)
-                if (200..300).contains(&response.status)
-                    && parse_chkstatus_detail(&response.body).is_some() =>
-            {
-                Some(started.elapsed().as_millis().max(1) as u64)
+            Ok(response) if (200..300).contains(&response.status) => {
+                let detail = parse_chkstatus_detail(&response.body)?;
+                Some((
+                    started.elapsed().as_millis().max(1) as u64,
+                    detail.portal_ip,
+                ))
             }
             _ => None,
         }

@@ -23,6 +23,7 @@ mod models;
 mod monitor;
 mod network_events;
 mod notify;
+mod self_service;
 mod single_instance;
 mod startup;
 mod traffic;
@@ -223,6 +224,8 @@ fn run_daemon(
     let online_since_unix: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
     let last_check_unix: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
     let last_check_seq: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    let latest_self_service: Arc<Mutex<models::SelfServiceState>> =
+        Arc::new(Mutex::new(models::SelfServiceState::default()));
     let ui_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
 
     let (ipc_server, listener) = match ipc::IpcServer::bind(&store.app_dir) {
@@ -232,6 +235,49 @@ fn run_daemon(
             return ExitCode::FAILURE;
         }
     };
+
+    // 自助服务低频按需同步管理器（按学号共享 5 分钟缓存，绝不跟随 10s 巡检轮询）
+    let initial_acct_id = settings
+        .active_account()
+        .map(|a| a.id.clone())
+        .unwrap_or_else(|| settings.active_account_id.clone());
+    let self_service_mgr = Arc::new(self_service::SelfServiceManager::new(
+        initial_acct_id,
+        settings.student_id.clone(),
+        settings.carrier.clone(),
+        Arc::new(|acct_id, student_id| {
+            credentials::load_for_account(acct_id, student_id)
+                .ok()
+                .flatten()
+        }),
+        {
+            let shared_ss = Arc::clone(&latest_self_service);
+            let latest_snap = Arc::clone(&latest_snapshot);
+            let online_since = Arc::clone(&online_since_unix);
+            let last_check = Arc::clone(&last_check_unix);
+            let shared_traffic = Arc::clone(&latest_traffic);
+            let acct_id_ref = Arc::clone(&active_account_id);
+            let ipc = Arc::clone(&ipc_server);
+            Arc::new(move |state| {
+                if let Ok(mut g) = shared_ss.lock() {
+                    *g = state.clone();
+                }
+                if let Some(snap) = latest_snap.lock().ok().and_then(|g| g.clone()) {
+                    ipc.broadcast_snapshot(ipc::SnapshotEnvelope {
+                        snapshot: snap,
+                        online_since_unix: online_since.lock().ok().and_then(|g| *g),
+                        last_check_unix: last_check.lock().ok().and_then(|g| *g),
+                        traffic: shared_traffic.lock().map(|g| g.clone()).unwrap_or_default(),
+                        active_account_id: acct_id_ref
+                            .lock()
+                            .map(|g| g.clone())
+                            .unwrap_or_default(),
+                        self_service: state,
+                    });
+                }
+            })
+        },
+    ));
 
     // 实时日志转发到已连接的 --ui 进程
     let log_rx = logging::subscribe();
@@ -260,6 +306,13 @@ fn run_daemon(
             }
         });
 
+    #[derive(Default)]
+    struct SelfServiceHookState {
+        last_state: Option<models::MonitorState>,
+        auth_expired_dropped_at: Option<i64>,
+        login_rejected_queried: bool,
+    }
+
     let sink_notifier = Arc::clone(&notifier);
     let sink_latest = Arc::clone(&latest_snapshot);
     let sink_online = Arc::clone(&online_since_unix);
@@ -269,6 +322,9 @@ fn run_daemon(
     let sink_is_online = Arc::clone(&is_online);
     let sink_traffic = Arc::clone(&latest_traffic);
     let sink_acct_id = Arc::clone(&active_account_id);
+    let sink_self_service_state = Arc::clone(&latest_self_service);
+    let sink_self_service_mgr = Arc::clone(&self_service_mgr);
+    let sink_hook = Arc::new(Mutex::new(SelfServiceHookState::default()));
 
     let sink: monitor::SnapshotSink = Arc::new(move |snapshot| {
         if let Ok(mut n) = sink_notifier.lock() {
@@ -313,6 +369,57 @@ fn run_daemon(
             None
         };
 
+        // 事件驱动异步复核（绝不阻塞重连主链路）
+        let maybe_trigger = if let Ok(mut hook) = sink_hook.lock() {
+            let prev = hook.last_state;
+            hook.last_state = Some(snapshot.state);
+            let campus_ip = snapshot.metrics.effective_campus_ip().to_string();
+            match snapshot.state {
+                models::MonitorState::Offline => {
+                    if snapshot.reason == Some(models::DisconnectReason::AuthExpired)
+                        && hook.auth_expired_dropped_at.is_none()
+                    {
+                        hook.auth_expired_dropped_at = Some(now);
+                    }
+                    if snapshot.reason == Some(models::DisconnectReason::LoginRejected)
+                        && !hook.login_rejected_queried
+                    {
+                        hook.login_rejected_queried = true;
+                        Some(self_service::FetchTrigger::LoginRejected {
+                            local_campus_ip: campus_ip,
+                        })
+                    } else {
+                        None
+                    }
+                }
+                models::MonitorState::Online => {
+                    hook.login_rejected_queried = false;
+                    if let Some(dropped_at) = hook.auth_expired_dropped_at.take() {
+                        Some(self_service::FetchTrigger::PostReconnect {
+                            dropped_at_unix: dropped_at,
+                            local_campus_ip: campus_ip,
+                        })
+                    } else if matches!(
+                        prev,
+                        Some(models::MonitorState::Verifying)
+                            | Some(models::MonitorState::Authenticating)
+                    ) {
+                        Some(self_service::FetchTrigger::UiOpen)
+                    } else {
+                        None
+                    }
+                }
+                models::MonitorState::Paused | models::MonitorState::Stopped => {
+                    hook.auth_expired_dropped_at = None;
+                    hook.login_rejected_queried = false;
+                    None
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         if let Ok(mut guard) = sink_latest.lock() {
             *guard = Some(snapshot.clone());
         }
@@ -320,13 +427,22 @@ fn run_daemon(
 
         let traffic_summary = sink_traffic.lock().map(|g| g.clone()).unwrap_or_default();
         let active_id = sink_acct_id.lock().map(|g| g.clone()).unwrap_or_default();
+        let ss_state = sink_self_service_state
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         sink_ipc.broadcast_snapshot(ipc::SnapshotEnvelope {
             snapshot,
             online_since_unix: online_ts,
             last_check_unix: check_ts,
             traffic: traffic_summary,
             active_account_id: active_id,
+            self_service: ss_state,
         });
+
+        if let Some(trigger) = maybe_trigger {
+            sink_self_service_mgr.trigger(trigger);
+        }
     });
 
     // 超轻量后台物理网卡流量采样线程（每 5s 增量采样，退时立即唤醒并落盘）
@@ -341,6 +457,7 @@ fn run_daemon(
         let last_check = Arc::clone(&last_check_unix);
         let shared_traffic = Arc::clone(&latest_traffic);
         let acct_id_ref = Arc::clone(&active_account_id);
+        let shared_ss = Arc::clone(&latest_self_service);
         let ipc = Arc::clone(&ipc_server);
         std::thread::Builder::new()
             .name("traffic-sampler".to_string())
@@ -379,6 +496,10 @@ fn run_daemon(
                                     .lock()
                                     .map(|g| g.clone())
                                     .unwrap_or_default(),
+                                self_service: shared_ss
+                                    .lock()
+                                    .map(|g| g.clone())
+                                    .unwrap_or_default(),
                             });
                         }
                     }
@@ -414,6 +535,7 @@ fn run_daemon(
         active_account_key: Arc::clone(&active_account_key),
         traffic_tracker: Arc::clone(&traffic_tracker),
         latest_traffic: Arc::clone(&latest_traffic),
+        self_service: Arc::clone(&self_service_mgr),
         show_ui: Box::new(move || show_or_spawn_ui(&child, &endpoint)),
     }));
     if settings.auto_start_monitoring {
@@ -520,12 +642,17 @@ struct DaemonCommands {
     active_account_key: Arc<Mutex<String>>,
     traffic_tracker: Arc<Mutex<traffic::TrafficTracker>>,
     latest_traffic: Arc<Mutex<models::TrafficSummary>>,
+    self_service: Arc<self_service::SelfServiceManager>,
     show_ui: Box<dyn Fn() -> Result<(), String> + Send + Sync>,
 }
 
 impl DaemonCommands {
     fn sync_active_account_state(&self, settings: &models::Settings) {
         let new_key = traffic::account_key_of(&settings.student_id);
+        let acct_id = settings
+            .active_account()
+            .map(|a| a.id.as_str())
+            .unwrap_or(settings.active_account_id.as_str());
         *self.active_account_id.lock().unwrap() = settings.active_account_id.clone();
         *self.active_account_label.lock().unwrap() = settings.active_display_name();
         *self.active_account_key.lock().unwrap() = new_key.clone();
@@ -535,6 +662,8 @@ impl DaemonCommands {
             .unwrap()
             .summary(&new_key, Local::now().date_naive());
         *self.latest_traffic.lock().unwrap() = refreshed;
+        self.self_service
+            .sync_account(acct_id, &settings.student_id, &settings.carrier);
     }
 
     fn apply(&self, cmd: ipc::UiToDaemon) -> Result<(), String> {
@@ -551,6 +680,13 @@ impl DaemonCommands {
             ForceCheck => {
                 self.control.force_check()?;
                 logging::info("[FORCE_CHECK] 用户要求立即检测");
+            }
+            RefreshSelfService { force } => {
+                self.self_service.trigger(if force {
+                    self_service::FetchTrigger::Manual
+                } else {
+                    self_service::FetchTrigger::UiOpen
+                });
             }
             ReloadSettings {
                 start,
@@ -571,6 +707,8 @@ impl DaemonCommands {
                 if start {
                     self.control.start()?;
                 }
+                self.self_service
+                    .trigger(self_service::FetchTrigger::UiOpen);
                 logging::info("[SETTINGS_SAVED] 守护进程已应用设置");
             }
             SwitchAccount {
@@ -591,7 +729,11 @@ impl DaemonCommands {
                     "[ACCOUNT_SWITCH] 守护进程开始切换至账号「{label}」"
                 ));
             }
-            ShowUi => (self.show_ui)()?,
+            ShowUi => {
+                (self.show_ui)()?;
+                self.self_service
+                    .trigger(self_service::FetchTrigger::UiOpen);
+            }
             TestToast { body } => self.notifier.lock().unwrap().send_test(&body),
         }
         Ok(())

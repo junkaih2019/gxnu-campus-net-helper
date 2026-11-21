@@ -40,9 +40,9 @@ impl ThemeMode {
 
 pub const MIN_UI_ZOOM: f32 = 0.75;
 pub const MAX_UI_ZOOM: f32 = 1.25;
-pub const DEFAULT_WINDOW_SIZE: [f32; 2] = [840.0, 580.0];
-pub const MIN_WINDOW_SIZE: [f32; 2] = [560.0, 400.0];
-pub const DEFAULT_TRAFFIC_SPLIT: f32 = 0.615;
+pub const DEFAULT_WINDOW_SIZE: [f32; 2] = [840.0, 610.0];
+pub const MIN_WINDOW_SIZE: [f32; 2] = [620.0, 460.0];
+pub const DEFAULT_TRAFFIC_SPLIT: f32 = 0.47;
 pub const DEFAULT_WIDE_SPLIT: f32 = 0.515;
 
 fn default_ui_zoom() -> f32 {
@@ -109,9 +109,9 @@ impl UiPrefs {
         self.home_mid_height = self
             .home_mid_height
             .filter(|h| h.is_finite())
-            .map(|h| h.clamp(196.0, 520.0).round());
+            .map(|h| h.clamp(174.0, 320.0).round());
         self.home_traffic_split = if self.home_traffic_split.is_finite() {
-            self.home_traffic_split.clamp(0.48, 0.74)
+            self.home_traffic_split.clamp(0.36, 0.64)
         } else {
             DEFAULT_TRAFFIC_SPLIT
         };
@@ -785,8 +785,8 @@ mod tests {
         .normalized();
         assert!((wild.zoom - MAX_UI_ZOOM).abs() < f32::EPSILON);
         assert_eq!(wild.window_size, Some(MIN_WINDOW_SIZE));
-        assert_eq!(wild.home_mid_height, Some(196.0));
-        assert!((wild.home_traffic_split - 0.74).abs() < f32::EPSILON);
+        assert_eq!(wild.home_mid_height, Some(174.0));
+        assert!((wild.home_traffic_split - 0.64).abs() < f32::EPSILON);
         assert!((wild.home_wide_split - 0.38).abs() < f32::EPSILON);
 
         let low = clamp_ui_zoom(0.2);

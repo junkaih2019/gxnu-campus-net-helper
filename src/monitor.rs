@@ -32,6 +32,9 @@ pub(crate) trait NetworkCheck: Send + Sync {
     fn route(&self) -> RoutePath;
     fn check_on_route(&self, route: RoutePath) -> DiagnosticResult;
     fn portal_latency(&self) -> Option<u64>;
+    fn portal_probe(&self) -> (Option<u64>, Option<String>) {
+        (self.portal_latency(), None)
+    }
 }
 
 impl NetworkCheck for NetworkDiagnostics {
@@ -43,6 +46,12 @@ impl NetworkCheck for NetworkDiagnostics {
     }
     fn portal_latency(&self) -> Option<u64> {
         self.measure_portal_latency_ms()
+    }
+    fn portal_probe(&self) -> (Option<u64>, Option<String>) {
+        match self.measure_portal_rtt_and_ip() {
+            Some((ms, ip)) => (Some(ms), ip),
+            None => (None, None),
+        }
     }
 }
 
@@ -485,8 +494,8 @@ impl NetworkMonitor {
                 while let Ok((generation, seq)) = jobs.recv() {
                     let Some(shared) = weak.upgrade() else { break };
                     if shared.is_pending(generation, seq) {
-                        let ms = shared.diagnostics.portal_latency();
-                        shared.finish_latency(generation, seq, ms);
+                        let (ms, portal_ip) = shared.diagnostics.portal_probe();
+                        shared.finish_latency(generation, seq, ms, portal_ip);
                     }
                 }
             })
@@ -569,11 +578,17 @@ impl Shared {
 
     fn measure_latency(&self, cycle: Cycle, seq: u64) {
         if self.latency_jobs.try_send((cycle.generation, seq)).is_err() {
-            self.finish_latency(cycle.generation, seq, None);
+            self.finish_latency(cycle.generation, seq, None, None);
         }
     }
 
-    fn finish_latency(&self, generation: u64, seq: u64, ms: Option<u64>) {
+    fn finish_latency(
+        &self,
+        generation: u64,
+        seq: u64,
+        ms: Option<u64>,
+        portal_ip: Option<String>,
+    ) {
         let mut mode = self.control.lock().unwrap();
         if mode.generation != generation || mode.metrics.check_seq != seq {
             return;
@@ -583,9 +598,19 @@ impl Shared {
         };
         point.ms = ms.unwrap_or(0);
         self.metrics_store.append(&point);
+        let mut updated = false;
+        if let Some(ip) = portal_ip.filter(|s| !s.is_empty()) {
+            if mode.metrics.portal_ip != ip {
+                mode.metrics.portal_ip = ip;
+                updated = true;
+            }
+        }
         if point.ms > 0 {
             mode.metrics.last_check_ms = point.ms;
             mode.metrics.last_point = Some(point);
+            updated = true;
+        }
+        if updated {
             let metrics = mode.metrics.clone();
             if let Some(snapshot) = mode.latest.as_mut() {
                 snapshot.metrics = metrics;
@@ -612,6 +637,14 @@ impl Shared {
         let seq = metrics.check_seq;
         metrics.local_ip = result.local_ip.clone();
         metrics.gateway = result.gateway.clone();
+        if !result.portal_ip.is_empty() {
+            metrics.portal_ip = result.portal_ip.clone();
+        } else if matches!(
+            result.reason,
+            DisconnectReason::LinkDown | DisconnectReason::NoIp | DisconnectReason::NoGateway
+        ) {
+            metrics.portal_ip.clear();
+        }
         metrics.last_check_ms = 0;
         metrics.last_check_text = now.format("%H:%M:%S").to_string();
         metrics.pipeline = build_pipeline(result);
@@ -1762,6 +1795,13 @@ mod tests {
             active_account_key: Arc::new(Mutex::new(crate::traffic::account_key_of(""))),
             traffic_tracker: Arc::new(Mutex::new(crate::traffic::TrafficTracker::new(dir))),
             latest_traffic: Arc::new(Mutex::new(crate::models::TrafficSummary::default())),
+            self_service: Arc::new(crate::self_service::SelfServiceManager::new(
+                String::new(),
+                String::new(),
+                "2".into(),
+                Arc::new(|_, _| None),
+                Arc::new(|_| {}),
+            )),
             show_ui: Box::new(move || {
                 shows.fetch_add(1, Ordering::SeqCst);
                 Ok(())

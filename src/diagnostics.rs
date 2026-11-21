@@ -129,6 +129,13 @@ impl NetworkDiagnostics {
             .and_then(CampusStatusProbe::measure_rtt_ms)
     }
 
+    /// 测量网关延迟并同时提取门户识别到的本机校园网 IPv4。
+    pub fn measure_portal_rtt_and_ip(&self) -> Option<(u64, Option<String>)> {
+        self.campus_status
+            .as_ref()
+            .and_then(CampusStatusProbe::measure_rtt_and_ip)
+    }
+
     pub(crate) fn route(&self) -> RoutePath {
         read_route_to(ROUTE_PROBE_IP)
     }

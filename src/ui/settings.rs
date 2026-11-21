@@ -763,19 +763,6 @@ fn draw_account_page(
 
         row_divider(ui, p);
 
-        fluent_stepper_row(
-            ui,
-            p,
-            "月流量提醒上限（可选）",
-            "设为 0 表示不限制（运营商免计费）；设为正值时主页流量环自动切为月额度进度",
-            &mut form.monthly_quota_gb,
-            0..=2000,
-            10,
-            "GB",
-        );
-
-        row_divider(ui, p);
-
         // 卡片底部操作行：左安全隔离说明 + 右保存账号按钮
         ui.allocate_ui_with_layout(
             Vec2::new(ui.available_width(), 30.0),
@@ -1304,12 +1291,12 @@ fn draw_display_page(
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.spacing_mut().item_spacing.x = 6.0;
                     let sizes: &[(&str, [f32; 2], &str)] = &[
-                        ("宽松", [960.0, 640.0], "调整为 960 × 640"),
-                        ("标准", [840.0, 580.0], "调整为默认 840 × 580"),
+                        ("宽松", [960.0, 660.0], "调整为 960 × 660"),
+                        ("标准", [840.0, 610.0], "调整为默认 840 × 610"),
                         (
                             "紧凑",
-                            [720.0, 500.0],
-                            "调整为紧凑 720 × 500（推荐配合 85% 缩放）",
+                            [740.0, 540.0],
+                            "调整为紧凑 740 × 540（推荐配合 85% 缩放）",
                         ),
                     ];
                     for (label, sz, tip) in sizes {
@@ -1331,8 +1318,8 @@ fn draw_display_page(
         fluent_toggle_row(
             ui,
             p,
-            "主页展示「本机流量」卡片",
-            "关闭后，中央区域由「连接稳定性与断联记录」宽屏双栏接管；后台仍会持续记录，随时可重开",
+            "主页展示「账号流量与在线设备」卡片",
+            "展示校园网自助服务的实际流量、套餐余量、在线终端与近期上网记录；关闭后仅保留连接稳定性与运行日志",
             &mut ui_prefs.show_home_traffic,
             true,
             None,
@@ -1453,16 +1440,16 @@ fn draw_notify_data_page(
                     egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
                         ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.label(bold_text("流量统计口径", 12.0, p.text));
+                        ui.label(bold_text("流量与设备数据源", 12.0, p.text));
                         ui.label(body_text(
-                            "仅在校园网在线期间采集物理网卡增量，自动排除 Clash / Mihomo TUN 虚拟网卡",
+                            "官方流量与在线终端来自校园网自助服务（5 分钟低频缓存）；本机今日参考来自物理网卡增量（自动排除 TUN）",
                             10.5,
                             p.text_muted,
                         ));
                     },
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    badge(ui, p.ok, p.ok_soft, p.ok_border, "物理网卡增量");
+                    badge(ui, p.ok, p.ok_soft, p.ok_border, "自助服务 + 网卡");
                 });
             },
         );

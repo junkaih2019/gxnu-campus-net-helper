@@ -26,10 +26,10 @@ use crate::config::SettingsStore;
 use crate::credentials;
 use crate::ipc::{IpcClient, SnapshotEnvelope, UiToDaemon};
 use crate::metrics_store::{TelemetryPoint, TimeRange};
-use crate::models::{MonitorSnapshot, MonitorState, Settings, TrafficSummary};
+use crate::models::{MonitorSnapshot, MonitorState, SelfServiceState, Settings, TrafficSummary};
 use crate::startup;
 
-use charts::TrafficPeriod;
+use charts::TrafficViewMode;
 use icons::Icon;
 use logs as logs_page;
 use settings as settings_page;
@@ -122,8 +122,10 @@ pub struct GuardApp {
     logs_state: logs_page::LogsState,
     telemetry: Vec<TelemetryPoint>,
     traffic: TrafficSummary,
+    self_service: SelfServiceState,
     time_range: TimeRange,
-    traffic_period: TrafficPeriod,
+    traffic_view_mode: TrafficViewMode,
+    traffic_view_user_override: bool,
     last_check_seq: u64,
     last_check_unix: Option<i64>,
     online_since_unix: Option<i64>,
@@ -134,6 +136,10 @@ pub struct GuardApp {
     account_alert_opened: bool,
     trimmed_while_idle: bool,
     brand_icon: egui::TextureHandle,
+    #[cfg(debug_assertions)]
+    qa_shot_out: Option<PathBuf>,
+    #[cfg(debug_assertions)]
+    qa_shot_frames: u32,
 }
 
 impl GuardApp {
@@ -188,11 +194,17 @@ impl GuardApp {
         } else {
             needs_account_setup(&deps.settings.student_id, legacy_cred_account.as_deref())
         };
-        let env_open_settings = std::env::var("GXNU_VIEW")
-            .map(|v| v.eq_ignore_ascii_case("settings"))
-            .unwrap_or(false)
+        let env_view = std::env::var("GXNU_VIEW").ok();
+        let env_force_home = env_view
+            .as_deref()
+            .is_some_and(|v| v.eq_ignore_ascii_case("home"));
+        let env_open_settings = env_view
+            .as_deref()
+            .is_some_and(|v| v.eq_ignore_ascii_case("settings"))
             || env_tab.is_some();
-        let view = if needs_setup || env_open_settings {
+        let view = if env_force_home {
+            AppView::Home
+        } else if needs_setup || env_open_settings {
             if needs_setup {
                 form.tab = settings_page::SettingsTab::Account;
             }
@@ -210,7 +222,8 @@ impl GuardApp {
             egui::TextureOptions::LINEAR,
         );
 
-        Self {
+        let initial_traffic_view = TrafficViewMode::default_for_carrier(&deps.settings.carrier);
+        let mut app = Self {
             store: deps.store,
             settings: deps.settings,
             ipc: deps.ipc,
@@ -230,8 +243,10 @@ impl GuardApp {
             logs_state: logs_page::LogsState::default(),
             telemetry: deps.initial_telemetry,
             traffic: deps.initial_traffic,
+            self_service: SelfServiceState::default(),
             time_range: TimeRange::H24,
-            traffic_period: TrafficPeriod::Today,
+            traffic_view_mode: initial_traffic_view,
+            traffic_view_user_override: false,
             last_check_seq: 0,
             last_check_unix: None,
             online_since_unix: None,
@@ -242,7 +257,15 @@ impl GuardApp {
             account_alert_opened: false,
             trimmed_while_idle: false,
             brand_icon,
+            #[cfg(debug_assertions)]
+            qa_shot_out: std::env::var_os("GXNU_SCREENSHOT_OUT").map(PathBuf::from),
+            #[cfg(debug_assertions)]
+            qa_shot_frames: 0,
+        };
+        if !app.needs_setup {
+            app.request(UiToDaemon::RefreshSelfService { force: false }, None);
         }
+        app
     }
 
     fn show_toast(&mut self, message: impl Into<String>, is_error: bool) {
@@ -567,6 +590,8 @@ impl GuardApp {
             return;
         }
         self.settings = next.clone();
+        self.traffic_view_user_override = false;
+        self.traffic_view_mode = TrafficViewMode::default_for_carrier(&self.settings.carrier);
         if !self.form.is_account_draft_dirty(&self.settings) {
             self.form.load_account_draft(&target);
         }
@@ -639,10 +664,17 @@ impl GuardApp {
             self.online_since_unix = env.online_since_unix;
             self.last_check_unix = env.last_check_unix;
             self.traffic = env.traffic;
+            self.self_service = env.self_service;
             if !env.active_account_id.is_empty()
                 && env.active_account_id != self.settings.active_account_id
             {
                 let _ = self.settings.switch_active_account(&env.active_account_id);
+                self.traffic_view_user_override = false;
+                self.traffic_view_mode =
+                    TrafficViewMode::default_for_carrier(&self.settings.carrier);
+            } else if !self.traffic_view_user_override {
+                self.traffic_view_mode =
+                    TrafficViewMode::default_for_carrier(&self.settings.carrier);
             }
 
             if snapshot.metrics.check_seq > self.last_check_seq {
@@ -829,6 +861,7 @@ impl GuardApp {
         let metrics = self.latest.as_ref().map(|s| &s.metrics);
         let dur = metrics.map(format_check_ms).unwrap_or_else(|| "—".into());
         let last_at_str = metrics.map(format_check_time).unwrap_or_else(|| "—".into());
+        let campus_ip = self.effective_campus_ip();
         self.account_chip_clicked = false;
         let display_name = self.settings.active_display_name();
         let has_account =
@@ -845,21 +878,32 @@ impl GuardApp {
                     ui.add_space(4.0);
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 3.0;
-                        // 第一行：连接状态 + 在线时长 + 一键切号胶囊
+                        // 第一行：连接状态 + 真实在线时长（优先由门户校准） + 一键切号胶囊
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 7.0;
                             ui.label(bold_text(status_title(state), 15.0, p.text));
                             let now_unix = Local::now().timestamp();
-                            if let Some(since_ts) = self.online_since_unix {
-                                if state == Some(MonitorState::Online) {
+                            if state == Some(MonitorState::Online) {
+                                let portal_since = self
+                                    .self_service
+                                    .data
+                                    .as_ref()
+                                    .and_then(|d| d.matched_local_since_unix(&campus_ip));
+                                if let Some(since_ts) = portal_since.or(self.online_since_unix) {
                                     let elapsed = (now_unix - since_ts).max(0) as u64;
+                                    let tip = if portal_since.is_some() {
+                                        "已由校园网自助服务会话上线时间校准"
+                                    } else {
+                                        "本地守护进程记录的连续在线时长"
+                                    };
                                     badge(
                                         ui,
                                         status_fg,
                                         status_soft,
                                         status_border,
                                         &format!("在线 {}", format_uptime(elapsed)),
-                                    );
+                                    )
+                                    .on_hover_text(tip);
                                 }
                             }
                             let (clicked, rect) = draw_account_chip(
@@ -874,11 +918,14 @@ impl GuardApp {
                             chip_rect = rect;
                         });
 
-                        // 第二行：巡检倒计时与最近检测，异常时直接显示可读故障说明
+                        // 第二行：本机真实校园网 IP + 巡检倒计时与最近检测，异常时直接显示可读故障说明
                         let meta_text = if self.ipc.connection_lost.load(Ordering::Acquire) {
                             "与守护进程的连接已断开，请重新打开主界面".to_string()
                         } else if state == Some(MonitorState::Online) {
                             let mut parts: Vec<String> = Vec::new();
+                            if !campus_ip.is_empty() {
+                                parts.push(format!("本机 {campus_ip}"));
+                            }
                             if running {
                                 if let Some(last_ts) = self.last_check_unix {
                                     let interval = self.settings.check_interval.max(1) as u64;
@@ -1211,6 +1258,23 @@ impl GuardApp {
         }
     }
 
+    fn effective_campus_ip(&self) -> String {
+        if let Some(snap) = &self.latest {
+            let ip = snap.metrics.effective_campus_ip();
+            if !ip.is_empty() {
+                return ip.to_string();
+            }
+        }
+        if self.state() == Some(MonitorState::Online) {
+            if let Some(data) = &self.self_service.data {
+                if data.online_devices.len() == 1 {
+                    return data.online_devices[0].ip.clone();
+                }
+            }
+        }
+        String::new()
+    }
+
     fn draw_toast(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some((message, is_error, at)) = self.toast.as_ref() else {
             return;
@@ -1345,64 +1409,79 @@ impl eframe::App for GuardApp {
                     .show(ctx, |ui| {
                         ui.spacing_mut().item_spacing.y = 0.0;
 
-                        // Tier 1: 精简状态主条
+                        // Tier 1: 精简状态主条（含本机真实校园网 IP 与门户校准在线时长）
                         self.draw_status_ribbon(ui, &p);
-                        ui.add_space(10.0);
+                        ui.add_space(8.0);
 
-                        // Tier 2 + Tier 3 垂直分配：中部采用紧贴内容的紧凑默认高度，将大窗/缩放多出的空间全部留给运行日志
-                        let avail_h = ui.available_height().max(320.0);
-                        let splitter_h = 10.0_f32;
-                        let usable_h = (avail_h - splitter_h).max(300.0);
-                        let (default_mid, min_mid) = if self.ui_prefs.show_home_traffic {
-                            (242.0_f32, 220.0_f32)
-                        } else {
-                            (212.0_f32, 194.0_f32)
-                        };
-                        let min_log = 148.0_f32;
-                        let max_mid = (usable_h - min_log).max(min_mid);
-                        let mid_h = self
-                            .ui_prefs
-                            .home_mid_height
-                            .unwrap_or(default_mid)
-                            .clamp(min_mid, max_mid)
-                            .floor();
+                        let show_self_service = self.ui_prefs.show_home_traffic;
+                        let campus_ip = self.effective_campus_ip();
+                        let is_online = self.state() == Some(MonitorState::Online);
+                        let login_rejected = self.latest.as_ref().and_then(|s| s.reason)
+                            == Some(crate::models::DisconnectReason::LoginRejected);
 
-                        // Tier 2: 按设置切换「可拖左右双卡」或「可拖双栏通栏稳定性面板」
-                        let show_traffic = self.ui_prefs.show_home_traffic;
-                        let split_ref = if show_traffic {
-                            &mut self.ui_prefs.home_traffic_split
-                        } else {
-                            &mut self.ui_prefs.home_wide_split
-                        };
-                        let split_changed = charts::draw_home_visual_row(
-                            ui,
-                            &p,
-                            &self.telemetry,
-                            &mut self.time_range,
-                            &self.traffic,
-                            &mut self.traffic_period,
-                            self.settings.monthly_quota_gb,
-                            show_traffic,
-                            split_ref,
-                            mid_h,
-                        );
-                        if split_changed {
-                            self.window_size_dirty_since = Some(Instant::now());
+                        // Tier 2: 账号流量 + 在线设备与记录双卡（可左右拖拽分栏，上下可由底部分隔条调节高度）
+                        let mut ss_h_opt: Option<(f32, f32, f32)> = None;
+                        if show_self_service {
+                            let avail_h = ui.available_height().max(360.0);
+                            let stability_reserved = 104.0_f32;
+                            let min_log = 136.0_f32;
+                            let min_ss = 174.0_f32;
+                            let default_ss = 176.0_f32;
+                            let max_ss =
+                                (avail_h - stability_reserved - min_log - 18.0).max(min_ss);
+                            let ss_h = self
+                                .ui_prefs
+                                .home_mid_height
+                                .unwrap_or(default_ss)
+                                .clamp(min_ss, max_ss)
+                                .floor();
+                            ss_h_opt = Some((ss_h, min_ss, max_ss));
+
+                            let actions = charts::draw_self_service_row(
+                                ui,
+                                &p,
+                                &self.self_service,
+                                &self.traffic,
+                                &mut self.traffic_view_mode,
+                                &campus_ip,
+                                is_online,
+                                login_rejected,
+                                &mut self.ui_prefs.home_traffic_split,
+                                ss_h,
+                            );
+                            if actions.split_changed {
+                                self.window_size_dirty_since = Some(Instant::now());
+                            }
+                            if actions.traffic_view_changed {
+                                self.traffic_view_user_override = true;
+                            }
+                            if actions.refresh_self_service {
+                                self.show_toast("正在刷新校园网自助服务数据…", false);
+                                self.request(UiToDaemon::RefreshSelfService { force: true }, None);
+                            }
+                            ui.add_space(8.0);
                         }
+
+                        // Tier 3: 通栏紧凑「连接稳定性」胶囊时间轴（位于流量/设备双卡之下、运行日志之上）
+                        charts::draw_stability_strip(ui, &p, &self.telemetry, &mut self.time_range);
 
                         // 中下可自由拖拽的横向分隔条（双击恢复默认）
-                        let (dy, dbl) = horizontal_splitter(ui, &p, ui.available_width());
-                        if dbl {
-                            self.ui_prefs.home_mid_height = None;
-                            self.window_size_dirty_since = Some(Instant::now());
-                            self.show_toast("已恢复默认面板高度比例", false);
-                        } else if dy.abs() > 0.01 {
-                            let next_h = (mid_h + dy).clamp(min_mid, max_mid).round();
-                            self.ui_prefs.home_mid_height = Some(next_h);
-                            self.window_size_dirty_since = Some(Instant::now());
+                        if let Some((ss_h, min_ss, max_ss)) = ss_h_opt {
+                            let (dy, dbl) = horizontal_splitter(ui, &p, ui.available_width());
+                            if dbl {
+                                self.ui_prefs.home_mid_height = None;
+                                self.window_size_dirty_since = Some(Instant::now());
+                                self.show_toast("已恢复默认面板高度比例", false);
+                            } else if dy.abs() > 0.01 {
+                                let next_h = (ss_h + dy).clamp(min_ss, max_ss).round();
+                                self.ui_prefs.home_mid_height = Some(next_h);
+                                self.window_size_dirty_since = Some(Instant::now());
+                            }
+                        } else {
+                            ui.add_space(8.0);
                         }
 
-                        // Tier 3: 通栏静谧运行日志（严格取当前剩余可用高度，杜绝底部圆角被窗口边缘裁切）
+                        // Tier 4: 通栏静谧运行日志（严格取当前剩余可用高度，杜绝底部圆角被窗口边缘裁切）
                         let log_h = ui.available_height().floor().max(110.0);
                         logs_page::draw_card(
                             ui,
@@ -1497,6 +1576,37 @@ impl eframe::App for GuardApp {
             Stroke::new(1.0_f32, with_alpha(p.window_border, 220)),
             StrokeKind::Inside,
         );
+
+        #[cfg(debug_assertions)]
+        if let Some(out_path) = self.qa_shot_out.clone() {
+            let mut saved = false;
+            ctx.input(|i| {
+                for ev in &i.events {
+                    if let egui::Event::Screenshot { image, .. } = ev {
+                        let [w, h] = image.size;
+                        let mut buf = Vec::with_capacity(8 + w * h * 4);
+                        buf.extend_from_slice(&(w as u32).to_le_bytes());
+                        buf.extend_from_slice(&(h as u32).to_le_bytes());
+                        for c in &image.pixels {
+                            buf.extend_from_slice(&c.to_array());
+                        }
+                        let _ = std::fs::write(&out_path, buf);
+                        saved = true;
+                        break;
+                    }
+                }
+            });
+            if saved {
+                self.qa_shot_out = None;
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            } else {
+                self.qa_shot_frames += 1;
+                if self.qa_shot_frames == 8 {
+                    ctx.send_viewport_cmd(ViewportCommand::Screenshot(Default::default()));
+                }
+                ctx.request_repaint();
+            }
+        }
     }
 
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {

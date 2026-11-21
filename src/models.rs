@@ -204,11 +204,161 @@ pub struct DiagnosticPipeline {
 pub struct MonitorMetrics {
     pub local_ip: String,
     pub gateway: String,
+    /// 校园网门户 `chkstatus` 识别到的真实校园网 IPv4（穿透 Mihomo/Tailscale TUN）。
+    #[serde(default)]
+    pub portal_ip: String,
     pub last_check_ms: u64,
     pub last_check_text: String,
     pub check_seq: u64,
     pub pipeline: DiagnosticPipeline,
     pub last_point: Option<crate::metrics_store::TelemetryPoint>,
+}
+
+impl MonitorMetrics {
+    /// 返回最适合展示与匹配在线设备的真实校园网 IPv4（优先 `portal_ip`，跳过虚拟隧道 IP）。
+    pub fn effective_campus_ip(&self) -> &str {
+        if !self.portal_ip.is_empty() {
+            return &self.portal_ip;
+        }
+        if !self.local_ip.is_empty() && !is_virtual_tunnel_ip(&self.local_ip) {
+            return &self.local_ip;
+        }
+        ""
+    }
+}
+
+/// 校园网自助服务（172.16.4.2/Self/）同步状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum SelfServiceStatus {
+    #[default]
+    Idle,
+    Refreshing,
+    Ready,
+    CaptchaCooldown,
+    Unreachable,
+    AuthFailed,
+    UnsupportedPassword,
+    NoCredentials,
+}
+
+/// 校园网自助服务返回的流量汇总（同时区分校园网限额口径与全账号实际流量口径）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SelfServiceTraffic {
+    /// 本月校园网出口计费已用流量（MB）。
+    pub campus_used_mb: f64,
+    /// 校园网累计剩余可用流量（MB，含结转免费额度）。
+    pub campus_remaining_mb: f64,
+    /// 本月全账号实际下行总流量（MB，含电信/联通/移动运营商出口）。
+    pub month_down_mb: f64,
+    /// 本月全账号实际上行总流量（MB，含电信/联通/移动运营商出口）。
+    pub month_up_mb: f64,
+    /// 门户返回的校园网套餐说明（如「每月免费30G」）。
+    #[serde(default)]
+    pub plan_description: String,
+    /// 本月累计上网会话次数（来自 `getUserOnlineLog` 汇总）。
+    #[serde(default)]
+    pub month_session_count: Option<u64>,
+}
+
+impl SelfServiceTraffic {
+    pub fn month_actual_total_mb(&self) -> f64 {
+        (self.month_down_mb.max(0.0) + self.month_up_mb.max(0.0)).max(self.campus_used_mb.max(0.0))
+    }
+
+    pub fn campus_total_mb(&self) -> f64 {
+        self.campus_used_mb.max(0.0) + self.campus_remaining_mb.max(0.0)
+    }
+}
+
+/// 门户当前在线的一台终端会话（仅保留非敏感白名单字段）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OnlineDevice {
+    pub ip: String,
+    /// 门户返回的本地上线时间文本（如 `2026-11-22 05:52:34`）。
+    pub login_time: String,
+    /// 解析后的 Unix 秒时间戳（用于界面实时计算已在线时长）。
+    #[serde(default)]
+    pub login_unix: Option<i64>,
+    /// 终端类型标签（如 `PC`、`手机`、`平板`）。
+    #[serde(default)]
+    pub terminal_type: String,
+    /// 门户服务端返回的当前会话已在线秒数（规避本地时钟偏差）。
+    #[serde(default)]
+    pub use_time_secs: Option<u64>,
+}
+
+/// 门户近期上网记录单条会话（来自 `/Self/bill/getUserOnlineLog`，含真实运营商流量）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RecentSession {
+    pub login_unix_ms: i64,
+    pub logout_unix_ms: Option<i64>,
+    pub ip: String,
+    /// 真实会话持续秒数（优先由 `logout - login` 计算）。
+    pub duration_secs: u64,
+    /// 校园网计费流量（MB；运营商出口通常为 0）。
+    pub campus_flow_mb: f64,
+    /// 实际下行流量（MB，来自 `internetDownFlow`）。
+    pub actual_down_mb: f64,
+    /// 实际上行流量（MB，来自 `internetUpFlow`）。
+    pub actual_up_mb: f64,
+}
+
+impl RecentSession {
+    pub fn actual_total_mb(&self) -> f64 {
+        let actual = self.actual_down_mb.max(0.0) + self.actual_up_mb.max(0.0);
+        if actual > 0.0 {
+            actual
+        } else {
+            self.campus_flow_mb.max(0.0)
+        }
+    }
+}
+
+/// 单次自助服务只读查询的完整白名单快照。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SelfServiceData {
+    /// 所属学号的脱敏隔离键（同校不同运营商配置共享缓存，不含明文学号）。
+    #[serde(default)]
+    pub account_key: String,
+    pub traffic: SelfServiceTraffic,
+    /// 账号允许同时在线的最大终端数（如 `Some(3)`）。
+    #[serde(default)]
+    pub max_online_devices: Option<u32>,
+    #[serde(default)]
+    pub online_devices: Vec<OnlineDevice>,
+    #[serde(default)]
+    pub recent_sessions: Vec<RecentSession>,
+    /// 本次快照拉取成功的 Unix 秒时间戳。
+    pub fetched_at_unix: i64,
+}
+
+impl SelfServiceData {
+    /// 尝试在当前在线列表中匹配本机终端，返回对应的权威会话上线 Unix 秒时间戳。
+    pub fn matched_local_since_unix(&self, local_campus_ip: &str) -> Option<i64> {
+        let device = if !local_campus_ip.is_empty() {
+            self.online_devices.iter().find(|d| d.ip == local_campus_ip)
+        } else if self.online_devices.len() == 1 {
+            self.online_devices.first()
+        } else {
+            None
+        }?;
+        if let Some(secs) = device.use_time_secs {
+            return Some(self.fetched_at_unix.saturating_sub(secs as i64));
+        }
+        device.login_unix
+    }
+}
+
+/// 守护进程通过 IPC 推送给界面的自助服务整体状态（保留旧缓存以支持优雅降级）。
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SelfServiceState {
+    pub status: SelfServiceStatus,
+    #[serde(default)]
+    pub message: String,
+    #[serde(default)]
+    pub cooldown_until_unix: Option<i64>,
+    #[serde(default)]
+    pub data: Option<SelfServiceData>,
 }
 
 impl MonitorSnapshot {

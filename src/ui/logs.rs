@@ -637,6 +637,16 @@ fn format_human_log(line: &str) -> Option<HumanLogLine> {
         ),
         "APP_EXIT" => (LogLevel::Info, "守护助手已退出".to_string(), None),
         "DIAGNOSTIC" => return None,
+        "SELF_SERVICE" => {
+            let lvl = if is_err {
+                LogLevel::Err
+            } else if is_warn {
+                LogLevel::Warn
+            } else {
+                LogLevel::Info
+            };
+            (lvl, raw_msg.trim().to_string(), None)
+        }
         "DIAGNOSTIC_ERROR" => (
             LogLevel::Err,
             "网络诊断过程发生异常".to_string(),
