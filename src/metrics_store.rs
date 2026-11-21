@@ -372,9 +372,38 @@ pub fn filter_range(points: &[TelemetryPoint], now: i64, range: TimeRange) -> Ve
         .collect()
 }
 
+#[derive(Debug, Clone)]
+pub struct OutageEvent<'a> {
+    pub start: &'a TelemetryPoint,
+    pub end_ts: Option<i64>,
+    pub duration_secs: Option<u64>,
+    pub recovered: bool,
+    pub auto_reconnected: bool,
+}
+
 pub struct OutageSummary<'a> {
     pub starts: Vec<&'a TelemetryPoint>,
+    pub events: Vec<OutageEvent<'a>>,
     pub recoveries: usize,
+}
+
+impl<'a> OutageSummary<'a> {
+    /// 返回最主要的断联原因码（频次相同取最近一次）。
+    pub fn primary_reason(&self) -> Option<&'a str> {
+        use std::collections::HashMap;
+        let mut counts: HashMap<&'a str, (usize, i64)> = HashMap::new();
+        for ev in &self.events {
+            let entry = counts
+                .entry(ev.start.reason.as_str())
+                .or_insert((0, ev.start.ts));
+            entry.0 += 1;
+            entry.1 = entry.1.max(ev.start.ts);
+        }
+        counts
+            .into_iter()
+            .max_by_key(|(_, (count, latest_ts))| (*count, *latest_ts))
+            .map(|(reason, _)| reason)
+    }
 }
 
 pub fn outages_in_range(
@@ -385,14 +414,24 @@ pub fn outages_in_range(
     let start = now - range.secs();
     let mut summary = OutageSummary {
         starts: Vec::new(),
+        events: Vec::new(),
         recoveries: 0,
     };
     let mut offline = false;
+    let mut active_event: Option<usize> = None;
     for p in points.iter().filter(|p| p.ts <= now + 5) {
         match p.event.as_str() {
             "check" if !p.online && p.confirmed_offline.unwrap_or(true) => {
                 if !offline && p.ts >= start {
                     summary.starts.push(p);
+                    summary.events.push(OutageEvent {
+                        start: p,
+                        end_ts: None,
+                        duration_secs: None,
+                        recovered: false,
+                        auto_reconnected: false,
+                    });
+                    active_event = Some(summary.events.len() - 1);
                 }
                 offline = true;
             }
@@ -400,10 +439,21 @@ pub fn outages_in_range(
                 if offline && p.ts >= start {
                     summary.recoveries += 1;
                 }
+                if let Some(idx) = active_event.take() {
+                    let ev = &mut summary.events[idx];
+                    ev.end_ts = Some(p.ts);
+                    ev.duration_secs = Some((p.ts - ev.start.ts).max(0) as u64);
+                    ev.recovered = true;
+                    ev.auto_reconnected = p.event == "login_ok";
+                }
                 offline = false;
             }
             _ => {}
         }
+    }
+    if let Some(idx) = active_event {
+        let ev = &mut summary.events[idx];
+        ev.duration_secs = Some((now - ev.start.ts).max(0) as u64);
     }
     summary
 }
@@ -716,5 +766,36 @@ mod tests {
         let _writer = MetricsStore::new(dir.path());
         assert!(read_jsonl(&path).unwrap().is_empty());
         assert_eq!(fs::metadata(path).unwrap().len(), 0);
+    }
+
+    #[test]
+    fn outage_events_track_duration_auto_reconnect_and_primary_reason() {
+        let now = 20_000;
+        let points = [
+            TelemetryPoint::check(now - 2000, 20, true, "ONLINE"),
+            TelemetryPoint::check(now - 1500, 0, false, "AUTH_EXPIRED"),
+            TelemetryPoint::auth_event(now - 1476, true, "AUTH_EXPIRED"),
+            TelemetryPoint::check(now - 1474, 24, true, "ONLINE"),
+            TelemetryPoint::check(now - 900, 0, false, "GATEWAY_UNREACHABLE"),
+            TelemetryPoint::check(now - 828, 22, true, "ONLINE"),
+            TelemetryPoint::check(now - 120, 0, false, "AUTH_EXPIRED"),
+        ];
+        let summary = outages_in_range(&points, now, TimeRange::H1);
+        assert_eq!(summary.events.len(), 3);
+
+        assert!(summary.events[0].recovered);
+        assert!(summary.events[0].auto_reconnected);
+        assert_eq!(summary.events[0].duration_secs, Some(24));
+
+        assert!(summary.events[1].recovered);
+        assert!(!summary.events[1].auto_reconnected);
+        assert_eq!(summary.events[1].duration_secs, Some(72));
+
+        assert!(!summary.events[2].recovered);
+        assert!(!summary.events[2].auto_reconnected);
+        assert_eq!(summary.events[2].end_ts, None);
+        assert_eq!(summary.events[2].duration_secs, Some(120));
+
+        assert_eq!(summary.primary_reason(), Some("AUTH_EXPIRED"));
     }
 }
