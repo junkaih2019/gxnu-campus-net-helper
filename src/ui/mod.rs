@@ -34,9 +34,10 @@ use icons::Icon;
 use logs as logs_page;
 use settings as settings_page;
 use theme::{
-    body_text, bold_text, carrier_label, format_check_ms, format_check_time, format_uptime,
-    status_title, with_alpha, Palette, ThemeMode,
+    body_text, bold_text, carrier_label, clamp_ui_zoom, format_check_ms, format_check_time,
+    format_uptime, status_title, with_alpha, Palette, ThemeMode, UiPrefs,
 };
+pub use theme::{load_ui_prefs, MIN_WINDOW_SIZE};
 use widgets::{accent_card, badge, icon_button, primary_button, pulsing_dot, secondary_button};
 
 const CREDENTIAL_TARGET: &str = "GXNUCampusLogin/v4";
@@ -107,7 +108,8 @@ pub struct GuardApp {
     logs: Receiver<String>,
     log_lines: Vec<String>,
     log_path: PathBuf,
-    theme_mode: ThemeMode,
+    ui_prefs: UiPrefs,
+    window_size_dirty_since: Option<Instant>,
     view: AppView,
     form: settings_page::SettingsForm,
     credential_account: Option<String>,
@@ -131,8 +133,10 @@ pub struct GuardApp {
 impl GuardApp {
     pub fn new(cc: &eframe::CreationContext<'_>, deps: GuardDeps) -> Self {
         theme::install_fonts(&cc.egui_ctx);
-        let theme_mode = theme::load_theme_mode(&deps.store.app_dir);
-        let palette = Palette::of(theme_mode);
+        let ui_prefs = theme::load_ui_prefs(&deps.store.app_dir);
+        cc.egui_ctx.options_mut(|o| o.zoom_with_keyboard = false);
+        cc.egui_ctx.set_zoom_factor(ui_prefs.zoom);
+        let palette = Palette::of(ui_prefs.theme);
         theme::apply_theme(&cc.egui_ctx, &palette);
 
         let credential_account = credentials::load(CREDENTIAL_TARGET)
@@ -151,6 +155,7 @@ impl GuardApp {
         if let Some(tab) = env_tab.as_deref() {
             form.tab = match tab {
                 "monitor" => settings_page::SettingsTab::Monitor,
+                "display" => settings_page::SettingsTab::Display,
                 "notify" => settings_page::SettingsTab::Notify,
                 _ => settings_page::SettingsTab::Account,
             };
@@ -194,7 +199,8 @@ impl GuardApp {
             logs: deps.logs,
             log_lines,
             log_path: deps.log_path,
-            theme_mode,
+            ui_prefs,
+            window_size_dirty_since: None,
             view,
             form,
             credential_account,
@@ -231,10 +237,92 @@ impl GuardApp {
     }
 
     fn toggle_theme(&mut self, ctx: &egui::Context) {
-        self.theme_mode = self.theme_mode.toggled();
-        let palette = Palette::of(self.theme_mode);
+        self.ui_prefs.theme = self.ui_prefs.theme.toggled();
+        let palette = Palette::of(self.ui_prefs.theme);
         theme::apply_theme(ctx, &palette);
-        theme::save_theme_mode(&self.store.app_dir, self.theme_mode);
+        theme::save_ui_prefs(&self.store.app_dir, &self.ui_prefs);
+    }
+
+    fn apply_zoom(&mut self, ctx: &egui::Context, target: f32, notify: bool) {
+        let next = clamp_ui_zoom(target);
+        if (next - self.ui_prefs.zoom).abs() < 0.001 {
+            return;
+        }
+        self.ui_prefs.zoom = next;
+        ctx.set_zoom_factor(next);
+        theme::save_ui_prefs(&self.store.app_dir, &self.ui_prefs);
+        if notify {
+            self.show_toast(
+                format!("界面缩放：{}%", (next * 100.0).round() as i32),
+                false,
+            );
+        }
+    }
+
+    fn handle_zoom_shortcuts(&mut self, ctx: &egui::Context) {
+        let mut step: Option<f32> = None;
+        let mut reset = false;
+        ctx.input(|i| {
+            let ctrl = i.modifiers.ctrl || i.modifiers.command;
+            if !ctrl {
+                return;
+            }
+            if i.key_pressed(egui::Key::Plus) || i.key_pressed(egui::Key::Equals) {
+                step = Some(0.05);
+            } else if i.key_pressed(egui::Key::Minus) {
+                step = Some(-0.05);
+            } else if i.key_pressed(egui::Key::Num0) {
+                reset = true;
+            } else {
+                for ev in &i.events {
+                    if let egui::Event::MouseWheel {
+                        delta, modifiers, ..
+                    } = ev
+                    {
+                        if (modifiers.ctrl || modifiers.command) && delta.y.abs() > 0.01 {
+                            step = Some(if delta.y > 0.0 { 0.05 } else { -0.05 });
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+        if reset {
+            self.apply_zoom(ctx, 1.0, true);
+        } else if let Some(delta) = step {
+            self.apply_zoom(ctx, self.ui_prefs.zoom + delta, true);
+        }
+    }
+
+    fn track_window_size(&mut self, ctx: &egui::Context) {
+        let (maximized, minimized, inner_rect) = ctx.input(|i| {
+            let vp = i.viewport();
+            (
+                vp.maximized.unwrap_or(false),
+                vp.minimized.unwrap_or(false),
+                vp.inner_rect,
+            )
+        });
+        if !maximized && !minimized {
+            if let Some(rect) = inner_rect {
+                let zoom = ctx.zoom_factor().max(0.5);
+                let os_w = (rect.width() * zoom).round();
+                let os_h = (rect.height() * zoom).round();
+                if os_w >= MIN_WINDOW_SIZE[0] && os_h >= MIN_WINDOW_SIZE[1] {
+                    let prev = self.ui_prefs.effective_window_size();
+                    if (os_w - prev[0]).abs() >= 4.0 || (os_h - prev[1]).abs() >= 4.0 {
+                        self.ui_prefs.window_size = Some([os_w, os_h]);
+                        self.window_size_dirty_since = Some(Instant::now());
+                    }
+                }
+            }
+        }
+        if let Some(since) = self.window_size_dirty_since {
+            if since.elapsed() >= Duration::from_millis(600) {
+                self.window_size_dirty_since = None;
+                theme::save_ui_prefs(&self.store.app_dir, &self.ui_prefs);
+            }
+        }
     }
 
     fn request(&mut self, command: UiToDaemon, startup_error: Option<String>) {
@@ -487,7 +575,7 @@ impl GuardApp {
                 }
 
                 ui.add_space(4.0);
-                let (theme_icon, theme_tip) = match self.theme_mode {
+                let (theme_icon, theme_tip) = match self.ui_prefs.theme {
                     ThemeMode::Light => (Icon::Moon, "切换深色主题"),
                     ThemeMode::Dark => (Icon::Sun, "切换浅色主题"),
                 };
@@ -748,7 +836,9 @@ impl eframe::App for GuardApp {
             Duration::from_secs(1)
         });
 
-        let p = Palette::of(self.theme_mode);
+        let p = Palette::of(self.ui_prefs.theme);
+        self.handle_zoom_shortcuts(ctx);
+        self.track_window_size(ctx);
         handle_window_resize(ctx);
 
         // 1. 36px 原生极简无边框标题栏
@@ -824,6 +914,7 @@ impl eframe::App for GuardApp {
                             &p,
                             &mut self.form,
                             &self.settings,
+                            &mut self.ui_prefs,
                             &self.store.app_dir,
                             &self.log_path,
                             self.credential_account.as_deref(),
@@ -832,6 +923,23 @@ impl eframe::App for GuardApp {
                             total_h,
                         );
                     });
+                if actions.ui_prefs_changed {
+                    self.ui_prefs = self.ui_prefs.clone().normalized();
+                    ctx.set_zoom_factor(self.ui_prefs.zoom);
+                    theme::apply_theme(ctx, &Palette::of(self.ui_prefs.theme));
+                    theme::save_ui_prefs(&self.store.app_dir, &self.ui_prefs);
+                }
+                if let Some([w, h]) = actions.set_window_size {
+                    let zoom = self.ui_prefs.zoom.max(0.5);
+                    self.ui_prefs.window_size = Some([w, h]);
+                    self.window_size_dirty_since = None;
+                    theme::save_ui_prefs(&self.store.app_dir, &self.ui_prefs);
+                    ctx.send_viewport_cmd(ViewportCommand::InnerSize(Vec2::new(
+                        w / zoom,
+                        h / zoom,
+                    )));
+                    self.show_toast(format!("窗口已调整为 {} × {}", w as i32, h as i32), false);
+                }
                 if actions.save {
                     self.save();
                 }
@@ -866,7 +974,11 @@ impl eframe::App for GuardApp {
         );
     }
 
-    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {}
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if self.window_size_dirty_since.take().is_some() {
+            theme::save_ui_prefs(&self.store.app_dir, &self.ui_prefs);
+        }
+    }
 }
 
 fn draw_titlebar_chip_btn(

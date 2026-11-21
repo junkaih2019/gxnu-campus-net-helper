@@ -38,6 +38,7 @@ pub enum Icon {
     ArrowUpDown,
     ChevronDown,
     Folder,
+    Monitor,
 }
 
 /// 在给定矩形内按比例居中绘制矢量图标。
@@ -385,6 +386,17 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
                 pt(-0.66, 0.48),
             ];
             painter.add(egui::Shape::closed_line(pts, st));
+        }
+        Icon::Monitor => {
+            let screen = Rect::from_min_max(pt(-0.74, -0.62), pt(0.74, 0.30));
+            painter.rect_stroke(
+                screen,
+                egui::CornerRadius::same(2),
+                st,
+                egui::StrokeKind::Middle,
+            );
+            painter.line_segment([pt(0.0, 0.30), pt(0.0, 0.64)], st);
+            painter.line_segment([pt(-0.34, 0.64), pt(0.34, 0.64)], st);
         }
     }
 }

@@ -9,16 +9,20 @@ use eframe::egui::{self, CornerRadius, CursorIcon, Sense, Stroke, StrokeKind, Ve
 
 use crate::models::Settings;
 use crate::ui::icons::{self, Icon};
-use crate::ui::theme::{body_text, bold_text, carrier_label, Palette, RADIUS_MD, RADIUS_SM};
+use crate::ui::theme::{
+    body_text, bold_text, carrier_label, clamp_ui_zoom, Palette, ThemeMode, UiPrefs, RADIUS_MD,
+    RADIUS_SM,
+};
 use crate::ui::widgets::{
-    badge, nav_rail_item, primary_button, save_button, secondary_button, stepper_field,
-    toggle_switch,
+    badge, nav_rail_item, primary_button, save_button, secondary_button, segmented_control,
+    stepper_field, toggle_switch,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingsTab {
     Account,
     Monitor,
+    Display,
     Notify,
 }
 
@@ -27,14 +31,16 @@ impl SettingsTab {
         match self {
             Self::Account => 0,
             Self::Monitor => 1,
-            Self::Notify => 2,
+            Self::Display => 2,
+            Self::Notify => 3,
         }
     }
 
     pub fn from_index(idx: usize) -> Self {
         match idx {
             1 => Self::Monitor,
-            2 => Self::Notify,
+            2 => Self::Display,
+            3 => Self::Notify,
             _ => Self::Account,
         }
     }
@@ -125,6 +131,8 @@ pub struct SettingsActions {
     pub test_toast: bool,
     pub save: bool,
     pub reset: bool,
+    pub ui_prefs_changed: bool,
+    pub set_window_size: Option<[f32; 2]>,
 }
 
 /// 成熟版 Windows 11 Fluent 设置中心视图（左侧分组导航 + 右侧分组卡片 + 底部常驻保存栏）。
@@ -134,6 +142,7 @@ pub fn draw_settings_view(
     p: &Palette,
     form: &mut SettingsForm,
     saved: &Settings,
+    ui_prefs: &mut UiPrefs,
     app_dir: &Path,
     log_path: &Path,
     credential_account: Option<&str>,
@@ -197,6 +206,15 @@ pub fn draw_settings_view(
                                     "监控与自启",
                                 ) {
                                     form.tab = SettingsTab::Monitor;
+                                }
+                                if nav_rail_item(
+                                    ui,
+                                    p,
+                                    form.tab == SettingsTab::Display,
+                                    Icon::Monitor,
+                                    "外观与显示",
+                                ) {
+                                    form.tab = SettingsTab::Display;
                                 }
                                 if nav_rail_item(
                                     ui,
@@ -278,6 +296,9 @@ pub fn draw_settings_view(
                                                 credential_account,
                                             ),
                                             SettingsTab::Monitor => draw_monitor_page(ui, p, form),
+                                            SettingsTab::Display => {
+                                                draw_display_page(ui, p, ui_prefs, &mut actions)
+                                            }
                                             SettingsTab::Notify => {
                                                 if draw_notify_data_page(
                                                     ui, p, form, app_dir, log_path,
@@ -655,6 +676,191 @@ fn draw_monitor_page(ui: &mut egui::Ui, p: &Palette, form: &mut SettingsForm) {
             true,
             None,
         );
+    });
+}
+
+fn draw_display_page(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    ui_prefs: &mut UiPrefs,
+    actions: &mut SettingsActions,
+) {
+    page_header(
+        ui,
+        p,
+        "外观与显示",
+        "调整主题模式、整体界面缩放比例、窗口大小与主页模块展示；本页修改即时生效并自动保存。",
+    );
+
+    group_card(ui, p, |ui| {
+        // 1. 主题模式
+        let row_w = ui.available_width();
+        ui.allocate_ui_with_layout(
+            Vec2::new(row_w, 36.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                let left_w = (row_w - 110.0).max(160.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(left_w, 34.0),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(bold_text("主题外观", 12.0, p.text));
+                        ui.label(body_text(
+                            "支持浅色与深色模式，与标题栏快捷切换实时同步",
+                            10.5,
+                            p.text_muted,
+                        ));
+                    },
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut idx = match ui_prefs.theme {
+                        ThemeMode::Light => 0,
+                        ThemeMode::Dark => 1,
+                    };
+                    if segmented_control(ui, p, "settings_theme_seg", &mut idx, &["浅色", "深色"])
+                    {
+                        ui_prefs.theme = if idx == 0 {
+                            ThemeMode::Light
+                        } else {
+                            ThemeMode::Dark
+                        };
+                        actions.ui_prefs_changed = true;
+                    }
+                });
+            },
+        );
+
+        row_divider(ui, p);
+
+        // 2. 全局界面缩放比例（5% 步进 + 6 档快捷预设）
+        let mut zoom_pct = (ui_prefs.zoom * 100.0).round() as i64;
+        let prev_pct = zoom_pct;
+        fluent_stepper_row(
+            ui,
+            p,
+            "界面缩放比例",
+            "元素偏大时可调小至 85% / 90%；亦支持 Ctrl + / − / 0 或 Ctrl + 滚轮随时缩放",
+            &mut zoom_pct,
+            75..=125,
+            5,
+            "%",
+        );
+        if zoom_pct != prev_pct {
+            ui_prefs.zoom = clamp_ui_zoom(zoom_pct as f32 / 100.0);
+            actions.ui_prefs_changed = true;
+        }
+
+        ui.add_space(6.0);
+        let presets: &[(i64, &str)] = &[
+            (75, "75%"),
+            (85, "85%"),
+            (90, "90%"),
+            (100, "100% 标准"),
+            (110, "110%"),
+            (125, "125%"),
+        ];
+        let gap = 6.0_f32;
+        let chip_w = ((ui.available_width() - gap * (presets.len() as f32 - 1.0))
+            / presets.len() as f32)
+            .floor()
+            .max(54.0);
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = gap;
+            let cur_pct = (ui_prefs.zoom * 100.0).round() as i64;
+            for (pct, label) in presets {
+                let active = cur_pct == *pct;
+                let (rect, resp) = ui.allocate_exact_size(Vec2::new(chip_w, 26.0), Sense::click());
+                let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+                let (fill, stroke, fg) = if active {
+                    (p.accent_soft, Stroke::new(1.2_f32, p.accent), p.accent)
+                } else if resp.hovered() {
+                    (p.card_hover, Stroke::new(1.0_f32, p.border_strong), p.text)
+                } else {
+                    (p.subtle, Stroke::new(1.0_f32, p.border), p.text_secondary)
+                };
+                ui.painter().rect(
+                    rect,
+                    CornerRadius::same(RADIUS_SM),
+                    fill,
+                    stroke,
+                    StrokeKind::Inside,
+                );
+                let font = if active {
+                    egui::FontId::new(11.0, crate::ui::theme::bold_family())
+                } else {
+                    egui::FontId::proportional(11.0)
+                };
+                ui.painter()
+                    .text(rect.center(), egui::Align2::CENTER_CENTER, *label, font, fg);
+                if resp.clicked() && !active {
+                    ui_prefs.zoom = clamp_ui_zoom(*pct as f32 / 100.0);
+                    actions.ui_prefs_changed = true;
+                }
+            }
+        });
+
+        row_divider(ui, p);
+
+        // 3. 窗口物理尺寸预设
+        let row_w = ui.available_width();
+        ui.allocate_ui_with_layout(
+            Vec2::new(row_w, 36.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                let left_w = (row_w - 220.0).max(150.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(left_w, 34.0),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(bold_text("窗口尺寸预设", 12.0, p.text));
+                        ui.label(body_text(
+                            "一键切换窗口大小；手动拖拽边缘缩放也会自动记住",
+                            10.5,
+                            p.text_muted,
+                        ));
+                    },
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    let sizes: &[(&str, [f32; 2], &str)] = &[
+                        ("宽松", [960.0, 640.0], "调整为 960 × 640"),
+                        ("标准", [840.0, 580.0], "调整为默认 840 × 580"),
+                        (
+                            "紧凑",
+                            [720.0, 500.0],
+                            "调整为紧凑 720 × 500（推荐配合 85% 缩放）",
+                        ),
+                    ];
+                    for (label, sz, tip) in sizes {
+                        let resp = secondary_button(ui, p, None, label).on_hover_text(*tip);
+                        if resp.clicked() {
+                            actions.set_window_size = Some(*sz);
+                        }
+                    }
+                });
+            },
+        );
+    });
+
+    ui.add_space(10.0);
+
+    // 4. 主页模块展示开关
+    group_card(ui, p, |ui| {
+        let prev = ui_prefs.show_home_traffic;
+        fluent_toggle_row(
+            ui,
+            p,
+            "主页展示「本机流量」卡片",
+            "关闭后，中央区域由「连接稳定性与断联记录」宽屏双栏接管；后台仍会持续记录，随时可重开",
+            &mut ui_prefs.show_home_traffic,
+            true,
+            None,
+        );
+        if ui_prefs.show_home_traffic != prev {
+            actions.ui_prefs_changed = true;
+        }
     });
 }
 

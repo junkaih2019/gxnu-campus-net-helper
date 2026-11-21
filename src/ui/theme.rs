@@ -38,34 +38,117 @@ impl ThemeMode {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct UiPrefs {
-    theme: ThemeMode,
+pub const MIN_UI_ZOOM: f32 = 0.75;
+pub const MAX_UI_ZOOM: f32 = 1.25;
+pub const DEFAULT_WINDOW_SIZE: [f32; 2] = [840.0, 580.0];
+pub const MIN_WINDOW_SIZE: [f32; 2] = [560.0, 400.0];
+
+fn default_ui_zoom() -> f32 {
+    1.0
 }
 
-/// 加载 UI 主题偏好（存于 `ui_prefs.json`）。
-pub fn load_theme_mode(app_dir: &Path) -> ThemeMode {
+fn default_show_home_traffic() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UiPrefs {
+    #[serde(default = "detect_windows_theme")]
+    pub theme: ThemeMode,
+    #[serde(default = "default_ui_zoom")]
+    pub zoom: f32,
+    #[serde(default = "default_show_home_traffic")]
+    pub show_home_traffic: bool,
+    #[serde(default)]
+    pub window_size: Option<[f32; 2]>,
+}
+
+impl Default for UiPrefs {
+    fn default() -> Self {
+        Self {
+            theme: detect_windows_theme(),
+            zoom: 1.0,
+            show_home_traffic: true,
+            window_size: None,
+        }
+    }
+}
+
+impl UiPrefs {
+    pub fn normalized(mut self) -> Self {
+        self.zoom = clamp_ui_zoom(self.zoom);
+        self.window_size = self.window_size.and_then(|[w, h]| {
+            if w.is_finite() && h.is_finite() {
+                Some([
+                    w.clamp(MIN_WINDOW_SIZE[0], 2560.0).round(),
+                    h.clamp(MIN_WINDOW_SIZE[1], 1600.0).round(),
+                ])
+            } else {
+                None
+            }
+        });
+        self
+    }
+
+    pub fn effective_window_size(&self) -> [f32; 2] {
+        self.window_size.unwrap_or(DEFAULT_WINDOW_SIZE)
+    }
+}
+
+pub fn clamp_ui_zoom(zoom: f32) -> f32 {
+    if !zoom.is_finite() {
+        return 1.0;
+    }
+    let clamped = zoom.clamp(MIN_UI_ZOOM, MAX_UI_ZOOM);
+    (clamped * 100.0).round() / 100.0
+}
+
+/// 加载全部 UI 偏好（存于 `ui_prefs.json`，完全向后兼容仅含 `theme` 字段的旧版配置）。
+pub fn load_ui_prefs(app_dir: &Path) -> UiPrefs {
+    let prefs_path = app_dir.join("ui_prefs.json");
+    let mut prefs = std::fs::read_to_string(&prefs_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<UiPrefs>(&text).ok())
+        .unwrap_or_default();
+
     if let Ok(env_theme) = std::env::var("GXNU_THEME") {
         match env_theme.to_lowercase().as_str() {
-            "dark" => return ThemeMode::Dark,
-            "light" => return ThemeMode::Light,
+            "dark" => prefs.theme = ThemeMode::Dark,
+            "light" => prefs.theme = ThemeMode::Light,
             _ => {}
         }
     }
-    let prefs_path = app_dir.join("ui_prefs.json");
-    if let Ok(text) = std::fs::read_to_string(&prefs_path) {
-        if let Ok(prefs) = serde_json::from_str::<UiPrefs>(&text) {
-            return prefs.theme;
+    if let Ok(env_zoom) = std::env::var("GXNU_ZOOM") {
+        if let Ok(z) = env_zoom.trim().parse::<f32>() {
+            prefs.zoom = z;
         }
     }
-    detect_windows_theme()
+    if let Ok(env_traffic) = std::env::var("GXNU_SHOW_TRAFFIC") {
+        match env_traffic.trim().to_lowercase().as_str() {
+            "0" | "false" | "off" | "no" => prefs.show_home_traffic = false,
+            "1" | "true" | "on" | "yes" => prefs.show_home_traffic = true,
+            _ => {}
+        }
+    }
+    prefs.normalized()
+}
+
+pub fn save_ui_prefs(app_dir: &Path, prefs: &UiPrefs) {
+    let prefs_path = app_dir.join("ui_prefs.json");
+    if let Ok(text) = serde_json::to_string_pretty(&prefs.clone().normalized()) {
+        let _ = std::fs::write(prefs_path, text);
+    }
+}
+
+/// 加载 UI 主题偏好（兼容旧调用方）。
+pub fn load_theme_mode(app_dir: &Path) -> ThemeMode {
+    load_ui_prefs(app_dir).theme
 }
 
 pub fn save_theme_mode(app_dir: &Path, mode: ThemeMode) {
-    let prefs_path = app_dir.join("ui_prefs.json");
-    if let Ok(text) = serde_json::to_string_pretty(&UiPrefs { theme: mode }) {
-        let _ = std::fs::write(prefs_path, text);
-    }
+    let mut prefs = load_ui_prefs(app_dir);
+    prefs.theme = mode;
+    save_ui_prefs(app_dir, &prefs);
 }
 
 fn detect_windows_theme() -> ThemeMode {
@@ -637,5 +720,35 @@ pub fn format_ms_compact(ms: u64) -> String {
         format!("{:.1}s", ms as f64 / 1000.0)
     } else {
         format!("{ms}ms")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ui_prefs_backward_compat_and_clamp() {
+        let legacy = serde_json::from_str::<UiPrefs>(r#"{"theme":"dark"}"#)
+            .unwrap()
+            .normalized();
+        assert_eq!(legacy.theme, ThemeMode::Dark);
+        assert!((legacy.zoom - 1.0).abs() < f32::EPSILON);
+        assert!(legacy.show_home_traffic);
+        assert!(legacy.window_size.is_none());
+
+        let wild = UiPrefs {
+            theme: ThemeMode::Light,
+            zoom: 2.8,
+            show_home_traffic: false,
+            window_size: Some([300.0, 200.0]),
+        }
+        .normalized();
+        assert!((wild.zoom - MAX_UI_ZOOM).abs() < f32::EPSILON);
+        assert_eq!(wild.window_size, Some(MIN_WINDOW_SIZE));
+
+        let low = clamp_ui_zoom(0.2);
+        assert!((low - MIN_UI_ZOOM).abs() < f32::EPSILON);
+        assert!((clamp_ui_zoom(f32::NAN) - 1.0).abs() < f32::EPSILON);
     }
 }

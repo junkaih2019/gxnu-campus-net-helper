@@ -591,6 +591,8 @@ fn run_ui_process(args: &[String]) -> ExitCode {
         &traffic::account_key_of(&settings.student_id),
     );
     let initial_logs = logging::read_tail(&log_path, 800);
+    let ui_prefs = ui::load_ui_prefs(&store.app_dir);
+    let initial_size = ui_prefs.effective_window_size();
 
     let deps = ui::GuardDeps {
         store,
@@ -606,8 +608,8 @@ fn run_ui_process(args: &[String]) -> ExitCode {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([840.0, 580.0])
-            .with_min_inner_size([760.0, 520.0])
+            .with_inner_size(initial_size)
+            .with_min_inner_size(ui::MIN_WINDOW_SIZE)
             .with_decorations(false)
             .with_title(APP_NAME)
             .with_app_id("GXNUCampusLoginRS")
