@@ -780,7 +780,7 @@ impl eframe::App for GuardApp {
                         let usable_h = (avail_h - gap).max(300.0);
                         let min_mid = 236.0_f32;
                         let min_log = 148.0_f32;
-                        let mid_h = (usable_h * 0.56)
+                        let mid_h = (usable_h * 0.585)
                             .clamp(min_mid, (usable_h - min_log).max(min_mid))
                             .floor();
                         let log_h = (usable_h - mid_h).max(min_log);
