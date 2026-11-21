@@ -26,7 +26,7 @@ use crate::config::SettingsStore;
 use crate::credentials;
 use crate::ipc::{IpcClient, SnapshotEnvelope, UiToDaemon};
 use crate::metrics_store::{TelemetryPoint, TimeRange};
-use crate::models::{MonitorSnapshot, MonitorState, Settings};
+use crate::models::{MonitorSnapshot, MonitorState, Settings, TrafficSummary};
 use crate::startup;
 
 use icons::Icon;
@@ -55,6 +55,7 @@ pub struct GuardDeps {
     pub log_path: PathBuf,
     pub initial_logs: Vec<String>,
     pub initial_telemetry: Vec<TelemetryPoint>,
+    pub initial_traffic: TrafficSummary,
 }
 
 struct PendingCommand {
@@ -107,6 +108,7 @@ pub struct GuardApp {
     credential_account: Option<String>,
     logs_state: logs_page::LogsState,
     telemetry: Vec<TelemetryPoint>,
+    traffic: TrafficSummary,
     time_range: TimeRange,
     left_pane_width: f32,
     settings_collapsed: bool,
@@ -189,6 +191,7 @@ impl GuardApp {
             credential_account,
             logs_state: logs_page::LogsState::default(),
             telemetry: deps.initial_telemetry,
+            traffic: deps.initial_traffic,
             time_range: TimeRange::H24,
             left_pane_width: 292.0,
             settings_collapsed,
@@ -340,6 +343,7 @@ impl GuardApp {
             let snapshot = env.snapshot;
             self.online_since_unix = env.online_since_unix;
             self.last_check_unix = env.last_check_unix;
+            self.traffic = env.traffic;
 
             if snapshot.metrics.check_seq > self.last_check_seq {
                 self.last_check_seq = snapshot.metrics.check_seq;

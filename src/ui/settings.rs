@@ -49,6 +49,7 @@ pub struct SettingsForm {
     pub notify_toast: bool,
     pub notify_wechat: bool,
     pub notify_quiet_minutes: i64,
+    pub monthly_quota_gb: i64,
 }
 
 impl SettingsForm {
@@ -68,6 +69,7 @@ impl SettingsForm {
             notify_toast: settings.notify_toast,
             notify_wechat: settings.notify_wechat,
             notify_quiet_minutes: settings.notify_quiet_minutes,
+            monthly_quota_gb: settings.monthly_quota_gb,
         }
     }
 
@@ -84,6 +86,7 @@ impl SettingsForm {
             notify_toast: self.notify_toast,
             notify_wechat: self.notify_wechat,
             notify_quiet_minutes: self.notify_quiet_minutes,
+            monthly_quota_gb: self.monthly_quota_gb,
         }
         .normalized()
     }
@@ -100,6 +103,7 @@ impl SettingsForm {
             || current.auto_boot != saved.auto_boot
             || current.notify_toast != saved.notify_toast
             || current.notify_quiet_minutes != saved.notify_quiet_minutes
+            || current.monthly_quota_gb != saved.monthly_quota_gb
             || !self.password.is_empty()
     }
 }

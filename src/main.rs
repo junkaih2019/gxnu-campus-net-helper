@@ -25,13 +25,15 @@ mod network_events;
 mod notify;
 mod single_instance;
 mod startup;
+mod traffic;
 mod tray;
 mod tray_menu;
 mod ui;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use chrono::Local;
@@ -208,6 +210,13 @@ fn run_daemon(
         settings.notify_toast,
     )));
     let metrics_store = Arc::new(metrics_store::MetricsStore::new(&store.app_dir));
+    let traffic_tracker = Arc::new(Mutex::new(traffic::TrafficTracker::new(&store.app_dir)));
+    let active_account_key = Arc::new(Mutex::new(traffic::account_key_of(&settings.student_id)));
+    let latest_traffic = Arc::new(Mutex::new(traffic_tracker.lock().unwrap().summary(
+        &active_account_key.lock().unwrap(),
+        Local::now().date_naive(),
+    )));
+    let is_online = Arc::new(AtomicBool::new(false));
     let latest_snapshot: Arc<Mutex<Option<models::MonitorSnapshot>>> = Arc::new(Mutex::new(None));
     let online_since_unix: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
     let last_check_unix: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
@@ -249,11 +258,18 @@ fn run_daemon(
     let sink_last_check = Arc::clone(&last_check_unix);
     let sink_seq = Arc::clone(&last_check_seq);
     let sink_ipc = Arc::clone(&ipc_server);
+    let sink_is_online = Arc::clone(&is_online);
+    let sink_traffic = Arc::clone(&latest_traffic);
 
     let sink: monitor::SnapshotSink = Arc::new(move |snapshot| {
         if let Ok(mut n) = sink_notifier.lock() {
             n.handle(&snapshot);
         }
+
+        sink_is_online.store(
+            snapshot.state == models::MonitorState::Online,
+            Ordering::Release,
+        );
 
         let now = Local::now().timestamp();
         let online_ts = if let Ok(mut guard) = sink_online.lock() {
@@ -293,12 +309,68 @@ fn run_daemon(
         }
         post_thread_msg(main_tid, WM_TRAY_REFRESH);
 
+        let traffic_summary = sink_traffic.lock().map(|g| g.clone()).unwrap_or_default();
         sink_ipc.broadcast_snapshot(ipc::SnapshotEnvelope {
             snapshot,
             online_since_unix: online_ts,
             last_check_unix: check_ts,
+            traffic: traffic_summary,
         });
     });
+
+    // 超轻量后台物理网卡流量采样线程（每 5s 增量采样，退时立即唤醒并落盘）
+    let traffic_stop = Arc::new((Mutex::new(false), Condvar::new()));
+    let traffic_thread = {
+        let stop_pair = Arc::clone(&traffic_stop);
+        let tracker = Arc::clone(&traffic_tracker);
+        let acct = Arc::clone(&active_account_key);
+        let online_flag = Arc::clone(&is_online);
+        let latest_snap = Arc::clone(&latest_snapshot);
+        let online_since = Arc::clone(&online_since_unix);
+        let last_check = Arc::clone(&last_check_unix);
+        let shared_traffic = Arc::clone(&latest_traffic);
+        let ipc = Arc::clone(&ipc_server);
+        std::thread::Builder::new()
+            .name("traffic-sampler".to_string())
+            .spawn(move || {
+                let (lock, cv) = &*stop_pair;
+                loop {
+                    let guard = lock.lock().unwrap();
+                    let (guard, _) = cv
+                        .wait_timeout_while(guard, Duration::from_secs(5), |stopped| !*stopped)
+                        .unwrap();
+                    if *guard {
+                        break;
+                    }
+                    drop(guard);
+
+                    let counters = traffic::read_physical_nic_counters();
+                    let online = online_flag.load(Ordering::Acquire);
+                    let account_key = acct.lock().unwrap().clone();
+                    let today = Local::now().date_naive();
+                    let (changed, summary) =
+                        tracker
+                            .lock()
+                            .unwrap()
+                            .tick(online, &account_key, today, &counters);
+                    if let Ok(mut g) = shared_traffic.lock() {
+                        *g = summary.clone();
+                    }
+                    if changed {
+                        if let Some(snap) = latest_snap.lock().ok().and_then(|g| g.clone()) {
+                            ipc.broadcast_snapshot(ipc::SnapshotEnvelope {
+                                snapshot: snap,
+                                online_since_unix: online_since.lock().ok().and_then(|g| *g),
+                                last_check_unix: last_check.lock().ok().and_then(|g| *g),
+                                traffic: summary,
+                            });
+                        }
+                    }
+                }
+                tracker.lock().unwrap().flush();
+            })
+            .ok()
+    };
 
     let diagnostics = diagnostics::NetworkDiagnostics::new()
         .with_campus_status(campus_status::CampusStatusProbe::new());
@@ -321,6 +393,9 @@ fn run_daemon(
         control: monitor_ctrl.clone(),
         store,
         notifier,
+        active_account_key: Arc::clone(&active_account_key),
+        traffic_tracker: Arc::clone(&traffic_tracker),
+        latest_traffic: Arc::clone(&latest_traffic),
         show_ui: Box::new(move || show_or_spawn_ui(&child, &endpoint)),
     }));
     if settings.auto_start_monitoring {
@@ -396,6 +471,11 @@ fn run_daemon(
 
     // ── 干净退出流程 ───────────────────────────────────────────────
     monitor_ctrl.signal_stop();
+    {
+        let (lock, cv) = &*traffic_stop;
+        *lock.lock().unwrap() = true;
+        cv.notify_all();
+    }
     logging::info("[APP_EXIT] 正在退出");
     ipc_server.broadcast_shutdown();
     if let Some(menu) = fluent_menu.as_mut() {
@@ -405,6 +485,9 @@ fn run_daemon(
     drop(tray);
     stop_ui_child(&ui_child);
     monitor.shutdown();
+    if let Some(handle) = traffic_thread {
+        let _ = handle.join();
+    }
     ExitCode::SUCCESS
 }
 
@@ -412,6 +495,9 @@ struct DaemonCommands {
     control: monitor::MonitorControl,
     store: config::SettingsStore,
     notifier: Arc<Mutex<notify::ToastNotifier>>,
+    active_account_key: Arc<Mutex<String>>,
+    traffic_tracker: Arc<Mutex<traffic::TrafficTracker>>,
+    latest_traffic: Arc<Mutex<models::TrafficSummary>>,
     show_ui: Box<dyn Fn() -> Result<(), String> + Send + Sync>,
 }
 
@@ -444,8 +530,16 @@ impl DaemonCommands {
                     return Err("磁盘设置已被其他写入更新，请重新核对后保存".into());
                 }
                 let enabled = settings.notify_toast;
+                let new_key = traffic::account_key_of(&settings.student_id);
                 self.control.update_settings(settings, password_changed)?;
                 self.notifier.lock().unwrap().set_enabled(enabled);
+                *self.active_account_key.lock().unwrap() = new_key.clone();
+                let refreshed = self
+                    .traffic_tracker
+                    .lock()
+                    .unwrap()
+                    .summary(&new_key, Local::now().date_naive());
+                *self.latest_traffic.lock().unwrap() = refreshed;
                 if start {
                     self.control.start()?;
                 }
@@ -492,6 +586,10 @@ fn run_ui_process(args: &[String]) -> ExitCode {
     };
 
     let initial_telemetry = metrics_store::MetricsStore::history(&store.app_dir);
+    let initial_traffic = traffic::TrafficTracker::read_summary(
+        &store.app_dir,
+        &traffic::account_key_of(&settings.student_id),
+    );
     let initial_logs = logging::read_tail(&log_path, 800);
 
     let deps = ui::GuardDeps {
@@ -503,6 +601,7 @@ fn run_ui_process(args: &[String]) -> ExitCode {
         log_path,
         initial_logs,
         initial_telemetry,
+        initial_traffic,
     };
 
     let options = eframe::NativeOptions {

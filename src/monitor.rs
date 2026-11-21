@@ -1583,6 +1583,9 @@ mod tests {
             },
             control: f.monitor.control(),
             notifier: Arc::new(Mutex::new(crate::notify::ToastNotifier::new(false))),
+            active_account_key: Arc::new(Mutex::new(crate::traffic::account_key_of(""))),
+            traffic_tracker: Arc::new(Mutex::new(crate::traffic::TrafficTracker::new(dir))),
+            latest_traffic: Arc::new(Mutex::new(crate::models::TrafficSummary::default())),
             show_ui: Box::new(move || {
                 shows.fetch_add(1, Ordering::SeqCst);
                 Ok(())

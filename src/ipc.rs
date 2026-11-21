@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{MonitorSnapshot, Settings};
+use crate::models::{MonitorSnapshot, Settings, TrafficSummary};
 
 const ENDPOINT_FILE: &str = "daemon.json";
 
@@ -29,6 +29,8 @@ pub struct SnapshotEnvelope {
     pub snapshot: MonitorSnapshot,
     pub online_since_unix: Option<i64>,
     pub last_check_unix: Option<i64>,
+    #[serde(default)]
+    pub traffic: TrafficSummary,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -498,6 +500,7 @@ mod tests {
             snapshot: MonitorSnapshot::new(MonitorState::Paused, None, "paused", false),
             online_since_unix: None,
             last_check_unix: None,
+            traffic: TrafficSummary::default(),
         });
         let ep = server.endpoint();
         let (mut client, snapshots, logs) = IpcClient::connect(ep.port, &ep.token).unwrap();

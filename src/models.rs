@@ -234,6 +234,43 @@ impl MonitorSnapshot {
     }
 }
 
+/// 单日校园网本机流量统计（字节）。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DailyTraffic {
+    /// 本地日期 `YYYY-MM-DD`。
+    pub date: String,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+}
+
+impl DailyTraffic {
+    pub fn total_bytes(&self) -> u64 {
+        self.rx_bytes.saturating_add(self.tx_bytes)
+    }
+}
+
+/// 守护进程推送给界面的本机流量摘要。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrafficSummary {
+    pub today_rx_bytes: u64,
+    pub today_tx_bytes: u64,
+    pub month_rx_bytes: u64,
+    pub month_tx_bytes: u64,
+    /// 按时间正序（含今日）的近 7 天统计。
+    #[serde(default)]
+    pub last_7_days: Vec<DailyTraffic>,
+}
+
+impl TrafficSummary {
+    pub fn today_total_bytes(&self) -> u64 {
+        self.today_rx_bytes.saturating_add(self.today_tx_bytes)
+    }
+
+    pub fn month_total_bytes(&self) -> u64 {
+        self.month_rx_bytes.saturating_add(self.month_tx_bytes)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -248,6 +285,8 @@ pub struct Settings {
     pub notify_toast: bool,
     pub notify_wechat: bool,
     pub notify_quiet_minutes: i64,
+    /// 可选月流量提醒上限（GB）；`0` 表示不限制（默认，适合运营商免计费出口）。
+    pub monthly_quota_gb: i64,
 }
 
 impl Default for Settings {
@@ -264,6 +303,7 @@ impl Default for Settings {
             notify_toast: true,
             notify_wechat: false,
             notify_quiet_minutes: 3,
+            monthly_quota_gb: 0,
         }
     }
 }
@@ -288,6 +328,7 @@ impl Settings {
             notify_toast: self.notify_toast,
             notify_wechat: self.notify_wechat,
             notify_quiet_minutes: self.notify_quiet_minutes.clamp(1, 60),
+            monthly_quota_gb: self.monthly_quota_gb.clamp(0, 2000),
         }
     }
 }
