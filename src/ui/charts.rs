@@ -157,7 +157,7 @@ fn draw_account_traffic_card(
     let mut view_changed = false;
 
     card_padded(ui, p, 12, |ui| {
-        let inner_h = (target_height - 26.0).max(110.0);
+        let inner_h = (target_height - 24.0).max(112.0);
         ui.set_min_height(inner_h);
         ui.set_max_height(inner_h);
         ui.spacing_mut().item_spacing.y = 0.0;
@@ -819,7 +819,7 @@ fn draw_online_devices_card(
     let now_unix = Local::now().timestamp();
 
     card_padded(ui, p, 12, |ui| {
-        let inner_h = (target_height - 26.0).max(110.0);
+        let inner_h = (target_height - 24.0).max(112.0);
         ui.set_min_height(inner_h);
         ui.set_max_height(inner_h);
         ui.spacing_mut().item_spacing.y = 0.0;

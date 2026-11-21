@@ -1428,7 +1428,7 @@ impl eframe::App for GuardApp {
 
                         // Tier 1: 精简状态主条（含本机真实校园网 IP 与门户校准在线时长）
                         self.draw_status_ribbon(ui, &p);
-                        ui.add_space(8.0);
+                        ui.add_space(10.0);
 
                         let show_self_service = self.ui_prefs.show_home_traffic;
                         let campus_ip = self.effective_campus_ip();
@@ -1476,7 +1476,7 @@ impl eframe::App for GuardApp {
                                 self.show_toast("正在刷新校园网自助服务数据…", false);
                                 self.request(UiToDaemon::RefreshSelfService { force: true }, None);
                             }
-                            ui.add_space(8.0);
+                            ui.add_space(10.0);
                         }
 
                         // Tier 3: 通栏紧凑「连接稳定性」胶囊时间轴（位于流量/设备双卡之下、运行日志之上）
@@ -1495,7 +1495,7 @@ impl eframe::App for GuardApp {
                                 self.window_size_dirty_since = Some(Instant::now());
                             }
                         } else {
-                            ui.add_space(8.0);
+                            ui.add_space(10.0);
                         }
 
                         // Tier 4: 通栏静谧运行日志（严格取当前剩余可用高度，杜绝底部圆角被窗口边缘裁切）
