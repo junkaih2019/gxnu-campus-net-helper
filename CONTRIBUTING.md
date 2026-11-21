@@ -16,6 +16,8 @@ rustup override set stable-x86_64-pc-windows-gnu
 
 验证脚本依次执行格式检查、Clippy、测试和锁定依赖的 Release 构建。日常开发可以用 `.\build.ps1 test --locked` 单独运行测试。
 
+运行 `.\build.ps1 release` 可生成带中文名称的发行 EXE。该命令会根据 Windows 文件资源中的原始文件名复制 Cargo 产物。
+
 ## 修改网络行为
 
 网络诊断、门户认证和监控状态机分别位于 `src/diagnostics.rs`、`src/authenticator.rs` 和 `src/monitor.rs`。修改前请阅读[诊断顺序和状态机](docs/ARCHITECTURE.md)。在回环地址上模拟门户响应，测试账号使用 `demo-student` 等虚构值，示例网络地址使用 `192.0.2.0/24`。

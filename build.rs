@@ -1,4 +1,4 @@
-//! Windows 构建脚本：使用 MinGW `windres` 将 `assets/app.ico` 嵌入最终的 `gxnu-guard.exe`，
+//! Windows 构建脚本：使用 MinGW `windres` 将 `assets/app.ico` 嵌入发行版可执行文件，
 //! 使 Windows 资源管理器、快捷方式与文件属性页都能显示高清应用图标。
 
 use std::env;
@@ -23,7 +23,27 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let obj_path = out_dir.join("app_icon.o");
 
+    let app_name = env!("CARGO_PKG_DESCRIPTION");
+    let version = env!("CARGO_PKG_VERSION");
+    let version_tuple = format!(
+        "{},{},{},0",
+        env!("CARGO_PKG_VERSION_MAJOR"),
+        env!("CARGO_PKG_VERSION_MINOR"),
+        env!("CARGO_PKG_VERSION_PATCH")
+    );
+    let header = format!(
+        r#"#define APP_NAME "{app_name}"
+#define APP_FILENAME "{app_name}.exe"
+#define APP_VERSION "{version}"
+#define APP_VERSION_TUPLE {version_tuple}
+"#
+    );
+    std::fs::write(out_dir.join("app_info.h"), header).expect("write Windows resource header");
+
     let status = Command::new("windres")
+        .arg("--codepage=65001")
+        .arg("-I")
+        .arg(&out_dir)
         .arg("-I")
         .arg(manifest_dir.join("assets"))
         .arg(&rc_path)

@@ -416,7 +416,7 @@ impl GuardApp {
                 Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                 egui::Color32::WHITE,
             );
-            ui.label(bold_text("GXNU 校园网守护", 12.5, p.text));
+            ui.label(bold_text(crate::APP_NAME, 12.5, p.text));
             ui.label(body_text(
                 format!("v{}", env!("CARGO_PKG_VERSION")),
                 11.0,

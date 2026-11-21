@@ -8,11 +8,11 @@
 
 在 Windows 上，任何基于 OpenGL（`eframe / glow`）的 GUI 进程一旦创建窗口，就会载入显卡 OpenGL ICD 驱动（如 Intel `igc64.dll` ~55 MB）并在进程堆中常驻中文字库（`msyh.ttc` ~19 MB），即使隐藏窗口也无法由进程自身完全卸载驱动映射。
 
-为兼顾**全天候极低后台占用**与**现代流畅的监控界面**，`gxnu-guard.exe` 内部采用单二进制双模式分离：
+为兼顾**全天候极低后台占用**与**现代流畅的监控界面**，`GXNU 校园网守护助手.exe` 内部采用单二进制双模式分离：
 
 | 运行模式 | 启动方式 | 职责 | 典型内存（Private / WS） | 后台 CPU |
 | :--- | :--- | :--- | :--- | :--- |
-| **轻守护进程（Daemon）** | `gxnu-guard.exe` 或 `--minimized` | 持有单实例锁 `Local\GXNUCampusLoginRS`、监控线程、Toast 通知、托盘图标与 Fluent 右键菜单、本地 IPC 服务端 | **~2.9 MB / ~5.8 MB** | **0.0%** |
+| **轻守护进程（Daemon）** | `GXNU 校园网守护助手.exe` 或 `--minimized` | 持有单实例锁 `Local\GXNUCampusLoginRS`、监控线程、Toast 通知、托盘图标与 Fluent 右键菜单、本地 IPC 服务端 | **~2.9 MB / ~5.8 MB** | **0.0%** |
 | **按需界面进程（UI）** | 守护进程按需拉起 `--ui --ipc-port <P> --ipc-token <T>` | 持有 UI 锁 `Local\GXNUCampusLoginRS_UI`、连接守护 IPC、展示双主题看板与设置页；点击 `×` 即退出彻底释放全部 GPU/字库内存 | 打开时 ~114 MB / 关闭后 **0 MB** | 仅可见时 1 FPS |
 
 ### 生命周期流转
@@ -20,9 +20,9 @@
 1. **首次启动**：
    - 普通启动：轻守护进程就绪后自动拉起 `--ui` 子进程显示主窗口。
    - `--minimized` 启动（开机自启）：仅启动轻守护进程静默驻留系统托盘。
-   - 重复双击 `gxnu-guard.exe`：检测到 `Local\GXNUCampusLoginRS` 已存在时，读取 `daemon.json` 向运行中的守护发送 `ShowUi` 指令，直接前置或拉起主窗口后退出。
+   - 重复双击 `GXNU 校园网守护助手.exe`：检测到 `Local\GXNUCampusLoginRS` 已存在时，读取 `daemon.json` 向运行中的守护发送 `ShowUi` 指令，直接前置或拉起主窗口后退出。
 2. **关闭主窗口（`×`）**：`--ui` 进程直接退出，释放全部 OpenGL 上下文与字库内存；守护进程继续在托盘实时监测并在断网时弹出 Windows Toast 通知。
-3. **托盘完全退出**：通过守护进程托盘右键菜单点击「退出校园网守护」：
+3. **托盘完全退出**：通过守护进程托盘右键菜单点击「退出 GXNU 校园网守护助手」：
    - 向已连接的 `--ui` 客户端广播 `Shutdown`；
    - 隐藏并销毁自定义 Fluent 菜单窗口与托盘图标（避免通知区残留幽灵图标）；
    - 在 600ms 内等待 `--ui` 退出，必要时终止；
@@ -110,7 +110,7 @@ Windows 接口变化或系统恢复消息一到托盘线程就使旧检测失效
 - **程序化统一图标 (`src/app_icon.rs`, `build.rs`)**：
   - 采用纯 SDF（有向距离场）+ 3×3 超采样抗锯齿绘制 GXNU 主题圆角矩形图标（清爽晴空蓝渐变、独秀峰与王城拱门、暖阳星芒、圆头 Wi-Fi 波纹）。
   - 托盘态在右下角叠加白边状态圆点，实时随 `MonitorState` 更新。
-  - 编译期通过 `build.rs` 调用 MinGW `windres` 将 `assets/app.ico`（6 档分辨率 PNG-in-ICO）链接进 `gxnu-guard.exe` 的 PE 资源节。
+  - 编译期通过 `build.rs` 调用 MinGW `windres` 将 `assets/app.ico`（6 档分辨率 PNG-in-ICO）链接进 `GXNU 校园网守护助手.exe` 的 PE 资源节。
 - **Fluent 自定义托盘菜单 (`src/tray_menu.rs`)**：
   - 守护进程启用 `Per-Monitor V2` DPI 感知，使用纯 Win32 GDI 双缓冲绘制现代弹出菜单，无需 OpenGL。
   - 通过 `DwmSetWindowAttribute` 启用 Windows 11 原生圆角（`DWMWCP_ROUND`）、阴影与主题边框色，自动读取 `ui_prefs.json` 或系统 `AppsUseLightTheme` 同步浅/深色外观。

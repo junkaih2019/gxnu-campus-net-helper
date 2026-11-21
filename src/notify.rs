@@ -136,7 +136,7 @@ impl ToastNotifier {
 fn show_toast_sync(body: &str) {
     match notify_rust::Notification::new()
         .app_id(AUMID)
-        .summary("校园网守护")
+        .summary(crate::APP_NAME)
         .body(body)
         .timeout(notify_rust::Timeout::Milliseconds(6000))
         .show()

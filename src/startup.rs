@@ -35,12 +35,12 @@ pub fn set_enabled(enabled: bool) -> Result<(), String> {
     }
 }
 
-/// 注册通知用的 AppUserModelID，让 Windows 弹窗显示“GXNU 校园网守护”。
+/// 注册通知用的 AppUserModelID，为 Windows 弹窗设置应用名称。
 pub fn ensure_app_id(app_id: &str) {
     let path = format!(r"Software\Classes\AppUserModelId\{app_id}");
     match RegKey::predef(HKEY_CURRENT_USER).create_subkey(&path) {
         Ok((key, _)) => {
-            let _ = key.set_value("DisplayName", &"GXNU 校园网守护");
+            let _ = key.set_value("DisplayName", &crate::APP_NAME);
         }
         Err(err) => logging::warn(&format!("[STARTUP] 注册通知 AppID 失败：{err}")),
     }

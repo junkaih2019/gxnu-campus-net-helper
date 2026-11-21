@@ -1,4 +1,4 @@
-//! GXNU 校园网守护（轻守护 + 按需界面双模式单文件架构）。
+//! GXNU 校园网守护助手（轻守护 + 按需界面双模式单文件架构）。
 //!
 //! - **守护模式（默认 / `--minimized`）**：纯 Win32 托盘 + 后台网络监控，不加载 OpenGL 与中文字库，
 //!   常驻内存仅约 5–10 MB、后台 CPU 0%。
@@ -44,7 +44,7 @@ const CREDENTIAL_TARGET: &str = "GXNUCampusLogin/v4";
 const MUTEX_NAME: &str = "Local\\GXNUCampusLoginRS";
 /// 按需界面进程单实例互斥体，确保同时只有一个主窗口。
 const UI_MUTEX_NAME: &str = "Local\\GXNUCampusLoginRS_UI";
-const APP_WINDOW_TITLE: &str = "GXNU 校园网守护";
+const APP_NAME: &str = env!("CARGO_PKG_DESCRIPTION");
 
 const WM_TRAY_REFRESH: u32 = 0x8000 + 1;
 const WM_DAEMON_QUIT: u32 = 0x8000 + 2;
@@ -161,7 +161,7 @@ fn main() -> ExitCode {
         }
     };
     logging::info(&format!(
-        "[APP_STARTED] gxnu-guard(rs) {VERSION} 守护模式启动，日志路径：{}",
+        "[APP_STARTED] {APP_NAME} {VERSION} 守护模式启动，日志路径：{}",
         log_path.display()
     ));
     logging::info(
@@ -510,14 +510,14 @@ fn run_ui_process(args: &[String]) -> ExitCode {
             .with_inner_size([980.0, 700.0])
             .with_min_inner_size([840.0, 580.0])
             .with_decorations(false)
-            .with_title(APP_WINDOW_TITLE)
+            .with_title(APP_NAME)
             .with_app_id("GXNUCampusLoginRS")
             .with_icon(window_icon()),
         ..Default::default()
     };
 
     match eframe::run_native(
-        "gxnu-guard",
+        APP_NAME,
         options,
         Box::new(move |cc| Ok(Box::new(ui::GuardApp::new(cc, deps)))),
     ) {
@@ -648,7 +648,7 @@ fn bring_pid_window_to_front(target_pid: u32) {
         }
         let mut buf = [0u16; 128];
         let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
-        if len > 0 && String::from_utf16_lossy(&buf[..len as usize]) == APP_WINDOW_TITLE {
+        if len > 0 && String::from_utf16_lossy(&buf[..len as usize]) == APP_NAME {
             state.found = hwnd;
             return 0;
         }
@@ -678,7 +678,7 @@ fn bring_any_ui_window_to_front() {
     unsafe extern "system" fn enum_cb(hwnd: HWND, _lparam: LPARAM) -> BOOL {
         let mut buf = [0u16; 128];
         let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
-        if len > 0 && String::from_utf16_lossy(&buf[..len as usize]) == APP_WINDOW_TITLE {
+        if len > 0 && String::from_utf16_lossy(&buf[..len as usize]) == APP_NAME {
             ShowWindow(hwnd, SW_SHOW);
             ShowWindow(hwnd, SW_RESTORE);
             SetForegroundWindow(hwnd);

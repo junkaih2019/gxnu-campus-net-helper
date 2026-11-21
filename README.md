@@ -6,14 +6,16 @@
 
 ## 开始使用
 
-1. 在 Releases 下载 `gxnu-guard-0.1.0-windows-x64.zip`，解压到固定目录，运行 `gxnu-guard.exe`。
+1. 在 Releases 下载 `gxnu-campus-net-helper-0.1.1-windows-x64.zip`，解压到固定目录，运行 `GXNU 校园网守护助手.exe`。
 2. 在账号页填写自己的校园网学号、运营商和密码，点击 **保存并开始守护**。
-3. 关闭主窗口后，守护进程继续在托盘运行。单击托盘图标可以重新打开界面，右键选择 **退出校园网守护** 可完全退出。需要随 Windows 启动时，在监控设置中开启 **开机自动启动到托盘**。
+3. 关闭主窗口后，守护进程继续在托盘运行。单击托盘图标可以重新打开界面，右键选择 **退出 GXNU 校园网守护助手** 可完全退出。需要随 Windows 启动时，在监控设置中开启 **开机自动启动到托盘**。
+
+从 v0.1.0 升级时，请先从托盘退出旧版，再运行新 EXE。如果原先开启了开机自启，在新程序所在目录运行 `& ".\GXNU 校园网守护助手.exe" --autostart on`，将自启路径更新到新文件。
 
 每个二进制发行包附 SHA-256 校验文件。可以在下载目录运行以下命令，对照校验文件中的值。
 
 ```powershell
-Get-FileHash .\gxnu-guard-0.1.0-windows-x64.zip -Algorithm SHA256
+Get-FileHash .\gxnu-campus-net-helper-0.1.1-windows-x64.zip -Algorithm SHA256
 ```
 
 ## 掉线时会发生什么
@@ -32,11 +34,11 @@ Get-FileHash .\gxnu-guard-0.1.0-windows-x64.zip -Algorithm SHA256
 
 | PowerShell 命令 | 用途 |
 | --- | --- |
-| `.\gxnu-guard.exe --once` | 只读检测。退出码 0 表示在线，2 表示离线，3 表示连续采样时出口发生变化。 |
-| `.\gxnu-guard.exe --minimized` | 启动后驻留托盘。 |
-| `.\gxnu-guard.exe --minimized --start` | 在后台开始或恢复监控。 |
-| `.\gxnu-guard.exe --test-toast` | 发送测试系统通知。 |
-| `.\gxnu-guard.exe --autostart status` | 查询开机自启状态。 |
+| `& ".\GXNU 校园网守护助手.exe" --once` | 只读检测。退出码 0 表示在线，2 表示离线，3 表示连续采样时出口发生变化。 |
+| `& ".\GXNU 校园网守护助手.exe" --minimized` | 启动后驻留托盘。 |
+| `& ".\GXNU 校园网守护助手.exe" --minimized --start` | 在后台开始或恢复监控。 |
+| `& ".\GXNU 校园网守护助手.exe" --test-toast` | 发送测试系统通知。 |
+| `& ".\GXNU 校园网守护助手.exe" --autostart status` | 查询开机自启状态。 |
 
 ## 数据与隐私
 
@@ -50,8 +52,9 @@ Get-FileHash .\gxnu-guard-0.1.0-windows-x64.zip -Algorithm SHA256
 rustup toolchain install stable-x86_64-pc-windows-gnu --component rustfmt --component clippy
 rustup override set stable-x86_64-pc-windows-gnu
 .\build.ps1 verify
+.\build.ps1 release
 ```
 
-脚本执行格式检查、Clippy、全量测试和 Release 构建，生成 `target\release\gxnu-guard.exe`。参与开发可参考[贡献指南](CONTRIBUTING.md)，安全问题请参阅[私下报告方式](SECURITY.md)。
+`verify` 执行格式检查、Clippy、全量测试和 Release 构建，`release` 输出发行文件 `target\release\GXNU 校园网守护助手.exe`。参与开发可参考[贡献指南](CONTRIBUTING.md)，安全问题请参阅[私下报告方式](SECURITY.md)。
 
 本项目使用 [MIT 许可证](LICENSE)。

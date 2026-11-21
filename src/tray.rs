@@ -26,7 +26,7 @@ impl TrayUi {
     pub fn new() -> Result<Self, String> {
         let icon = TrayIconBuilder::new()
             .with_icon(state_icon(MonitorState::Paused)?)
-            .with_tooltip("GXNU 校园网：启动中")
+            .with_tooltip(format!("{}：启动中", crate::APP_NAME))
             .build()
             .map_err(|err| format!("创建托盘图标失败：{err}"))?;
 
@@ -47,7 +47,7 @@ impl TrayUi {
         if let Ok(icon) = state_icon(snapshot.state) {
             let _ = self.icon.set_icon(Some(icon));
         }
-        let tooltip = format!("GXNU 校园网：{title}");
+        let tooltip = format!("{}：{title}", crate::APP_NAME);
         let _ = self.icon.set_tooltip(Some(tooltip.as_str()));
     }
 

@@ -18,9 +18,9 @@ use windows_sys::Win32::Graphics::Gdi::{
     CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, FillRect,
     GetMonitorInfoW, InvalidateRect, LineTo, MonitorFromPoint, MoveToEx, RoundRect, SelectObject,
     SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL, FW_SEMIBOLD,
-    MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_PEN, OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID,
-    SRCCOPY, TRANSPARENT,
+    DEFAULT_PITCH, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, FW_NORMAL,
+    FW_SEMIBOLD, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_PEN, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
+    PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -146,7 +146,6 @@ struct MenuState {
     hovered: Option<usize>,
     tracking_mouse: bool,
     dpi: u32,
-    header_title: String,
     header_sub: String,
     status_color: COLORREF,
     status_halo: COLORREF,
@@ -193,7 +192,6 @@ impl FluentTrayMenu {
                 hovered: None,
                 tracking_mouse: false,
                 dpi: 96,
-                header_title: "校园网守护".to_string(),
                 header_sub: "后台轻量运行中".to_string(),
                 status_color: rgb(0x22, 0xC5, 0x5E),
                 status_halo: rgb(0xDC, 0xFC, 0xE7),
@@ -383,7 +381,6 @@ fn refresh_menu_content(state: &mut MenuState, snap: Option<&MonitorSnapshot>) {
         ),
     };
 
-    state.header_title = title.to_string();
     state.status_color = dot;
     state.status_halo = halo;
     state.header_sub = match snap {
@@ -394,10 +391,12 @@ fn refresh_menu_content(state: &mut MenuState, snap: Option<&MonitorSnapshot>) {
             } else {
                 format!("{ms} ms")
             };
-            format!("网关延迟 {lat} · 轻守护运行中")
+            format!("{title} · 网关延迟 {lat}")
         }
-        Some(s) if !s.message.is_empty() => truncate_chars(&s.message, 16),
-        _ => "后台轻守护运行中".to_string(),
+        Some(s) if !s.message.is_empty() && s.message != title => {
+            format!("{title} · {}", truncate_chars(&s.message, 16))
+        }
+        _ => title.to_owned(),
     };
 
     let mut items = vec![
@@ -479,7 +478,7 @@ fn refresh_menu_content(state: &mut MenuState, snap: Option<&MonitorSnapshot>) {
     });
     items.push(MenuItemSpec {
         action: TrayAction::Exit,
-        label: "退出校园网守护",
+        label: concat!("退出 ", env!("CARGO_PKG_DESCRIPTION")),
         icon: ItemIcon::Exit,
         is_primary: false,
         is_danger: true,
@@ -496,7 +495,7 @@ fn refresh_menu_content(state: &mut MenuState, snap: Option<&MonitorSnapshot>) {
 }
 
 fn compute_layout(state: &mut MenuState, dpi: u32) -> (i32, i32) {
-    let win_w = scale(216, dpi);
+    let win_w = scale(256, dpi);
     let pad_x = scale(6, dpi);
     let pad_y = scale(6, dpi);
     let header_h = scale(48, dpi);
@@ -662,7 +661,7 @@ unsafe fn paint_menu(hwnd: HWND, state: &MenuState) {
     };
     let old_font = SelectObject(mem_dc, font_title);
     SetTextColor(mem_dc, p.text);
-    let title_w = to_wide(&state.header_title);
+    let title_w = to_wide(crate::APP_NAME);
     DrawTextW(
         mem_dc,
         title_w.as_ptr(),
@@ -685,7 +684,7 @@ unsafe fn paint_menu(hwnd: HWND, state: &MenuState) {
         sub_w.as_ptr(),
         (sub_w.len() - 1) as i32,
         &mut r_sub,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+        DT_END_ELLIPSIS | DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
     );
 
     // ── 2. 菜单项 + 细分隔线 ─────────────────────────────────────────

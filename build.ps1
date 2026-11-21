@@ -1,5 +1,6 @@
 # Windows Cargo wrapper. Examples:
 #   .\build.ps1 verify
+#   .\build.ps1 release
 #   .\build.ps1 test --locked --offline -- --list
 #   .\build.ps1 run -- --once
 $ErrorActionPreference = 'Stop'
@@ -52,6 +53,30 @@ try {
     $pathParts = @($cargoBin, $previousPath)
     if (Test-Path -LiteralPath $mingwBin) { $pathParts = @($mingwBin) + $pathParts }
     $env:PATH = $pathParts -join ';'
+
+    if ($cargoArgs[0] -eq 'release') {
+        if ($cargoArgs.Count -ne 1) { throw 'Usage: .\build.ps1 release' }
+        $previousEncoding = [Console]::OutputEncoding
+        try {
+            [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+            $binary = & cargo build --release --locked --bin gxnu-guard --message-format=json-render-diagnostics |
+                ForEach-Object {
+                    $artifact = ConvertFrom-Json $_
+                    if ($artifact.reason -eq 'compiler-artifact' -and $artifact.executable -and
+                        $artifact.target.name -eq 'gxnu-guard') { $artifact.executable }
+                }
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        } finally {
+            [Console]::OutputEncoding = $previousEncoding
+        }
+        if (-not $binary) { throw 'Cargo did not report the application executable.' }
+        $name = [Diagnostics.FileVersionInfo]::GetVersionInfo($binary).OriginalFilename
+        if (-not $name) { throw 'Missing Windows version resource. Check windres and rebuild.' }
+        $destination = Join-Path (Split-Path -Parent $binary) $name
+        Copy-Item -LiteralPath $binary -Destination $destination -Force
+        Write-Output $destination
+        exit 0
+    }
 
     if ($cargoArgs[0] -eq 'verify') {
         if ($cargoArgs.Count -ne 1) { throw 'Usage: .\build.ps1 verify' }
