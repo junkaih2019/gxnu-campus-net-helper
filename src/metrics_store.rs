@@ -388,8 +388,8 @@ pub struct OutageSummary<'a> {
 }
 
 impl<'a> OutageSummary<'a> {
-    /// 返回最主要的断联原因码（频次相同取最近一次）。
-    pub fn primary_reason(&self) -> Option<&'a str> {
+    /// 按断联频次（同频次按最近发生时间）降序返回各原因码及次数。
+    pub fn reason_counts(&self) -> Vec<(&'a str, usize)> {
         use std::collections::HashMap;
         let mut counts: HashMap<&'a str, (usize, i64)> = HashMap::new();
         for ev in &self.events {
@@ -399,10 +399,17 @@ impl<'a> OutageSummary<'a> {
             entry.0 += 1;
             entry.1 = entry.1.max(ev.start.ts);
         }
-        counts
+        let mut items: Vec<(&'a str, usize, i64)> = counts
             .into_iter()
-            .max_by_key(|(_, (count, latest_ts))| (*count, *latest_ts))
-            .map(|(reason, _)| reason)
+            .map(|(reason, (count, latest_ts))| (reason, count, latest_ts))
+            .collect();
+        items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| b.2.cmp(&a.2)));
+        items.into_iter().map(|(r, c, _)| (r, c)).collect()
+    }
+
+    /// 返回最主要的断联原因码（频次相同取最近一次）。
+    pub fn primary_reason(&self) -> Option<&'a str> {
+        self.reason_counts().into_iter().next().map(|(r, _)| r)
     }
 }
 
@@ -797,5 +804,9 @@ mod tests {
         assert_eq!(summary.events[2].duration_secs, Some(120));
 
         assert_eq!(summary.primary_reason(), Some("AUTH_EXPIRED"));
+        assert_eq!(
+            summary.reason_counts(),
+            vec![("AUTH_EXPIRED", 2), ("GATEWAY_UNREACHABLE", 1)]
+        );
     }
 }

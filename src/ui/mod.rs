@@ -875,7 +875,7 @@ impl eframe::App for GuardApp {
                             .floor();
                         let log_h = (usable_h - mid_h).max(min_log);
 
-                        // Tier 2: 左 62% 稳定性主卡 + 右 38% 紧凑双模式环形流量卡
+                        // Tier 2: 按设置切换「62:38 稳定性+流量双卡」或「通栏宽屏双栏稳定性面板」
                         charts::draw_home_visual_row(
                             ui,
                             &p,
@@ -884,6 +884,7 @@ impl eframe::App for GuardApp {
                             &self.traffic,
                             &mut self.traffic_period,
                             self.settings.monthly_quota_gb,
+                            self.ui_prefs.show_home_traffic,
                             mid_h,
                         );
                         ui.add_space(gap);

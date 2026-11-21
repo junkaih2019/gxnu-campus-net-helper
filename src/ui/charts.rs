@@ -50,8 +50,14 @@ pub fn draw_home_visual_row(
     traffic: &TrafficSummary,
     traffic_period: &mut TrafficPeriod,
     monthly_quota_gb: i64,
+    show_traffic: bool,
     target_height: f32,
 ) {
+    if !show_traffic {
+        draw_stability_wide_card(ui, p, all_points, range, target_height);
+        return;
+    }
+
     let total_w = ui.available_width();
     let gap = 10.0_f32;
     let left_w = ((total_w - gap) * 0.615).floor().max(320.0);
@@ -82,6 +88,367 @@ pub fn draw_home_visual_row(
             },
         );
     });
+}
+
+/// 关闭「本机流量」时的通栏宽屏版稳定性面板：
+/// - 左侧 ~51%：自绘在线率环形图 + 健康结论/主因分布 + 饱满 36 格通断时间轴
+/// - 右侧 ~49%：独占整卡高度的可上下滚动断联事件明细（同屏展示 4–5 条）
+pub fn draw_stability_wide_card(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    all_points: &[TelemetryPoint],
+    range: &mut TimeRange,
+    target_height: f32,
+) {
+    let now = Local::now().timestamp();
+    let points = filter_range(all_points, now, *range);
+    let stats = compute_stats(&points);
+    let outages = outages_in_range(all_points, now, *range);
+    let slots = uptime_timeline(&points, now, *range, 36);
+    let reasons = outages.reason_counts();
+
+    card_padded(ui, p, 12, |ui| {
+        let inner_h = (target_height - 24.0).max(196.0);
+        ui.set_min_height(inner_h);
+        ui.set_max_height(inner_h);
+
+        // 1. 顶部标题 + 1h / 7h / 24h 分段切换
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 26.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                section_heading(ui, Icon::Shield, p.ok, "连接稳定性与断联记录", p.text, 26.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut idx = range.index();
+                    let labels = ["1h", "7h", "24h"];
+                    if segmented_control(ui, p, "stab_wide_range_seg", &mut idx, &labels) {
+                        *range = TimeRange::from_index(idx);
+                    }
+                });
+            },
+        );
+
+        ui.add_space(10.0);
+
+        let body_h = (inner_h - 36.0).max(148.0);
+        let total_w = ui.available_width();
+        let sep_total = 25.0_f32; // 12 + 1 + 12
+        let left_w = ((total_w - sep_total) * 0.515).floor().max(260.0);
+        let right_w = (total_w - left_w - sep_total).max(220.0);
+
+        ui.horizontal_top(|ui| {
+            ui.spacing_mut().item_spacing.x = 0.0;
+
+            // ── 左侧视觉概览：在线率环形图 + 原因构成 + 36 格健康时间轴 ──
+            ui.allocate_ui_with_layout(
+                Vec2::new(left_w, body_h),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.set_min_size(Vec2::new(left_w, body_h));
+
+                    // 上半：环形图 + 结构化摘要
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(left_w, 84.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = 14.0;
+
+                            // 80×80 自绘在线率环形图
+                            let (ring_rect, ring_resp) =
+                                ui.allocate_exact_size(Vec2::splat(80.0), Sense::hover());
+                            let center = ring_rect.center();
+                            let radius = 33.0_f32;
+                            let thickness = 8.0_f32;
+                            let painter = ui.painter();
+
+                            painter.circle_stroke(
+                                center,
+                                radius,
+                                Stroke::new(thickness, p.divider),
+                            );
+                            if let Some(pct) = stats.uptime_pct {
+                                let ratio = (pct as f32 / 100.0).clamp(0.0, 1.0);
+                                let arc_color = if pct >= 98.0 {
+                                    p.ok
+                                } else if pct >= 90.0 {
+                                    p.warn
+                                } else {
+                                    p.danger
+                                };
+                                if ratio > 0.005 {
+                                    paint_ring_arc(
+                                        painter,
+                                        center,
+                                        radius,
+                                        -PI * 0.5,
+                                        -PI * 0.5 + ratio * 2.0 * PI,
+                                        Stroke::new(thickness, arc_color),
+                                    );
+                                }
+                                let rate_text = if (pct - 100.0).abs() < 0.05 {
+                                    "100%".to_string()
+                                } else {
+                                    format!("{pct:.1}%")
+                                };
+                                painter.text(
+                                    Pos2::new(center.x, center.y - 6.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    rate_text,
+                                    egui::FontId::new(14.5, crate::ui::theme::bold_family()),
+                                    p.text,
+                                );
+                                painter.text(
+                                    Pos2::new(center.x, center.y + 10.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    "在线率",
+                                    egui::FontId::proportional(9.5),
+                                    p.text_muted,
+                                );
+                            } else {
+                                painter.text(
+                                    Pos2::new(center.x, center.y - 5.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    "—",
+                                    egui::FontId::new(15.0, crate::ui::theme::bold_family()),
+                                    p.text_muted,
+                                );
+                                painter.text(
+                                    Pos2::new(center.x, center.y + 10.0),
+                                    egui::Align2::CENTER_CENTER,
+                                    "待采样",
+                                    egui::FontId::proportional(9.5),
+                                    p.text_muted,
+                                );
+                            }
+                            ring_resp.on_hover_text(format!(
+                                "统计过去 {} 内 {} 次巡检样本的公网连通占比",
+                                range.label(),
+                                stats.check_count
+                            ));
+
+                            // 右侧健康结论 + 断联原因构成（无冗余平均恢复/次数 KPI）
+                            ui.vertical(|ui| {
+                                ui.spacing_mut().item_spacing.y = 5.0;
+                                let (verdict, verdict_color) = match stats.uptime_pct {
+                                    Some(pct) if outages.events.is_empty() && pct >= 99.5 => {
+                                        ("全程保持稳定", p.ok)
+                                    }
+                                    Some(pct) if pct >= 95.0 => ("偶发波动，已自动恢复", p.text),
+                                    Some(pct) if pct >= 85.0 => ("存在明显掉线波动", p.warn),
+                                    Some(_) => ("连接持续不稳定", p.danger),
+                                    None => ("等待巡检采样", p.text_muted),
+                                };
+                                ui.allocate_ui_with_layout(
+                                    Vec2::new(ui.available_width(), 18.0),
+                                    egui::Layout::left_to_right(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(bold_text(verdict, 12.5, verdict_color));
+                                        if stats.check_count > 0 {
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    ui.label(body_text(
+                                                        format!("{} 次巡检", stats.check_count),
+                                                        10.5,
+                                                        p.text_muted,
+                                                    ));
+                                                },
+                                            );
+                                        }
+                                    },
+                                );
+
+                                let div = ui.allocate_space(Vec2::new(ui.available_width(), 1.0)).1;
+                                ui.painter().line_segment(
+                                    [div.left_center(), div.right_center()],
+                                    Stroke::new(1.0_f32, p.divider),
+                                );
+
+                                if reasons.is_empty() {
+                                    if stats.check_count > 0 {
+                                        legend_kv_row(
+                                            ui,
+                                            p,
+                                            Some(p.ok),
+                                            &format!("过去 {} 确认断联", range.label()),
+                                            "0 次",
+                                        );
+                                        let avg_str = stats
+                                            .avg_ms
+                                            .map(|ms| format!("{ms} ms"))
+                                            .unwrap_or_else(|| "正常".to_string());
+                                        legend_kv_row(ui, p, None, "平均网关响应", &avg_str);
+                                    } else {
+                                        ui.label(body_text(
+                                            "开启监控后自动记录通断状态与断联主因",
+                                            11.0,
+                                            p.text_muted,
+                                        ));
+                                    }
+                                } else {
+                                    for (reason, cnt) in reasons.iter().take(2) {
+                                        let dot = reason_severity_color(p, reason);
+                                        legend_kv_row(
+                                            ui,
+                                            p,
+                                            Some(dot),
+                                            reason_label(reason),
+                                            &format!("{cnt} 次"),
+                                        );
+                                    }
+                                    if reasons.len() == 1 {
+                                        ui.add(
+                                            egui::Label::new(body_text(
+                                                reason_hint(reasons[0].0),
+                                                10.0,
+                                                p.text_muted,
+                                            ))
+                                            .truncate(),
+                                        );
+                                    } else if reasons.len() > 2 {
+                                        let other_cnt: usize =
+                                            reasons[2..].iter().map(|(_, c)| *c).sum();
+                                        ui.label(body_text(
+                                            format!(
+                                                "其余 {} 类原因共 {} 次（详见右侧列表）",
+                                                reasons.len() - 2,
+                                                other_cnt
+                                            ),
+                                            10.0,
+                                            p.text_muted,
+                                        ));
+                                    }
+                                }
+                            });
+                        },
+                    );
+
+                    ui.add_space(12.0);
+                    let hsep = ui.allocate_space(Vec2::new(left_w, 1.0)).1;
+                    ui.painter().line_segment(
+                        [hsep.left_center(), hsep.right_center()],
+                        Stroke::new(1.0_f32, p.divider),
+                    );
+                    ui.add_space(10.0);
+
+                    // 下半：通断健康时间轴
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(left_w, 16.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            ui.label(bold_text("通断健康时间轴", 11.0, p.text_secondary));
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.label(body_text("悬停色条查看时段", 10.0, p.text_muted));
+                                },
+                            );
+                        },
+                    );
+                    ui.add_space(7.0);
+                    draw_uptime_bars_sized(ui, p, &slots, *range, 26.0);
+                },
+            );
+
+            // 中央 1px 竖向分割线
+            ui.add_space(12.0);
+            let vsep = ui.allocate_space(Vec2::new(1.0, body_h)).1;
+            ui.painter().line_segment(
+                [vsep.center_top(), vsep.center_bottom()],
+                Stroke::new(1.0_f32, p.divider),
+            );
+            ui.add_space(12.0);
+
+            // ── 右侧独立可滚动断联事件明细（享整卡高度，同屏展示 4–5 条） ──
+            ui.allocate_ui_with_layout(
+                Vec2::new(right_w, body_h),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(right_w, 16.0),
+                        egui::Layout::left_to_right(egui::Align::Center),
+                        |ui| {
+                            let count_text = if outages.events.is_empty() {
+                                format!("过去 {} 无断联事件", range.label())
+                            } else {
+                                format!(
+                                    "断联事件明细（共 {} 次，可上下滑动）",
+                                    outages.events.len()
+                                )
+                            };
+                            ui.label(bold_text(count_text, 11.0, p.text_secondary));
+                            if !outages.events.is_empty() {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(body_text("按时间倒序", 10.0, p.text_muted));
+                                    },
+                                );
+                            }
+                        },
+                    );
+                    ui.add_space(6.0);
+
+                    let list_h = (body_h - 22.0).max(80.0);
+                    if outages.events.is_empty() {
+                        egui::Frame::new()
+                            .fill(p.subtle)
+                            .stroke(Stroke::new(1.0_f32, p.divider))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(egui::Margin::symmetric(12, 10))
+                            .show(ui, |ui| {
+                                ui.set_width((right_w - 24.0).max(160.0));
+                                ui.set_min_height((list_h - 22.0).max(60.0));
+                                ui.centered_and_justified(|ui| {
+                                    ui.horizontal(|ui| {
+                                        let (r, _) = ui
+                                            .allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+                                        icons::paint(ui.painter(), r, Icon::Check, p.ok);
+                                        ui.label(body_text(
+                                            format!(
+                                                "过去 {} 校园网保持稳定，未发生确认断联",
+                                                range.label()
+                                            ),
+                                            11.5,
+                                            p.text_secondary,
+                                        ));
+                                    });
+                                });
+                            });
+                    } else {
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(right_w, list_h),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                egui::ScrollArea::vertical()
+                                    .id_salt("home_outages_wide_scroll")
+                                    .max_height(list_h)
+                                    .auto_shrink([false, false])
+                                    .show(ui, |ui| {
+                                        ui.set_width(right_w);
+                                        ui.spacing_mut().item_spacing.y = 5.0;
+                                        for ev in outages.events.iter().rev() {
+                                            draw_outage_event_row(ui, p, ev);
+                                        }
+                                    });
+                            },
+                        );
+                    }
+                },
+            );
+        });
+    });
+}
+
+fn reason_severity_color(p: &Palette, reason: &str) -> Color32 {
+    if matches!(
+        reason,
+        "LINK_DOWN" | "NO_IP" | "NO_GATEWAY" | "GATEWAY_UNREACHABLE" | "LOGIN_REJECTED"
+    ) {
+        p.danger
+    } else {
+        p.warn
+    }
 }
 
 /// 左侧 62% 主卡：在线率 + 主因摘要 + 36 格通断健康时间轴 + 可上下滚动断联事件列表。
@@ -242,8 +609,17 @@ pub fn draw_stability_card(
 }
 
 fn draw_uptime_bars(ui: &mut egui::Ui, p: &Palette, slots: &[TimelineSlot], range: TimeRange) {
+    draw_uptime_bars_sized(ui, p, slots, range, 22.0);
+}
+
+fn draw_uptime_bars_sized(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    slots: &[TimelineSlot],
+    range: TimeRange,
+    bar_h: f32,
+) {
     let total_w = ui.available_width();
-    let bar_h = 22.0_f32;
     let gap = 2.5_f32;
     let n = slots.len().max(1);
     let slot_w = ((total_w - gap * (n as f32 - 1.0)) / n as f32).max(2.0);
