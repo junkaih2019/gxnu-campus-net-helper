@@ -768,12 +768,29 @@ impl GuardApp {
                     Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
                     egui::Color32::WHITE,
                 );
-                ui.label(bold_text(crate::APP_NAME, 12.5, p.text));
-                ui.label(body_text(
+                let title_g = ui.painter().layout_no_wrap(
+                    crate::APP_NAME.to_string(),
+                    egui::FontId::new(12.5, theme::bold_family()),
+                    p.text,
+                );
+                let ver_g = ui.painter().layout_no_wrap(
                     format!("v{}", env!("CARGO_PKG_VERSION")),
-                    10.5,
+                    egui::FontId::proportional(10.5),
                     p.text_muted,
-                ));
+                );
+                let gap = 6.0_f32;
+                let total_w = title_g.size().x + gap + ver_g.size().x;
+                let (text_rect, _) =
+                    ui.allocate_exact_size(Vec2::new(total_w, TITLEBAR_HEIGHT), Sense::hover());
+                let cy = text_rect.center().y;
+                let title_y = cy - title_g.size().y * 0.5;
+                // 同族微软雅黑不同字号按基线对齐（约 79% 行高处为基线）
+                let ver_y = title_y + (title_g.size().y - ver_g.size().y) * 0.79;
+                let ver_x = text_rect.left() + title_g.size().x + gap;
+                ui.painter()
+                    .galley(Pos2::new(text_rect.left(), title_y), title_g, p.text);
+                ui.painter()
+                    .galley(Pos2::new(ver_x, ver_y), ver_g, p.text_muted);
             }
 
             // 右侧窗口控制区：设置入口 + 主题 + 最小化 + 关闭
