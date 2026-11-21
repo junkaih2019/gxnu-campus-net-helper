@@ -271,10 +271,96 @@ impl TrafficSummary {
     }
 }
 
+/// 单个校园网账号配置（支持自定义备注名与独立月流量上限）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AccountProfile {
+    /// 稳定唯一标识（如 `default` 或 `acc-a1b2c3d4`，用作凭据目标后缀与活跃索引）。
+    pub id: String,
+    /// 用户自定义备注（如「宿舍联通」「实验室电信」），界面优先显示备注。
+    pub remark: String,
+    pub student_id: String,
+    /// 运营商编码：`"0"` 校园用户 / `"1"` 电信 / `"2"` 联通 / `"3"` 移动。
+    pub carrier: String,
+    /// 可选月流量提醒上限（GB）；`0` 表示不限制（默认，适合运营商免计费出口）。
+    pub monthly_quota_gb: i64,
+}
+
+impl Default for AccountProfile {
+    fn default() -> Self {
+        Self {
+            id: "default".to_string(),
+            remark: String::new(),
+            student_id: String::new(),
+            carrier: "2".to_string(),
+            monthly_quota_gb: 0,
+        }
+    }
+}
+
+impl AccountProfile {
+    pub fn normalized(&self) -> Self {
+        let carrier = normalize_carrier(&self.carrier);
+        Self {
+            id: self.id.trim().to_string(),
+            remark: self.remark.trim().to_string(),
+            student_id: self.student_id.trim().to_string(),
+            carrier,
+            monthly_quota_gb: self.monthly_quota_gb.clamp(0, 2000),
+        }
+    }
+
+    /// 脱敏学号（保留前 4 位，后接 `***`）。
+    pub fn masked_student_id(&self) -> String {
+        mask_student_id(&self.student_id)
+    }
+
+    /// 界面优先展示备注名；备注为空时回退为脱敏学号。
+    pub fn display_name(&self) -> String {
+        let remark = self.remark.trim();
+        if !remark.is_empty() {
+            return remark.to_string();
+        }
+        let sid = self.student_id.trim();
+        if !sid.is_empty() {
+            return mask_student_id(sid);
+        }
+        "未命名账号".to_string()
+    }
+
+    /// 按账号隔离的 Windows 凭据管理器目标名。
+    pub fn credential_target(&self) -> String {
+        crate::credentials::target_for_account(&self.id)
+    }
+}
+
+pub fn mask_student_id(id: &str) -> String {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return "未填学号".to_string();
+    }
+    if trimmed.chars().count() <= 4 {
+        trimmed.to_string()
+    } else {
+        let head: String = trimmed.chars().take(4).collect();
+        format!("{head}***")
+    }
+}
+
+fn normalize_carrier(raw: &str) -> String {
+    if matches!(raw, "0" | "1" | "2" | "3") {
+        raw.to_string()
+    } else {
+        "2".to_string()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
+    /// 活跃账号的学号镜像字段（向后兼容旧版配置与只读访问）。
     pub student_id: String,
+    /// 活跃账号的运营商镜像字段。
     pub carrier: String,
     pub check_interval: i64,
     pub heartbeat_interval: i64,
@@ -285,8 +371,14 @@ pub struct Settings {
     pub notify_toast: bool,
     pub notify_wechat: bool,
     pub notify_quiet_minutes: i64,
-    /// 可选月流量提醒上限（GB）；`0` 表示不限制（默认，适合运营商免计费出口）。
+    /// 活跃账号的可选月流量提醒上限（GB）；`0` 表示不限制。
     pub monthly_quota_gb: i64,
+    /// 多账号配置列表（为空且旧版 `student_id` 非空时自动平滑迁移）。
+    #[serde(default)]
+    pub accounts: Vec<AccountProfile>,
+    /// 当前活跃账号的 `AccountProfile::id`。
+    #[serde(default)]
+    pub active_account_id: String,
 }
 
 impl Default for Settings {
@@ -304,20 +396,65 @@ impl Default for Settings {
             notify_wechat: false,
             notify_quiet_minutes: 3,
             monthly_quota_gb: 0,
+            accounts: Vec::new(),
+            active_account_id: String::new(),
         }
     }
 }
 
 impl Settings {
-    /// 将配置值限制在支持的范围内。
+    /// 将配置值限制在支持的范围内，自动完成旧版单账号迁移并同步活跃账号镜像字段。
     pub fn normalized(&self) -> Self {
-        let carrier = if matches!(self.carrier.as_str(), "0" | "1" | "2" | "3") {
-            self.carrier.clone()
+        let legacy_sid = self.student_id.trim().to_string();
+        let legacy_carrier = normalize_carrier(&self.carrier);
+        let legacy_quota = self.monthly_quota_gb.clamp(0, 2000);
+
+        let mut accounts: Vec<AccountProfile> = Vec::new();
+        let mut seen_ids = std::collections::HashSet::new();
+        if self.accounts.is_empty() {
+            if !legacy_sid.is_empty() {
+                accounts.push(AccountProfile {
+                    id: "default".to_string(),
+                    remark: String::new(),
+                    student_id: legacy_sid.clone(),
+                    carrier: legacy_carrier.clone(),
+                    monthly_quota_gb: legacy_quota,
+                });
+            }
         } else {
-            "2".to_string()
+            for (idx, raw) in self.accounts.iter().enumerate() {
+                let mut p = raw.normalized();
+                if p.id.is_empty() || seen_ids.contains(&p.id) {
+                    let mut n = idx + 1;
+                    loop {
+                        let candidate = format!("acc-{n}");
+                        if !seen_ids.contains(&candidate) {
+                            p.id = candidate;
+                            break;
+                        }
+                        n += 1;
+                    }
+                }
+                seen_ids.insert(p.id.clone());
+                accounts.push(p);
+            }
+        }
+
+        let active_id = self.active_account_id.trim().to_string();
+        let active_account_id = if accounts.iter().any(|a| a.id == active_id) {
+            active_id
+        } else {
+            accounts.first().map(|a| a.id.clone()).unwrap_or_default()
         };
+
+        let (student_id, carrier, monthly_quota_gb) = accounts
+            .iter()
+            .find(|a| a.id == active_account_id)
+            .map(|a| (a.student_id.clone(), a.carrier.clone(), a.monthly_quota_gb))
+            .unwrap_or((legacy_sid, legacy_carrier, legacy_quota));
+
         Self {
-            student_id: self.student_id.trim().to_string(),
+            student_id,
             carrier,
             check_interval: self.check_interval.clamp(10, 3600),
             heartbeat_interval: self.heartbeat_interval.clamp(60, 86400),
@@ -328,8 +465,77 @@ impl Settings {
             notify_toast: self.notify_toast,
             notify_wechat: self.notify_wechat,
             notify_quiet_minutes: self.notify_quiet_minutes.clamp(1, 60),
-            monthly_quota_gb: self.monthly_quota_gb.clamp(0, 2000),
+            monthly_quota_gb,
+            accounts,
+            active_account_id,
         }
+    }
+
+    pub fn active_account(&self) -> Option<&AccountProfile> {
+        self.accounts
+            .iter()
+            .find(|a| a.id == self.active_account_id)
+            .or_else(|| self.accounts.first())
+    }
+
+    pub fn find_account(&self, id: &str) -> Option<&AccountProfile> {
+        self.accounts.iter().find(|a| a.id == id)
+    }
+
+    /// 返回当前活跃账号的展示名（优先备注，次选脱敏学号，未配置时返回「未配置账号」）。
+    pub fn active_display_name(&self) -> String {
+        if let Some(acc) = self.active_account() {
+            return acc.display_name();
+        }
+        if !self.student_id.trim().is_empty() {
+            return mask_student_id(&self.student_id);
+        }
+        "未配置账号".to_string()
+    }
+
+    /// 切换当前活跃账号并同步镜像字段；账号不存在时返回错误。
+    pub fn switch_active_account(&mut self, account_id: &str) -> Result<AccountProfile, String> {
+        let Some(target) = self.accounts.iter().find(|a| a.id == account_id).cloned() else {
+            return Err("未找到要切换的目标账号".to_string());
+        };
+        self.active_account_id = target.id.clone();
+        self.student_id = target.student_id.clone();
+        self.carrier = target.carrier.clone();
+        self.monthly_quota_gb = target.monthly_quota_gb;
+        Ok(target)
+    }
+
+    /// 新增或更新账号配置，可选同时设为当前活跃账号。
+    pub fn upsert_account(&mut self, profile: AccountProfile, make_active: bool) {
+        let profile = profile.normalized();
+        if let Some(existing) = self.accounts.iter_mut().find(|a| a.id == profile.id) {
+            *existing = profile.clone();
+        } else {
+            self.accounts.push(profile.clone());
+        }
+        if make_active || self.active_account_id.is_empty() {
+            self.active_account_id = profile.id;
+        }
+        *self = self.normalized();
+    }
+
+    /// 删除指定账号；若删掉了活跃账号则自动切换到剩余第一个账号。
+    pub fn remove_account(&mut self, account_id: &str) -> Option<AccountProfile> {
+        let pos = self.accounts.iter().position(|a| a.id == account_id)?;
+        let removed = self.accounts.remove(pos);
+        if self.active_account_id == account_id {
+            self.active_account_id = self
+                .accounts
+                .first()
+                .map(|a| a.id.clone())
+                .unwrap_or_default();
+        }
+        if self.accounts.is_empty() {
+            self.student_id.clear();
+            self.monthly_quota_gb = 0;
+        }
+        *self = self.normalized();
+        Some(removed)
     }
 }
 
@@ -399,5 +605,67 @@ mod tests {
         let dumped = serde_json::to_string(&parsed).expect("config must serialize");
         assert!(dumped.contains("\"student_id\":\"demo-student\""));
         assert!(!dumped.contains("unknown_future_key"));
+    }
+
+    #[test]
+    fn legacy_single_account_config_migrates_into_accounts_list() {
+        let legacy_json = r#"{
+            "student_id": "20240001",
+            "carrier": "1",
+            "monthly_quota_gb": 50
+        }"#;
+        let parsed = serde_json::from_str::<Settings>(legacy_json)
+            .unwrap()
+            .normalized();
+        assert_eq!(parsed.accounts.len(), 1);
+        assert_eq!(parsed.active_account_id, "default");
+        assert_eq!(parsed.accounts[0].student_id, "20240001");
+        assert_eq!(parsed.accounts[0].carrier, "1");
+        assert_eq!(parsed.accounts[0].monthly_quota_gb, 50);
+        assert_eq!(parsed.active_display_name(), "2024***");
+    }
+
+    #[test]
+    fn multi_account_switch_upsert_remove_and_display_name_priority() {
+        let mut settings = Settings::default();
+        settings.upsert_account(
+            AccountProfile {
+                id: "acc-dorm".into(),
+                remark: "宿舍联通".into(),
+                student_id: "20240001".into(),
+                carrier: "2".into(),
+                monthly_quota_gb: 0,
+            },
+            true,
+        );
+        settings.upsert_account(
+            AccountProfile {
+                id: "acc-lab".into(),
+                remark: String::new(),
+                student_id: "20249999".into(),
+                carrier: "1".into(),
+                monthly_quota_gb: 80,
+            },
+            false,
+        );
+
+        assert_eq!(settings.active_account_id, "acc-dorm");
+        assert_eq!(settings.active_display_name(), "宿舍联通");
+        assert_eq!(settings.student_id, "20240001");
+        assert_eq!(settings.carrier, "2");
+
+        settings.switch_active_account("acc-lab").unwrap();
+        assert_eq!(settings.active_account_id, "acc-lab");
+        assert_eq!(settings.student_id, "20249999");
+        assert_eq!(settings.carrier, "1");
+        assert_eq!(settings.monthly_quota_gb, 80);
+        assert_eq!(settings.active_display_name(), "2024***");
+
+        assert!(settings.switch_active_account("missing").is_err());
+
+        settings.remove_account("acc-lab").unwrap();
+        assert_eq!(settings.accounts.len(), 1);
+        assert_eq!(settings.active_account_id, "acc-dorm");
+        assert_eq!(settings.student_id, "20240001");
     }
 }

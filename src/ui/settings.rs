@@ -105,6 +105,7 @@ impl SettingsForm {
             notify_wechat: self.notify_wechat,
             notify_quiet_minutes: self.notify_quiet_minutes,
             monthly_quota_gb: self.monthly_quota_gb,
+            ..Default::default()
         }
         .normalized()
     }

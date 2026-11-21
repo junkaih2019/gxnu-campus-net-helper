@@ -7,6 +7,76 @@ use windows_sys::Win32::Security::Credentials::{
     CRED_TYPE_GENERIC,
 };
 
+/// 旧版单账号凭据目标（读取时自动兼容平滑迁移）。
+pub const LEGACY_CREDENTIAL_TARGET: &str = "GXNUCampusLogin/v4";
+/// 多账号按 ID 隔离的凭据目标前缀。
+pub const ACCOUNT_CREDENTIAL_PREFIX: &str = "GXNUCampusLogin/v5/";
+
+/// 生成多账号凭据管理器目标名：`GXNUCampusLogin/v5/<account_id>`。
+pub fn target_for_account(account_id: &str) -> String {
+    let clean = account_id.trim();
+    if clean.is_empty() {
+        LEGACY_CREDENTIAL_TARGET.to_string()
+    } else {
+        format!("{ACCOUNT_CREDENTIAL_PREFIX}{clean}")
+    }
+}
+
+/// 生成简短且唯一的随机账号 ID（如 `acc-a3f81c2e`）。
+pub fn generate_account_id() -> String {
+    let mut bytes = [0u8; 4];
+    if getrandom::getrandom(&mut bytes).is_err() {
+        let nanos = chrono::Utc::now().timestamp_nanos_opt().unwrap_or(1) as u32;
+        bytes = nanos.to_le_bytes();
+    }
+    format!(
+        "acc-{:02x}{:02x}{:02x}{:02x}",
+        bytes[0], bytes[1], bytes[2], bytes[3]
+    )
+}
+
+/// 按账号读取 Windows 凭据：优先查 `GXNUCampusLogin/v5/<id>`，
+/// 若不存在则自动回退读取旧版 `GXNUCampusLogin/v4`（仅在学号匹配时采用，绝不串号）。
+pub fn load_for_account(
+    account_id: &str,
+    student_id: &str,
+) -> Result<Option<StoredCredential>, String> {
+    let target = target_for_account(account_id);
+    if target != LEGACY_CREDENTIAL_TARGET {
+        if let Some(cred) = load(&target)? {
+            if cred.matches_account(student_id) {
+                return Ok(Some(cred));
+            }
+        }
+    }
+    if let Some(legacy) = load(LEGACY_CREDENTIAL_TARGET)? {
+        if legacy.matches_account(student_id) {
+            return Ok(Some(legacy));
+        }
+    }
+    Ok(None)
+}
+
+pub fn save_for_account(account_id: &str, student_id: &str, password: &str) -> Result<(), String> {
+    save(&target_for_account(account_id), student_id, password)
+}
+
+pub fn delete_for_account(account_id: &str) -> Result<(), String> {
+    let target = target_for_account(account_id);
+    if target != LEGACY_CREDENTIAL_TARGET {
+        delete(&target)?;
+    }
+    Ok(())
+}
+
+pub fn has_credential_for(account_id: &str, student_id: &str) -> bool {
+    !student_id.trim().is_empty()
+        && load_for_account(account_id, student_id)
+            .ok()
+            .flatten()
+            .is_some()
+}
+
 /// Win32 的 `CRED_MAX_CREDENTIAL_BLOB_SIZE`（固定 5 × 512 字节）。
 const CRED_MAX_CREDENTIAL_BLOB_SIZE: usize = 5 * 512;
 // This marker identifies credentials encoded as UTF-16LE.
@@ -169,5 +239,13 @@ mod tests {
         let blob = encode_credential_blob("中山");
         assert!(std::str::from_utf8(&blob).is_ok());
         assert_eq!(decode_credential_blob(&blob, true).unwrap(), "中山");
+    }
+
+    #[test]
+    fn account_targets_and_ids_are_isolated_and_well_formed() {
+        assert_eq!(target_for_account("default"), "GXNUCampusLogin/v5/default");
+        assert_eq!(target_for_account(""), LEGACY_CREDENTIAL_TARGET);
+        let id = generate_account_id();
+        assert!(id.starts_with("acc-") && id.len() == 12);
     }
 }

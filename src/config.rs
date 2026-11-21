@@ -57,6 +57,63 @@ impl SettingsStore {
         Ok(file)
     }
 
+    /// 原子保存完整 `config.json`（不修改凭据管理器）。
+    pub fn save_settings(&self, settings: &Settings) -> Result<(), String> {
+        let file = self
+            .stage(settings)
+            .map_err(|err| format!("准备配置失败：{err}"))?;
+        file.persist(&self.path)
+            .map_err(|err| format!("提交配置失败：{}", err.error))?;
+        Ok(())
+    }
+
+    /// 原子保存指定账号配置及可选密码（写盘失败时自动回滚凭据，绝不留下半套状态）。
+    pub fn save_profile_credential(
+        &self,
+        settings: &Settings,
+        account_id: &str,
+        previous_student_id: &str,
+        password: &str,
+        stored: Option<&StoredCredential>,
+        mut write_credential: impl FnMut(Option<&StoredCredential>) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        let normalized = settings.normalized();
+        let profile = normalized
+            .find_account(account_id)
+            .ok_or_else(|| "找不到要保存的目标账号".to_string())?;
+        let account = profile.student_id.trim();
+        if password.is_empty() {
+            let matches =
+                stored.is_some_and(|cred| cred.username == account && !cred.password.is_empty());
+            if !matches && (account != previous_student_id || stored.is_some()) {
+                return Err("更换学号时请同时输入该账号的密码".into());
+            }
+        } else if account.is_empty() {
+            return Err("保存密码前请输入学号".into());
+        }
+
+        let file = self
+            .stage(&normalized)
+            .map_err(|err| format!("准备配置失败：{err}"))?;
+        if !password.is_empty() {
+            let new = StoredCredential {
+                username: account.to_owned(),
+                password: password.to_owned(),
+            };
+            write_credential(Some(&new))?;
+        }
+        if let Err(err) = file.persist(&self.path) {
+            if !password.is_empty() {
+                write_credential(stored).map_err(|rollback| {
+                    format!("提交配置失败，恢复原凭据也失败，请重新保存账号和密码：{rollback}")
+                })?;
+            }
+            return Err(format!("提交配置失败：{}", err.error));
+        }
+        Ok(!password.is_empty()
+            && !stored.is_some_and(|cred| cred.username == account && cred.password == password))
+    }
+
     pub fn save_account(
         &self,
         settings: &Settings,
@@ -174,5 +231,45 @@ mod tests {
             )
             .unwrap();
         assert!(saved.unwrap().matches_account(&store.load().student_id));
+    }
+
+    #[test]
+    fn multi_account_save_rolls_back_credential_on_persist_error() {
+        use crate::models::AccountProfile;
+        let root = tempfile::tempdir().unwrap();
+        let blocked = SettingsStore {
+            app_dir: root.path().into(),
+            path: root.path().to_owned(), // 目录路径触发 persist 失败
+        };
+        let mut settings = Settings::default();
+        settings.upsert_account(
+            AccountProfile {
+                id: "acc-lab".into(),
+                remark: "实验室".into(),
+                student_id: "20249999".into(),
+                carrier: "1".into(),
+                monthly_quota_gb: 0,
+            },
+            true,
+        );
+        let old = Some(StoredCredential {
+            username: "20240001".into(),
+            password: "old-pass".into(),
+        });
+        let mut slot = old.clone();
+        let err = blocked.save_profile_credential(
+            &settings,
+            "acc-lab",
+            "20240001",
+            "new-pass",
+            old.as_ref(),
+            |val| {
+                slot = val.cloned();
+                Ok(())
+            },
+        );
+        assert!(err.is_err());
+        assert_eq!(slot.as_ref().unwrap().username, "20240001");
+        assert_eq!(slot.as_ref().unwrap().password, "old-pass");
     }
 }
