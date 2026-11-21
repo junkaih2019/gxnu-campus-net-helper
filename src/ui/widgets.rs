@@ -709,48 +709,93 @@ pub fn save_button(ui: &mut egui::Ui, p: &Palette, dirty: bool) -> egui::Respons
     }
 }
 
-/// 可拖拽纵向分隔条（调整左右宽度），返回水平拖拽增量 dx。
-pub fn vertical_splitter(ui: &mut egui::Ui, p: &Palette, height: f32) -> f32 {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(8.0, height), Sense::drag());
+/// 可拖拽纵向分隔条（调整左右宽度），返回 `(水平拖拽增量 dx, 是否双击恢复默认)`。
+pub fn vertical_splitter(ui: &mut egui::Ui, p: &Palette, height: f32) -> (f32, bool) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(10.0, height), Sense::click_and_drag());
     let resp = resp.on_hover_cursor(CursorIcon::ResizeHorizontal);
     let active = resp.hovered() || resp.dragged();
     let grip_color = if active {
         p.accent
     } else {
-        with_alpha(p.border_strong, 170)
+        with_alpha(p.border_strong, 150)
     };
     let grip = Rect::from_center_size(
         rect.center(),
-        Vec2::new(if active { 3.0 } else { 2.0 }, 32.0),
+        Vec2::new(
+            if active { 3.0 } else { 2.0 },
+            if active { 42.0 } else { 30.0 },
+        ),
     );
     ui.painter()
         .rect_filled(grip, CornerRadius::same(2), grip_color);
-    if resp.dragged() {
+    let dx = if resp.dragged() {
         resp.drag_delta().x
     } else {
         0.0
-    }
+    };
+    let dbl = resp.double_clicked();
+    resp.on_hover_text("左右拖拽调整宽度比例 · 双击恢复默认");
+    (dx, dbl)
 }
 
-/// 可拖拽横向分隔条（调整图表与日志上下高度），返回纵向拖拽增量 dy。
-pub fn horizontal_splitter(ui: &mut egui::Ui, p: &Palette, width: f32) -> f32 {
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 8.0), Sense::drag());
+/// 卡片内部带细竖线的可拖拽纵向分隔条（用于宽屏稳定性面板左右栏拖拽）。
+pub fn inner_vertical_splitter(ui: &mut egui::Ui, p: &Palette, height: f32) -> (f32, bool) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(18.0, height), Sense::click_and_drag());
+    let resp = resp.on_hover_cursor(CursorIcon::ResizeHorizontal);
+    let active = resp.hovered() || resp.dragged();
+    ui.painter().line_segment(
+        [rect.center_top(), rect.center_bottom()],
+        Stroke::new(1.0_f32, if active { p.accent_border } else { p.divider }),
+    );
+    let grip_color = if active {
+        p.accent
+    } else {
+        with_alpha(p.border_strong, 130)
+    };
+    let grip = Rect::from_center_size(
+        rect.center(),
+        Vec2::new(
+            if active { 3.0 } else { 2.0 },
+            if active { 40.0 } else { 24.0 },
+        ),
+    );
+    ui.painter()
+        .rect_filled(grip, CornerRadius::same(2), grip_color);
+    let dx = if resp.dragged() {
+        resp.drag_delta().x
+    } else {
+        0.0
+    };
+    let dbl = resp.double_clicked();
+    resp.on_hover_text("左右拖拽调整双栏比例 · 双击恢复默认");
+    (dx, dbl)
+}
+
+/// 可拖拽横向分隔条（调整图表与日志上下高度），返回 `(纵向拖拽增量 dy, 是否双击恢复默认)`。
+pub fn horizontal_splitter(ui: &mut egui::Ui, p: &Palette, width: f32) -> (f32, bool) {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, 10.0), Sense::click_and_drag());
     let resp = resp.on_hover_cursor(CursorIcon::ResizeVertical);
     let active = resp.hovered() || resp.dragged();
     let grip_color = if active {
         p.accent
     } else {
-        with_alpha(p.border_strong, 170)
+        with_alpha(p.border_strong, 150)
     };
     let grip = Rect::from_center_size(
         rect.center(),
-        Vec2::new(36.0, if active { 3.0 } else { 2.0 }),
+        Vec2::new(
+            if active { 54.0 } else { 38.0 },
+            if active { 3.0 } else { 2.0 },
+        ),
     );
     ui.painter()
         .rect_filled(grip, CornerRadius::same(2), grip_color);
-    if resp.dragged() {
+    let dy = if resp.dragged() {
         resp.drag_delta().y
     } else {
         0.0
-    }
+    };
+    let dbl = resp.double_clicked();
+    resp.on_hover_text("上下拖拽调整面板与日志高度 · 双击恢复默认");
+    (dy, dbl)
 }

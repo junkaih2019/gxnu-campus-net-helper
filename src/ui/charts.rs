@@ -15,8 +15,12 @@ use crate::models::{DailyTraffic, TrafficSummary};
 use crate::ui::icons::{self, Icon};
 use crate::ui::theme::{
     body_text, bold_text, reason_hint, reason_label, with_alpha, Palette, ThemeMode,
+    DEFAULT_TRAFFIC_SPLIT, DEFAULT_WIDE_SPLIT,
 };
-use crate::ui::widgets::{badge, card_padded, section_heading, segmented_control};
+use crate::ui::widgets::{
+    badge, card_padded, inner_vertical_splitter, section_heading, segmented_control,
+    vertical_splitter,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TrafficPeriod {
@@ -51,17 +55,23 @@ pub fn draw_home_visual_row(
     traffic_period: &mut TrafficPeriod,
     monthly_quota_gb: i64,
     show_traffic: bool,
+    split_ratio: &mut f32,
     target_height: f32,
-) {
+) -> bool {
     if !show_traffic {
-        draw_stability_wide_card(ui, p, all_points, range, target_height);
-        return;
+        return draw_stability_wide_card(ui, p, all_points, range, split_ratio, target_height);
     }
 
     let total_w = ui.available_width();
-    let gap = 10.0_f32;
-    let left_w = ((total_w - gap) * 0.615).floor().max(320.0);
-    let right_w = (total_w - gap - left_w).max(220.0);
+    let splitter_w = 10.0_f32;
+    let usable_w = (total_w - splitter_w).max(460.0);
+    let min_left = 300.0_f32.min(usable_w * 0.52);
+    let min_right = 210.0_f32.min(usable_w * 0.38);
+    let left_w = (usable_w * (*split_ratio).clamp(0.48, 0.74))
+        .clamp(min_left, (usable_w - min_right).max(min_left))
+        .floor();
+    let right_w = (usable_w - left_w).max(min_right);
+    let mut split_changed = false;
 
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
@@ -72,7 +82,14 @@ pub fn draw_home_visual_row(
                 draw_stability_card(ui, p, all_points, range, target_height);
             },
         );
-        ui.add_space(gap);
+        let (dx, dbl) = vertical_splitter(ui, p, target_height);
+        if dbl {
+            *split_ratio = DEFAULT_TRAFFIC_SPLIT;
+            split_changed = true;
+        } else if dx.abs() > 0.01 && usable_w > 1.0 {
+            *split_ratio = ((left_w + dx) / usable_w).clamp(0.48, 0.74);
+            split_changed = true;
+        }
         ui.allocate_ui_with_layout(
             Vec2::new(right_w, target_height),
             egui::Layout::top_down(egui::Align::LEFT),
@@ -88,27 +105,31 @@ pub fn draw_home_visual_row(
             },
         );
     });
+    split_changed
 }
 
 /// 关闭「本机流量」时的通栏宽屏版稳定性面板：
-/// - 左侧 ~51%：自绘在线率环形图 + 健康结论/主因分布 + 饱满 36 格通断时间轴
-/// - 右侧 ~49%：独占整卡高度的可上下滚动断联事件明细（同屏展示 4–5 条）
+/// - 左侧：自绘在线率环形图 + 健康结论/主因分布 + 饱满通断时间轴
+/// - 中央：可左右拖拽调整双栏比例（双击恢复默认）
+/// - 右侧：独占整卡高度的可上下滚动断联事件明细
 pub fn draw_stability_wide_card(
     ui: &mut egui::Ui,
     p: &Palette,
     all_points: &[TelemetryPoint],
     range: &mut TimeRange,
+    split_ratio: &mut f32,
     target_height: f32,
-) {
+) -> bool {
     let now = Local::now().timestamp();
     let points = filter_range(all_points, now, *range);
     let stats = compute_stats(&points);
     let outages = outages_in_range(all_points, now, *range);
     let slots = uptime_timeline(&points, now, *range, 36);
     let reasons = outages.reason_counts();
+    let mut split_changed = false;
 
     card_padded(ui, p, 12, |ui| {
-        let inner_h = (target_height - 24.0).max(196.0);
+        let inner_h = (target_height - 24.0).max(170.0);
         ui.set_min_height(inner_h);
         ui.set_max_height(inner_h);
 
@@ -128,18 +149,23 @@ pub fn draw_stability_wide_card(
             },
         );
 
-        ui.add_space(10.0);
+        ui.add_space(8.0);
 
-        let body_h = (inner_h - 36.0).max(148.0);
+        let body_h = (inner_h - 34.0).max(134.0);
         let total_w = ui.available_width();
-        let sep_total = 25.0_f32; // 12 + 1 + 12
-        let left_w = ((total_w - sep_total) * 0.515).floor().max(260.0);
-        let right_w = (total_w - left_w - sep_total).max(220.0);
+        let splitter_w = 18.0_f32;
+        let usable_w = (total_w - splitter_w).max(420.0);
+        let min_left = 240.0_f32.min(usable_w * 0.45);
+        let min_right = 210.0_f32.min(usable_w * 0.42);
+        let left_w = (usable_w * (*split_ratio).clamp(0.38, 0.68))
+            .clamp(min_left, (usable_w - min_right).max(min_left))
+            .floor();
+        let right_w = (usable_w - left_w).max(min_right);
 
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = 0.0;
 
-            // ── 左侧视觉概览：在线率环形图 + 原因构成 + 36 格健康时间轴 ──
+            // ── 左侧视觉概览：在线率环形图 + 原因构成 + 健康时间轴 ──
             ui.allocate_ui_with_layout(
                 Vec2::new(left_w, body_h),
                 egui::Layout::top_down(egui::Align::LEFT),
@@ -148,17 +174,17 @@ pub fn draw_stability_wide_card(
 
                     // 上半：环形图 + 结构化摘要
                     ui.allocate_ui_with_layout(
-                        Vec2::new(left_w, 84.0),
+                        Vec2::new(left_w, 78.0),
                         egui::Layout::left_to_right(egui::Align::Center),
                         |ui| {
-                            ui.spacing_mut().item_spacing.x = 14.0;
+                            ui.spacing_mut().item_spacing.x = 12.0;
 
-                            // 80×80 自绘在线率环形图
+                            // 74×74 自绘在线率环形图
                             let (ring_rect, ring_resp) =
-                                ui.allocate_exact_size(Vec2::splat(80.0), Sense::hover());
+                                ui.allocate_exact_size(Vec2::splat(74.0), Sense::hover());
                             let center = ring_rect.center();
-                            let radius = 33.0_f32;
-                            let thickness = 8.0_f32;
+                            let radius = 30.0_f32;
+                            let thickness = 7.5_f32;
                             let painter = ui.painter();
 
                             painter.circle_stroke(
@@ -323,13 +349,13 @@ pub fn draw_stability_wide_card(
                         },
                     );
 
-                    ui.add_space(12.0);
+                    ui.add_space(8.0);
                     let hsep = ui.allocate_space(Vec2::new(left_w, 1.0)).1;
                     ui.painter().line_segment(
                         [hsep.left_center(), hsep.right_center()],
                         Stroke::new(1.0_f32, p.divider),
                     );
-                    ui.add_space(10.0);
+                    ui.add_space(7.0);
 
                     // 下半：通断健康时间轴
                     ui.allocate_ui_with_layout(
@@ -345,19 +371,20 @@ pub fn draw_stability_wide_card(
                             );
                         },
                     );
-                    ui.add_space(7.0);
-                    draw_uptime_bars_sized(ui, p, &slots, *range, 26.0);
+                    ui.add_space(5.0);
+                    draw_uptime_bars_sized(ui, p, &slots, *range, 22.0);
                 },
             );
 
-            // 中央 1px 竖向分割线
-            ui.add_space(12.0);
-            let vsep = ui.allocate_space(Vec2::new(1.0, body_h)).1;
-            ui.painter().line_segment(
-                [vsep.center_top(), vsep.center_bottom()],
-                Stroke::new(1.0_f32, p.divider),
-            );
-            ui.add_space(12.0);
+            // 中央可拖拽竖向分隔条
+            let (dx, dbl) = inner_vertical_splitter(ui, p, body_h);
+            if dbl {
+                *split_ratio = DEFAULT_WIDE_SPLIT;
+                split_changed = true;
+            } else if dx.abs() > 0.01 && usable_w > 1.0 {
+                *split_ratio = ((left_w + dx) / usable_w).clamp(0.38, 0.68);
+                split_changed = true;
+            }
 
             // ── 右侧独立可滚动断联事件明细（享整卡高度，同屏展示 4–5 条） ──
             ui.allocate_ui_with_layout(
@@ -387,9 +414,9 @@ pub fn draw_stability_wide_card(
                             }
                         },
                     );
-                    ui.add_space(6.0);
+                    ui.add_space(5.0);
 
-                    let list_h = (body_h - 22.0).max(80.0);
+                    let list_h = (body_h - 21.0).max(76.0);
                     if outages.events.is_empty() {
                         egui::Frame::new()
                             .fill(p.subtle)
@@ -438,6 +465,7 @@ pub fn draw_stability_wide_card(
             );
         });
     });
+    split_changed
 }
 
 fn reason_severity_color(p: &Palette, reason: &str) -> Color32 {

@@ -42,6 +42,8 @@ pub const MIN_UI_ZOOM: f32 = 0.75;
 pub const MAX_UI_ZOOM: f32 = 1.25;
 pub const DEFAULT_WINDOW_SIZE: [f32; 2] = [840.0, 580.0];
 pub const MIN_WINDOW_SIZE: [f32; 2] = [560.0, 400.0];
+pub const DEFAULT_TRAFFIC_SPLIT: f32 = 0.615;
+pub const DEFAULT_WIDE_SPLIT: f32 = 0.515;
 
 fn default_ui_zoom() -> f32 {
     1.0
@@ -49,6 +51,14 @@ fn default_ui_zoom() -> f32 {
 
 fn default_show_home_traffic() -> bool {
     true
+}
+
+fn default_traffic_split() -> f32 {
+    DEFAULT_TRAFFIC_SPLIT
+}
+
+fn default_wide_split() -> f32 {
+    DEFAULT_WIDE_SPLIT
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +71,12 @@ pub struct UiPrefs {
     pub show_home_traffic: bool,
     #[serde(default)]
     pub window_size: Option<[f32; 2]>,
+    #[serde(default)]
+    pub home_mid_height: Option<f32>,
+    #[serde(default = "default_traffic_split")]
+    pub home_traffic_split: f32,
+    #[serde(default = "default_wide_split")]
+    pub home_wide_split: f32,
 }
 
 impl Default for UiPrefs {
@@ -70,6 +86,9 @@ impl Default for UiPrefs {
             zoom: 1.0,
             show_home_traffic: true,
             window_size: None,
+            home_mid_height: None,
+            home_traffic_split: DEFAULT_TRAFFIC_SPLIT,
+            home_wide_split: DEFAULT_WIDE_SPLIT,
         }
     }
 }
@@ -87,6 +106,20 @@ impl UiPrefs {
                 None
             }
         });
+        self.home_mid_height = self
+            .home_mid_height
+            .filter(|h| h.is_finite())
+            .map(|h| h.clamp(196.0, 520.0).round());
+        self.home_traffic_split = if self.home_traffic_split.is_finite() {
+            self.home_traffic_split.clamp(0.48, 0.74)
+        } else {
+            DEFAULT_TRAFFIC_SPLIT
+        };
+        self.home_wide_split = if self.home_wide_split.is_finite() {
+            self.home_wide_split.clamp(0.38, 0.68)
+        } else {
+            DEFAULT_WIDE_SPLIT
+        };
         self
     }
 
@@ -736,16 +769,25 @@ mod tests {
         assert!((legacy.zoom - 1.0).abs() < f32::EPSILON);
         assert!(legacy.show_home_traffic);
         assert!(legacy.window_size.is_none());
+        assert!(legacy.home_mid_height.is_none());
+        assert!((legacy.home_traffic_split - DEFAULT_TRAFFIC_SPLIT).abs() < f32::EPSILON);
+        assert!((legacy.home_wide_split - DEFAULT_WIDE_SPLIT).abs() < f32::EPSILON);
 
         let wild = UiPrefs {
             theme: ThemeMode::Light,
             zoom: 2.8,
             show_home_traffic: false,
             window_size: Some([300.0, 200.0]),
+            home_mid_height: Some(90.0),
+            home_traffic_split: 0.95,
+            home_wide_split: 0.1,
         }
         .normalized();
         assert!((wild.zoom - MAX_UI_ZOOM).abs() < f32::EPSILON);
         assert_eq!(wild.window_size, Some(MIN_WINDOW_SIZE));
+        assert_eq!(wild.home_mid_height, Some(196.0));
+        assert!((wild.home_traffic_split - 0.74).abs() < f32::EPSILON);
+        assert!((wild.home_wide_split - 0.38).abs() < f32::EPSILON);
 
         let low = clamp_ui_zoom(0.2);
         assert!((low - MIN_UI_ZOOM).abs() < f32::EPSILON);

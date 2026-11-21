@@ -38,7 +38,10 @@ use theme::{
     format_uptime, status_title, with_alpha, Palette, ThemeMode, UiPrefs,
 };
 pub use theme::{load_ui_prefs, MIN_WINDOW_SIZE};
-use widgets::{accent_card, badge, icon_button, primary_button, pulsing_dot, secondary_button};
+use widgets::{
+    accent_card, badge, horizontal_splitter, icon_button, primary_button, pulsing_dot,
+    secondary_button,
+};
 
 const CREDENTIAL_TARGET: &str = "GXNUCampusLogin/v4";
 const MAX_LOG_LINES: usize = 4000;
@@ -864,19 +867,33 @@ impl eframe::App for GuardApp {
                         self.draw_status_ribbon(ui, &p);
                         ui.add_space(10.0);
 
-                        // Tier 2 + Tier 3 垂直比例分配（中部非对称双图 ~56%，底部全宽日志 ~44%）
+                        // Tier 2 + Tier 3 垂直分配：中部采用紧贴内容的紧凑默认高度，将大窗/缩放多出的空间全部留给运行日志
                         let avail_h = ui.available_height().max(320.0);
-                        let gap = 10.0_f32;
-                        let usable_h = (avail_h - gap).max(300.0);
-                        let min_mid = 236.0_f32;
+                        let splitter_h = 10.0_f32;
+                        let usable_h = (avail_h - splitter_h).max(300.0);
+                        let (default_mid, min_mid) = if self.ui_prefs.show_home_traffic {
+                            (248.0_f32, 224.0_f32)
+                        } else {
+                            (222.0_f32, 198.0_f32)
+                        };
                         let min_log = 148.0_f32;
-                        let mid_h = (usable_h * 0.585)
-                            .clamp(min_mid, (usable_h - min_log).max(min_mid))
+                        let max_mid = (usable_h - min_log).max(min_mid);
+                        let mid_h = self
+                            .ui_prefs
+                            .home_mid_height
+                            .unwrap_or(default_mid)
+                            .clamp(min_mid, max_mid)
                             .floor();
                         let log_h = (usable_h - mid_h).max(min_log);
 
-                        // Tier 2: 按设置切换「62:38 稳定性+流量双卡」或「通栏宽屏双栏稳定性面板」
-                        charts::draw_home_visual_row(
+                        // Tier 2: 按设置切换「可拖左右双卡」或「可拖双栏通栏稳定性面板」
+                        let show_traffic = self.ui_prefs.show_home_traffic;
+                        let split_ref = if show_traffic {
+                            &mut self.ui_prefs.home_traffic_split
+                        } else {
+                            &mut self.ui_prefs.home_wide_split
+                        };
+                        let split_changed = charts::draw_home_visual_row(
                             ui,
                             &p,
                             &self.telemetry,
@@ -884,12 +901,27 @@ impl eframe::App for GuardApp {
                             &self.traffic,
                             &mut self.traffic_period,
                             self.settings.monthly_quota_gb,
-                            self.ui_prefs.show_home_traffic,
+                            show_traffic,
+                            split_ref,
                             mid_h,
                         );
-                        ui.add_space(gap);
+                        if split_changed {
+                            self.window_size_dirty_since = Some(Instant::now());
+                        }
 
-                        // Tier 3: 通栏静谧运行日志
+                        // 中下可自由拖拽的横向分隔条（双击恢复默认）
+                        let (dy, dbl) = horizontal_splitter(ui, &p, ui.available_width());
+                        if dbl {
+                            self.ui_prefs.home_mid_height = None;
+                            self.window_size_dirty_since = Some(Instant::now());
+                            self.show_toast("已恢复默认面板高度比例", false);
+                        } else if dy.abs() > 0.01 {
+                            let next_h = (mid_h + dy).clamp(min_mid, max_mid).round();
+                            self.ui_prefs.home_mid_height = Some(next_h);
+                            self.window_size_dirty_since = Some(Instant::now());
+                        }
+
+                        // Tier 3: 通栏静谧运行日志（吃满剩余全部高度）
                         logs_page::draw_card(
                             ui,
                             &p,
