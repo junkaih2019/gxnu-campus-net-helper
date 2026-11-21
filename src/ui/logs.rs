@@ -1,7 +1,8 @@
 //! 嵌入式运行日志卡（位于主页下半屏）：
-//! - 极简直观工具栏：`全部 / 断联与登录 / 仅异常` + 单个紧凑搜索框 + 打开原文件（自动智能滚底，无多余开关）
-//! - 严格 1 对 1 色彩语义标签：绿「正常」、蓝「动态」、黄「波动」、红「异常」，绝不混色
-//! - 自然大白话中文重写（保持磁盘 `app.log` 原格式 100% 兼容不变）；超长或含补充详情时悬停展示小卡片
+//! - 经典三层英文标签：`全部 / INFO / WARN / ERR`，顶部分类与列表左侧胶囊 1 对 1 严格对应
+//! - 深度降噪：自动过滤弹窗发送回执（`NOTIFY_SENT`）、登录中间握手态与重复状态行（1 次重连从 9 条压至 2 条核心记录）
+//! - 右上角轻量等高搜索框（纯 Painter 24px 高度 + 零内边距中线锁定，图标与文字严格水平对齐）
+//! - 严格单行限宽截断；超长或含折叠详情时鼠标悬停弹出结构化小卡片
 
 use std::path::Path;
 use std::sync::Arc;
@@ -11,47 +12,41 @@ use eframe::egui::{
 };
 
 use crate::ui::icons::{self, Icon};
-use crate::ui::theme::{
-    body_text, bold_text, parse_log_line, reason_label, with_alpha, Palette, RADIUS_SM,
-};
+use crate::ui::theme::{body_text, bold_text, parse_log_line, reason_label, with_alpha, Palette};
 use crate::ui::widgets::{badge, card_padded, icon_button, section_heading, segmented_control};
 
 #[derive(Default)]
 pub struct LogsState {
-    /// 0 = 全部，1 = 断联与登录（断网、自动重登、切号、恢复），2 = 仅异常
+    /// 0 = 全部，1 = INFO，2 = WARN，3 = ERR
     pub view_filter: usize,
     pub search: String,
 }
 
-/// 严格 1 对 1 的日志状态色阶（每种颜色只对应唯一一个中文标签）。
+/// 严格 1 对 1 的三层日志等级（1 种颜色 = 1 个英文标签 = 顶部 1 个筛选项）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LogStatus {
-    /// 绿：巡检通过、在线、重连成功、切号成功
-    Normal,
-    /// 蓝：启停守护、开始登录、切号过程、网络变动复查、设置更新、常规通知
-    Activity,
-    /// 黄：掉线/认证过期、网络波动复核、等待重试、轻度警告
-    Notice,
-    /// 红：登录被拒、缺密码、切号失败、程序或网络故障
-    Error,
+enum LogLevel {
+    /// 绿：一切正常运行状态、重连成功、切号成功、检测通过、守护启停与设置生效
+    Info,
+    /// 黄：一切掉线触发、认证过期自动重连中、网络波动复核、等待重试
+    Warn,
+    /// 红：一切认证被拒、缺密码、切号失败、网卡断开或程序故障
+    Err,
 }
 
-impl LogStatus {
+impl LogLevel {
     fn label(self) -> &'static str {
         match self {
-            Self::Normal => "正常",
-            Self::Activity => "动态",
-            Self::Notice => "波动",
-            Self::Error => "异常",
+            Self::Info => "INFO",
+            Self::Warn => "WARN",
+            Self::Err => "ERR",
         }
     }
 
     fn colors(self, p: &Palette) -> (Color32, Color32, Color32) {
         match self {
-            Self::Normal => (p.ok, p.ok_soft, p.ok_border),
-            Self::Activity => (p.accent, p.accent_soft, p.accent_border),
-            Self::Notice => (p.warn, p.warn_soft, p.warn_border),
-            Self::Error => (p.danger, p.danger_soft, p.danger_border),
+            Self::Info => (p.ok, p.ok_soft, p.ok_border),
+            Self::Warn => (p.warn, p.warn_soft, p.warn_border),
+            Self::Err => (p.danger, p.danger_soft, p.danger_border),
         }
     }
 }
@@ -60,14 +55,10 @@ impl LogStatus {
 struct HumanLogLine {
     full_stamp: String,
     time_short: String,
-    status: LogStatus,
+    level: LogLevel,
     summary: String,
-    /// 若正文精简掉了 IP/网关/路径等次要技术参数，放入此处供鼠标悬停详情卡查看。
+    /// 若正文折叠了 IP/网关/路径等次要参数，放入此处供鼠标悬停小卡片查看。
     detail: Option<String>,
-    /// 是否属于「断联与登录」关注范畴（掉线、重登、切号、恢复、认证异常）。
-    is_conn_or_auth: bool,
-    /// 是否属于「仅异常」范畴（波动与异常）。
-    is_anomaly: bool,
     raw: String,
 }
 
@@ -79,24 +70,25 @@ pub fn draw_card(
     log_path: &Path,
     target_height: f32,
 ) {
+    let entries = build_visible_logs(lines);
     let query = state.search.trim().to_lowercase();
-    let filtered: Vec<HumanLogLine> = lines
+    let filtered: Vec<&HumanLogLine> = entries
         .iter()
-        .map(|line| format_human_log(line))
         .filter(|entry| {
-            let tab_ok = match state.view_filter {
-                1 => entry.is_conn_or_auth,
-                2 => entry.is_anomaly,
+            let level_ok = match state.view_filter {
+                1 => entry.level == LogLevel::Info,
+                2 => entry.level == LogLevel::Warn,
+                3 => entry.level == LogLevel::Err,
                 _ => true,
             };
-            if !tab_ok {
+            if !level_ok {
                 return false;
             }
             if query.is_empty() {
                 return true;
             }
             entry.summary.to_lowercase().contains(&query)
-                || entry.status.label().contains(&query)
+                || entry.level.label().to_lowercase().contains(&query)
                 || entry
                     .detail
                     .as_deref()
@@ -105,7 +97,7 @@ pub fn draw_card(
         })
         .collect();
 
-    // 精确扣除所有内外边距与 1px 描边（外卡 12×2+2=26，工具栏 26，间距 7，内框 6×2+2=14），确保底部圆角与外边距完全对称
+    // 精确扣除所有内外边距与 1px 描边（外卡 12×2+2=26，工具栏 26，间距 7，内框 6×2+2=14）
     let inner_h = (target_height - 26.0).max(96.0);
     let scroll_h = (inner_h - 26.0 - 7.0 - 14.0).max(48.0);
 
@@ -114,7 +106,7 @@ pub fn draw_card(
         ui.set_max_height(inner_h);
         ui.spacing_mut().item_spacing.y = 0.0;
 
-        // ── 26px 极简工具栏：清晰中文分类 + 单个紧凑搜索框 + 打开原文件 ──
+        // ── 26px 统一中线工具栏：全部 / INFO / WARN / ERR + 紧凑等高搜索框 ──
         ui.allocate_ui_with_layout(
             Vec2::new(ui.available_width(), 26.0),
             egui::Layout::left_to_right(egui::Align::Center),
@@ -129,14 +121,14 @@ pub fn draw_card(
                     26.0,
                 );
 
-                let count_label = if filtered.len() == lines.len() {
-                    format!("{} 条", lines.len())
+                let count_label = if filtered.len() == entries.len() {
+                    format!("{} 条", entries.len())
                 } else {
-                    format!("{}/{}", filtered.len(), lines.len())
+                    format!("{}/{}", filtered.len(), entries.len())
                 };
                 badge(ui, p.text_secondary, p.subtle, p.border, &count_label);
 
-                let tabs = ["全部", "断联与登录", "仅异常"];
+                let tabs = ["全部", "INFO", "WARN", "ERR"];
                 segmented_control(ui, p, "inline_log_view", &mut state.view_filter, &tabs);
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -146,8 +138,8 @@ pub fn draw_card(
                         ui,
                         p,
                         Icon::ExternalLink,
-                        Vec2::splat(26.0),
-                        13.0,
+                        Vec2::splat(24.0),
+                        12.5,
                         false,
                         "打开原始日志文件 (app.log)",
                     )
@@ -156,10 +148,10 @@ pub fn draw_card(
                         open_path(log_path);
                     }
 
-                    // 单个紧凑搜索框（常驻不占地方）
-                    let box_w = (ui.available_width() - 6.0).clamp(86.0, 128.0);
-                    if box_w >= 86.0 {
-                        draw_compact_search_box(ui, p, &mut state.search, box_w);
+                    // 与左侧状态胶囊同体量（24px 高、96px 宽）且图标文字严格中线对齐的小搜索框
+                    let box_w = (ui.available_width() - 4.0).clamp(76.0, 96.0);
+                    if box_w >= 76.0 {
+                        draw_aligned_mini_search(ui, p, &mut state.search, box_w);
                     }
                 });
             },
@@ -167,7 +159,7 @@ pub fn draw_card(
 
         ui.add_space(7.0);
 
-        // ── 日志流圆角容器（严格锁定高度，确保内外圆角完整闭合） ─────────
+        // ── 日志流圆角容器 ─────────────────────────────────────────────
         egui::Frame::new()
             .fill(p.subtle)
             .stroke(Stroke::new(1.0_f32, p.divider))
@@ -180,8 +172,9 @@ pub fn draw_card(
 
                 if filtered.is_empty() {
                     let empty_hint = match state.view_filter {
-                        2 => "当前没有波动或异常记录",
-                        1 => "当前没有断联或登录记录",
+                        3 => "当前没有 ERR 故障记录",
+                        2 => "当前没有 WARN 波动记录",
+                        1 => "当前没有 INFO 运行记录",
                         _ => "没有匹配的日志记录",
                     };
                     ui.centered_and_justified(|ui| {
@@ -200,63 +193,115 @@ pub fn draw_card(
                         ui.spacing_mut().item_spacing.y = 0.0;
                         let row_w = (inner_w - 8.0).max(160.0);
                         for index in range {
-                            paint_log_row(ui, p, &filtered[index], index, row_height, row_w);
+                            paint_log_row(ui, p, filtered[index], index, row_height, row_w);
                         }
                     });
             });
     });
 }
 
-fn draw_compact_search_box(ui: &mut egui::Ui, p: &Palette, search: &mut String, width: f32) {
+/// 纯 Painter 24px 迷你搜索框：与左侧徽章/分段器同高同体量，图标与文字强制共享同一水平中线 `cy`。
+fn draw_aligned_mini_search(ui: &mut egui::Ui, p: &Palette, search: &mut String, width: f32) {
+    let height = 24.0_f32;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    let cy = rect.center().y;
     let active = !search.is_empty();
-    egui::Frame::new()
-        .fill(p.input_bg)
-        .stroke(Stroke::new(
-            1.0_f32,
-            if active { p.accent_border } else { p.border },
-        ))
-        .corner_radius(CornerRadius::same(RADIUS_SM))
-        .inner_margin(egui::Margin::symmetric(7, 2))
-        .show(ui, |ui| {
-            ui.allocate_ui_with_layout(
-                Vec2::new((width - 14.0).max(66.0), 20.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    ui.spacing_mut().item_spacing.x = 4.0;
-                    let (s_rect, _) = ui.allocate_exact_size(Vec2::splat(11.5), Sense::hover());
-                    icons::paint(
-                        ui.painter(),
-                        s_rect,
-                        Icon::Search,
-                        if active { p.accent } else { p.text_muted },
-                    );
-                    let edit_w = (ui.available_width() - if active { 16.0 } else { 2.0 }).max(40.0);
-                    ui.add_sized(
-                        [edit_w, 18.0],
-                        egui::TextEdit::singleline(search)
-                            .hint_text(egui::RichText::new("搜索…").color(p.text_muted))
-                            .vertical_align(egui::Align::Center)
-                            .frame(false),
-                    );
-                    if active {
-                        let (clr, resp) = ui.allocate_exact_size(Vec2::splat(12.0), Sense::click());
-                        let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-                        icons::paint(
-                            ui.painter(),
-                            clr.shrink(1.5),
-                            Icon::Close,
-                            if resp.hovered() { p.text } else { p.text_muted },
-                        );
-                        if resp.clicked() {
-                            search.clear();
-                        }
-                    }
-                },
-            );
-        });
+
+    let edit_id = ui.make_persistent_id("mini_log_search_edit");
+    let focused = ui.ctx().memory(|m| m.has_focus(edit_id));
+    let (fill, border_c) = if focused || active {
+        (p.card, p.accent_border)
+    } else {
+        (p.subtle, p.border)
+    };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(5),
+        fill,
+        Stroke::new(1.0_f32, border_c),
+        StrokeKind::Inside,
+    );
+
+    // 左侧放大镜图标（严格居中于 cy）
+    let icon_rect = Rect::from_center_size(Pos2::new(rect.left() + 12.0, cy), Vec2::splat(11.0));
+    icons::paint(
+        ui.painter(),
+        icon_rect,
+        Icon::Search,
+        if focused || active {
+            p.accent
+        } else {
+            p.text_muted
+        },
+    );
+
+    let text_left = rect.left() + 21.0;
+    let text_right = if active {
+        rect.right() - 18.0
+    } else {
+        rect.right() - 6.0
+    };
+
+    // 空置且未聚焦时直接用 Painter 以 LEFT_CENTER 绘制占位文字，确保与放大镜图标 0 像素垂直误差
+    if search.is_empty() && !focused {
+        ui.painter().text(
+            Pos2::new(text_left, cy),
+            egui::Align2::LEFT_CENTER,
+            "搜索…",
+            egui::FontId::proportional(11.0),
+            p.text_muted,
+        );
+    }
+
+    let edit_rect = Rect::from_min_max(
+        Pos2::new(text_left, cy - 8.0),
+        Pos2::new(text_right.max(text_left + 24.0), cy + 8.0),
+    );
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(edit_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.spacing_mut().button_padding = Vec2::ZERO;
+    let resp = child.add_sized(
+        edit_rect.size(),
+        egui::TextEdit::singleline(search)
+            .id(edit_id)
+            .font(egui::FontId::proportional(11.0))
+            .vertical_align(egui::Align::Center)
+            .frame(false),
+    );
+    if resp.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Escape)) {
+        search.clear();
+        resp.surrender_focus();
+    }
+
+    if active {
+        let clr_rect =
+            Rect::from_center_size(Pos2::new(rect.right() - 10.0, cy), Vec2::splat(12.0));
+        let clr_resp = ui
+            .interact(
+                clr_rect,
+                ui.id().with("mini_log_search_clear"),
+                Sense::click(),
+            )
+            .on_hover_cursor(CursorIcon::PointingHand);
+        icons::paint(
+            ui.painter(),
+            clr_rect.shrink(2.2),
+            Icon::Close,
+            if clr_resp.hovered() {
+                p.text
+            } else {
+                p.text_muted
+            },
+        );
+        if clr_resp.clicked() {
+            search.clear();
+        }
+    }
 }
 
-/// 绘制单条自然中文日志行：时间 + 1 对 1 颜色状态胶囊 + 限宽正文（超长或有补充详情时悬停展示小卡片）。
 fn paint_log_row(
     ui: &mut egui::Ui,
     p: &Palette,
@@ -278,11 +323,11 @@ fn paint_log_row(
     let cy = row_rect.center().y;
     let painter = ui.painter();
     let font_regular = egui::FontId::proportional(11.5);
-    let font_pill = egui::FontId::new(10.0, crate::ui::theme::bold_family());
+    let font_pill = egui::FontId::new(9.5, crate::ui::theme::bold_family());
 
     let mut cursor_x = row_rect.left() + 4.0;
 
-    // 1. 时间列（固定对齐）
+    // 1. 时间列
     if !entry.time_short.is_empty() {
         let tg =
             painter.layout_no_wrap(entry.time_short.clone(), font_regular.clone(), p.text_muted);
@@ -294,12 +339,12 @@ fn paint_log_row(
         cursor_x += 56.0;
     }
 
-    // 2. 严格 1 对 1 语义状态胶囊（38px：正常/动态/波动/异常）
-    let (st_fg, st_bg, st_bd) = entry.status.colors(p);
-    let pill_w = 38.0_f32;
+    // 2. 严格 1 对 1 英文等级胶囊（36px：INFO / WARN / ERR）
+    let (st_fg, st_bg, st_bd) = entry.level.colors(p);
+    let pill_w = 36.0_f32;
     let pill_rect = Rect::from_center_size(
         Pos2::new(cursor_x + pill_w * 0.5, cy),
-        Vec2::new(pill_w, 17.0),
+        Vec2::new(pill_w, 16.0),
     );
     painter.rect(
         pill_rect,
@@ -308,7 +353,7 @@ fn paint_log_row(
         Stroke::new(1.0_f32, st_bd),
         StrokeKind::Inside,
     );
-    let cg = painter.layout_no_wrap(entry.status.label().to_string(), font_pill, st_fg);
+    let cg = painter.layout_no_wrap(entry.level.label().to_string(), font_pill, st_fg);
     painter.galley(
         Pos2::new(
             pill_rect.center().x - cg.size().x * 0.5,
@@ -321,7 +366,7 @@ fn paint_log_row(
 
     // 3. 自然中文正文（严格限宽截断；超长或有折叠参数时鼠标悬停弹出详情卡）
     let msg_max_w = (row_rect.right() - cursor_x - 6.0).max(40.0);
-    let text_color = if entry.status == LogStatus::Error {
+    let text_color = if entry.level == LogLevel::Err {
         p.danger
     } else {
         p.text
@@ -344,7 +389,7 @@ fn paint_log_row(
 }
 
 fn show_log_detail_tooltip(ui: &egui::Ui, p: &Palette, id: egui::Id, entry: &HumanLogLine) {
-    let (st_fg, st_bg, st_bd) = entry.status.colors(p);
+    let (st_fg, st_bg, st_bd) = entry.level.colors(p);
     egui::show_tooltip(ui.ctx(), ui.layer_id(), id, |ui| {
         ui.set_min_width(260.0);
         ui.set_max_width(356.0);
@@ -354,7 +399,7 @@ fn show_log_detail_tooltip(ui: &egui::Ui, p: &Palette, id: egui::Id, entry: &Hum
             Vec2::new(ui.available_width(), 22.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                badge(ui, st_fg, st_bg, st_bd, entry.status.label());
+                badge(ui, st_fg, st_bg, st_bd, entry.level.label());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let stamp = if entry.full_stamp.is_empty() {
                         &entry.time_short
@@ -423,8 +468,27 @@ fn fit_single_line(
     (g, true)
 }
 
-/// 将底层结构化日志重写为自然中文与 1 对 1 色彩状态（不改变磁盘 `app.log` 原文）。
-fn format_human_log(line: &str) -> HumanLogLine {
+/// 将原始日志列表转换为去噪、合并且按真实语义分级的可视化日志流。
+fn build_visible_logs(lines: &[String]) -> Vec<HumanLogLine> {
+    let mut out: Vec<HumanLogLine> = Vec::with_capacity(lines.len());
+    for line in lines {
+        let Some(entry) = format_human_log(line) else {
+            continue;
+        };
+        // 相邻行若在同一秒/相邻时刻表达同一结论（例如 LOGIN_VERIFIED 与紧随其后的 VERIFYING → ONLINE），自动合并去重
+        if let Some(prev) = out.last() {
+            if prev.level == entry.level && prev.summary == entry.summary {
+                continue;
+            }
+        }
+        out.push(entry);
+    }
+    out
+}
+
+/// 将单条底层日志映射为用户可读的 `(INFO/WARN/ERR, 中文描述)`；
+/// 返回 `None` 表示该条属于内部握手中间态、弹窗发送回执或高频探测流水，主界面不展示。
+fn format_human_log(line: &str) -> Option<HumanLogLine> {
     let full_stamp = if line.len() >= 19 && line.as_bytes().get(10) == Some(&b' ') {
         line[..19].to_string()
     } else {
@@ -435,87 +499,75 @@ fn format_human_log(line: &str) -> HumanLogLine {
     let is_warn = level == "WARNING";
     let is_err = level == "ERROR";
 
-    let (status, summary, detail, is_conn_or_auth) = match tag_str {
-        "STATE_CHANGE" => rewrite_state_change(&raw_msg),
+    // ── 第一层：过滤一般场景不需要展示的内部流水与弹窗回执 ──
+    if matches!(
+        tag_str,
+        "NOTIFY_SENT"
+            | "NOTIFY_RETRY"
+            | "LOGIN_ACCEPTED"
+            | "PORTAL_LOGOUT"
+            | "FORCE_CHECK"
+            | "CAMPUS_STATUS"
+            | "NET_POLICY"
+            | "CONFIG"
+            | "UI"
+            | "NETWORK_CHANGE"
+            | "NETWORK_SWITCH"
+            | "SELF_CHECK"
+    ) {
+        return None;
+    }
+
+    let (lvl, summary, detail) = match tag_str {
+        "STATE_CHANGE" => rewrite_state_change(&raw_msg)?,
         "HEALTH_CHECK" => rewrite_health_check(&raw_msg),
-        "FORCE_CHECK" => (
-            LogStatus::Activity,
-            "手动发起了一次网络检测".to_string(),
-            None,
-            false,
-        ),
         "FORCE_CHECK_RESULT" => {
             if is_warn || is_err || raw_msg.contains("异常") {
                 (
-                    LogStatus::Notice,
+                    LogLevel::Warn,
                     format!(
                         "手动检测发现异常：{}",
                         polish_fragment(&raw_msg, "检测异常：")
                     ),
                     None,
-                    true,
                 )
             } else if raw_msg.contains("监控已暂停") {
                 (
-                    LogStatus::Normal,
+                    LogLevel::Info,
                     "手动检测通过，校园网在线（当前已暂停守护）".to_string(),
                     None,
-                    false,
                 )
             } else {
                 let ip = extract_kv(&raw_msg, "IP=");
                 (
-                    LogStatus::Normal,
+                    LogLevel::Info,
                     "手动检测通过，校园网连接正常".to_string(),
                     ip.map(|v| format!("本机 IP：{v}")),
-                    false,
-                )
-            }
-        }
-        "LOGIN_ACCEPTED" => {
-            let clean = strip_portal_code(&raw_msg);
-            if clean.is_empty() || clean == "认证服务器未返回说明" {
-                (
-                    LogStatus::Activity,
-                    "校园网认证已受理，等待网络放行".to_string(),
-                    None,
-                    true,
-                )
-            } else {
-                (
-                    LogStatus::Activity,
-                    format!("认证请求已受理：{clean}"),
-                    None,
-                    true,
                 )
             }
         }
         "LOGIN_VERIFIED" => (
-            LogStatus::Normal,
-            "校园网登录成功，已恢复上网".to_string(),
+            LogLevel::Info,
+            "自动重连成功，校园网已恢复上网".to_string(),
             None,
-            true,
         ),
         "NETWORK_RECOVERED" => {
             let ip = extract_kv(&raw_msg, "IP=");
             (
-                LogStatus::Normal,
-                "网络连接已自行恢复正常".to_string(),
+                LogLevel::Info,
+                "网络连接已恢复正常".to_string(),
                 ip.map(|v| format!("本机 IP：{v}")),
-                true,
             )
         }
         "AUTH_RETRY_OK" => (
-            LogStatus::Normal,
-            "重试认证成功，校园网已放行".to_string(),
+            LogLevel::Info,
+            "重试认证成功，校园网已恢复上网".to_string(),
             Some(raw_msg.clone()),
-            true,
         ),
         "AUTH_RETRY" => (
-            LogStatus::Notice,
+            LogLevel::Warn,
             "认证被短暂拒绝，稍后将自动重试".to_string(),
             Some(polish_generic(&raw_msg)),
-            true,
         ),
         "RETRY_BACKOFF" => {
             let secs = raw_msg
@@ -528,41 +580,30 @@ fn format_human_log(line: &str) -> HumanLogLine {
             } else {
                 format!("将在 {secs} 秒后自动重试连接")
             };
-            (LogStatus::Notice, msg, None, true)
+            (LogLevel::Warn, msg, None)
         }
         "LOGIN_NOT_VERIFIED" => (
-            LogStatus::Error,
+            LogLevel::Err,
             "认证提交后公网仍未恢复，将继续排查".to_string(),
             Some(polish_generic(&raw_msg)),
-            true,
         ),
         "CREDENTIALS_MISSING" => (
-            LogStatus::Error,
+            LogLevel::Err,
             "尚未保存当前账号密码，无法自动登录".to_string(),
             None,
-            true,
         ),
         "LOGIN_REJECTED" | "PORTAL_REJECTED" | "PORTAL_ERROR" | "PORTAL_UNAVAILABLE" => (
-            LogStatus::Error,
+            LogLevel::Err,
             format!("校园网认证失败：{}", strip_portal_code(&raw_msg)),
             None,
-            true,
         ),
         "ACCOUNT_SWITCH" => {
             let acct = extract_quoted_name(&raw_msg);
             let msg = match acct {
-                Some(name) => format!("开始切换账号至「{name}」"),
-                None => "开始切换校园网账号".to_string(),
+                Some(name) => format!("正在切换账号至「{name}」…"),
+                None => "正在切换校园网账号…".to_string(),
             };
-            (LogStatus::Activity, msg, None, true)
-        }
-        "PORTAL_LOGOUT" => {
-            let msg = if raw_msg.contains("success=true") {
-                "已注销原账号会话，准备登录新账号".to_string()
-            } else {
-                "已尝试注销原会话，继续登录新账号".to_string()
-            };
-            (LogStatus::Activity, msg, None, true)
+            (LogLevel::Info, msg, None)
         }
         "ACCOUNT_SWITCHED" => {
             let acct = extract_quoted_name(&raw_msg);
@@ -570,137 +611,68 @@ fn format_human_log(line: &str) -> HumanLogLine {
                 Some(name) => format!("已切换至「{name}」并成功联网"),
                 None => "账号切换成功，校园网已连接".to_string(),
             };
-            (LogStatus::Normal, msg, None, true)
+            (LogLevel::Info, msg, None)
         }
         "SWITCH_ABORTED" | "SWITCH_NOT_VERIFIED" | "SWITCH_FAILED" => {
-            (LogStatus::Error, strip_portal_code(&raw_msg), None, true)
+            (LogLevel::Err, strip_portal_code(&raw_msg), None)
         }
-        "MONITOR_STARTED" => (
-            LogStatus::Activity,
-            "已开启后台自动守护".to_string(),
-            None,
-            false,
-        ),
-        "MONITOR_PAUSED" => (
-            LogStatus::Activity,
-            "已暂停后台自动守护".to_string(),
-            None,
-            false,
-        ),
-        "SETTINGS_SAVED" => (
-            LogStatus::Activity,
-            "新设置已保存并生效".to_string(),
-            None,
-            false,
-        ),
-        "NETWORK_CHANGE" => (
-            LogStatus::Activity,
-            "检测到网络变动或电脑唤醒，正在检查连接".to_string(),
-            None,
-            false,
-        ),
-        "NETWORK_SWITCH" => (
-            LogStatus::Activity,
-            "网络接口正在切换，等待稳定后重新检测".to_string(),
-            Some(polish_generic(&raw_msg)),
-            false,
-        ),
-        "NOTIFY_SENT" => rewrite_notify(&raw_msg),
-        "NOTIFY_RETRY" => (
-            LogStatus::Notice,
-            "系统弹窗提醒发送失败".to_string(),
-            Some(raw_msg.clone()),
-            false,
-        ),
-        "CAMPUS_STATUS" => {
-            if raw_msg.contains("在线") && !raw_msg.contains("不在线") {
-                (
-                    LogStatus::Normal,
-                    "校园网门户确认当前处于在线状态".to_string(),
-                    extract_paren(&raw_msg).map(polish_generic),
-                    false,
-                )
-            } else if raw_msg.contains("不在线") {
-                (
-                    LogStatus::Notice,
-                    "校园网门户提示当前账号未登录".to_string(),
-                    extract_paren(&raw_msg).map(polish_generic),
-                    true,
-                )
-            } else {
-                (
-                    LogStatus::Notice,
-                    "暂时无法查询校园网门户状态".to_string(),
-                    Some(polish_generic(&raw_msg)),
-                    false,
-                )
-            }
-        }
+        "MONITOR_STARTED" => (LogLevel::Info, "已开启后台自动守护".to_string(), None),
+        "MONITOR_PAUSED" => (LogLevel::Info, "已暂停后台自动守护".to_string(), None),
+        "SETTINGS_SAVED" => (LogLevel::Info, "新设置已保存并生效".to_string(), None),
         "APP_STARTED" => {
             let detail = raw_msg
                 .split("日志路径：")
                 .nth(1)
                 .map(|p| format!("日志路径：{}", p.trim()));
             (
-                LogStatus::Activity,
+                LogLevel::Info,
                 format!("守护助手 v{} 已启动", env!("CARGO_PKG_VERSION")),
                 detail,
-                false,
             )
         }
         "APP_READY" => (
-            LogStatus::Normal,
+            LogLevel::Info,
             "后台守护已就绪，正在系统托盘静默运行".to_string(),
             None,
-            false,
         ),
-        "APP_EXIT" => (
-            LogStatus::Activity,
-            "守护助手已退出".to_string(),
-            None,
-            false,
-        ),
-        "NET_POLICY" => (
-            LogStatus::Activity,
-            "已启用直连探测策略（自动绕过系统代理）".to_string(),
-            None,
-            false,
-        ),
-        "CONFIG" => (
-            LogStatus::Activity,
-            "已加载本地守护配置".to_string(),
-            Some(polish_generic(&raw_msg)),
-            false,
-        ),
-        "DIAGNOSTIC" => (LogStatus::Notice, polish_generic(&raw_msg), None, true),
+        "APP_EXIT" => (LogLevel::Info, "守护助手已退出".to_string(), None),
+        "DIAGNOSTIC" => return None,
         "DIAGNOSTIC_ERROR" => (
-            LogStatus::Error,
+            LogLevel::Err,
             "网络诊断过程发生异常".to_string(),
             Some(polish_generic(&raw_msg)),
-            true,
         ),
         _ if is_err || tag_str.ends_with("_ERROR") || tag_str.ends_with("_FAILED") => {
-            (LogStatus::Error, polish_generic(&raw_msg), None, true)
+            (LogLevel::Err, polish_generic(&raw_msg), None)
         }
-        _ if is_warn => (LogStatus::Notice, polish_generic(&raw_msg), None, true),
-        _ => (LogStatus::Activity, polish_generic(&raw_msg), None, false),
+        _ if is_warn => (LogLevel::Warn, polish_generic(&raw_msg), None),
+        _ => (LogLevel::Info, polish_generic(&raw_msg), None),
     };
 
-    let is_anomaly = matches!(status, LogStatus::Notice | LogStatus::Error);
-    HumanLogLine {
+    Some(HumanLogLine {
         full_stamp,
         time_short,
-        status,
+        level: lvl,
         summary,
         detail,
-        is_conn_or_auth,
-        is_anomaly,
         raw: line.to_string(),
-    }
+    })
 }
 
-/// 将 `[STATE_CHANGE] A → B ...; 原因=CODE` 改写为地道中文句式，彻底去除状态机箭头术语。
-fn rewrite_state_change(raw_msg: &str) -> (LogStatus, String, Option<String>, bool) {
+/// 过滤掉内部状态机握手中间态（`→ AUTHENTICATING` / `→ VERIFYING` / `→ CHECKING`），
+/// 仅保留对用户有实质意义的「断联/恢复/启停」结果。
+fn rewrite_state_change(raw_msg: &str) -> Option<(LogLevel, String, Option<String>)> {
+    // 内部握手中间态直接静默
+    if raw_msg.contains("→ AUTHENTICATING")
+        || raw_msg.contains("-> AUTHENTICATING")
+        || raw_msg.contains("→ VERIFYING")
+        || raw_msg.contains("-> VERIFYING")
+        || raw_msg.contains("→ CHECKING")
+        || raw_msg.contains("-> CHECKING")
+    {
+        return None;
+    }
+
     let reason_code = extract_kv(raw_msg, "原因=");
     let reason_zh = reason_code
         .as_deref()
@@ -708,90 +680,70 @@ fn rewrite_state_change(raw_msg: &str) -> (LogStatus, String, Option<String>, bo
         .map(reason_label);
 
     if raw_msg.contains("→ ONLINE") || raw_msg.contains("-> ONLINE") {
+        if raw_msg.contains("已切换至账号") {
+            // ACCOUNT_SWITCHED 已专门展示，避免重复打印
+            return None;
+        }
         let summary = if raw_msg.starts_with("PAUSED") {
-            "已恢复守护，当前校园网在线".to_string()
+            "已开启后台自动守护，当前校园网在线".to_string()
         } else if raw_msg.starts_with("VERIFYING") {
-            "校园网重连成功，已恢复上网".to_string()
+            "自动重连成功，校园网已恢复上网".to_string()
         } else if raw_msg.starts_with("OFFLINE") || raw_msg.starts_with("SUSPECT") {
-            "校园网已重新恢复在线".to_string()
+            "校园网已恢复正常连接".to_string()
         } else {
             "检测通过，校园网连接正常".to_string()
         };
-        let conn = raw_msg.starts_with("VERIFYING")
-            || raw_msg.starts_with("OFFLINE")
-            || raw_msg.starts_with("SUSPECT");
-        return (LogStatus::Normal, summary, None, conn);
-    }
-
-    if raw_msg.contains("→ AUTHENTICATING") || raw_msg.contains("-> AUTHENTICATING") {
-        let summary = if let Some(label) = extract_quoted_name(raw_msg) {
-            format!("正在登录账号「{label}」…")
-        } else {
-            "正在自动登录校园网…".to_string()
-        };
-        return (LogStatus::Activity, summary, None, true);
-    }
-
-    if raw_msg.contains("→ VERIFYING") || raw_msg.contains("-> VERIFYING") {
-        let summary = if let Some(label) = extract_quoted_name(raw_msg) {
-            format!("账号「{label}」认证已通过，正在确认公网连接")
-        } else {
-            "认证已通过，正在确认公网连通性".to_string()
-        };
-        return (LogStatus::Activity, summary, None, true);
+        return Some((LogLevel::Info, summary, None));
     }
 
     if raw_msg.contains("→ OFFLINE") || raw_msg.contains("-> OFFLINE") {
-        let is_auth_expired = reason_code.as_deref() == Some("AUTH_EXPIRED");
-        let is_missing = reason_code.as_deref() == Some("CREDENTIALS_MISSING");
-        let is_rejected = reason_code.as_deref() == Some("LOGIN_REJECTED");
-        let status = if is_missing || is_rejected {
-            LogStatus::Error
+        let code = reason_code.as_deref().unwrap_or("");
+        let is_err = matches!(
+            code,
+            "CREDENTIALS_MISSING"
+                | "LOGIN_REJECTED"
+                | "LINK_DOWN"
+                | "NO_IP"
+                | "NO_GATEWAY"
+                | "GATEWAY_UNREACHABLE"
+        );
+        let level = if is_err {
+            LogLevel::Err
         } else {
-            LogStatus::Notice
+            LogLevel::Warn
         };
-        let summary = if is_auth_expired && raw_msg.contains("准备自动登录") {
-            "校园网认证已过期，准备自动重连".to_string()
-        } else if is_missing {
+        let summary = if code == "AUTH_EXPIRED" {
+            "校园网认证已过期，正在自动重连…".to_string()
+        } else if code == "CREDENTIALS_MISSING" {
             "尚未保存账号密码，请前往设置补全".to_string()
         } else if let Some(r) = reason_zh {
-            format!("校园网已断开（{r}）")
+            if raw_msg.contains("准备自动登录") {
+                format!("{r}，正在自动重连…")
+            } else {
+                format!("校园网已断开（{r}）")
+            }
         } else {
-            "检测到校园网已断开".to_string()
+            "检测到校园网连接中断".to_string()
         };
-        return (status, summary, None, true);
+        return Some((level, summary, None));
     }
 
     if raw_msg.contains("→ SUSPECT") || raw_msg.contains("-> SUSPECT") {
         let summary = match reason_zh {
-            Some(r) => format!("网络出现波动（{r}），正在二次复核"),
+            Some(r) => format!("网络出现短暂波动（{r}），正在二次复核"),
             None => "网络出现短暂波动，正在二次复核".to_string(),
         };
-        return (LogStatus::Notice, summary, None, true);
+        return Some((LogLevel::Warn, summary, None));
     }
 
     if raw_msg.contains("→ PAUSED") || raw_msg.contains("-> PAUSED") {
-        return (
-            LogStatus::Activity,
-            "后台守护已暂停".to_string(),
-            None,
-            false,
-        );
+        return Some((LogLevel::Info, "已暂停后台自动守护".to_string(), None));
     }
 
-    if raw_msg.contains("→ CHECKING") || raw_msg.contains("-> CHECKING") {
-        return (
-            LogStatus::Activity,
-            "正在检测校园网连接状态…".to_string(),
-            None,
-            false,
-        );
-    }
-
-    (LogStatus::Activity, polish_generic(raw_msg), None, false)
+    None
 }
 
-fn rewrite_health_check(raw_msg: &str) -> (LogStatus, String, Option<String>, bool) {
+fn rewrite_health_check(raw_msg: &str) -> (LogLevel, String, Option<String>) {
     let cost = extract_kv(raw_msg, "检测耗时=");
     let ip = extract_kv(raw_msg, "IP=");
     let gw = extract_kv(raw_msg, "网关=");
@@ -817,36 +769,7 @@ fn rewrite_health_check(raw_msg: &str) -> (LogStatus, String, Option<String>, bo
     } else {
         Some(extras.join(" · "))
     };
-    (LogStatus::Normal, summary, detail, false)
-}
-
-fn rewrite_notify(raw_msg: &str) -> (LogStatus, String, Option<String>, bool) {
-    if let Some(body) = raw_msg
-        .strip_prefix("系统弹窗：")
-        .or_else(|| raw_msg.strip_prefix("系统弹窗:"))
-    {
-        let body = body.trim();
-        let is_outage = body.contains("过期") || body.contains("断开") || body.contains("异常");
-        return (
-            if is_outage {
-                LogStatus::Notice
-            } else {
-                LogStatus::Activity
-            },
-            format!("已发送系统提醒：{body}"),
-            None,
-            is_outage || body.contains("恢复"),
-        );
-    }
-    if raw_msg.starts_with("网络恢复提醒") {
-        let cause = extract_kv(raw_msg, "最后原因=");
-        let summary = match cause {
-            Some(c) => format!("已发送恢复提醒（原原因：{c}）"),
-            None => "已发送网络恢复提醒".to_string(),
-        };
-        return (LogStatus::Normal, summary, None, true);
-    }
-    (LogStatus::Activity, polish_generic(raw_msg), None, false)
+    (LogLevel::Info, summary, detail)
 }
 
 fn strip_portal_code(raw: &str) -> String {
@@ -933,18 +856,6 @@ fn extract_quoted_name(text: &str) -> Option<String> {
     }
 }
 
-fn extract_paren(text: &str) -> Option<&str> {
-    let start = text.find('（')? + '（'.len_utf8();
-    let rest = &text[start..];
-    let end = rest.find('）')?;
-    let inner = rest[..end].trim();
-    if inner.is_empty() {
-        None
-    } else {
-        Some(inner)
-    }
-}
-
 fn open_path(path: &Path) {
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -960,49 +871,44 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rewrites_logs_into_natural_chinese_with_strict_four_status_colors() {
-        let offline = format_human_log(
-            "2026-11-22 02:47:41 INFO [STATE_CHANGE] ONLINE → OFFLINE 准备自动登录校园网; 原因=AUTH_EXPIRED",
-        );
-        assert_eq!(offline.status, LogStatus::Notice);
-        assert_eq!(offline.status.label(), "波动");
-        assert!(offline.is_conn_or_auth);
-        assert!(offline.is_anomaly);
-        assert_eq!(offline.summary, "校园网认证已过期，准备自动重连");
+    fn compresses_nine_line_reconnect_sequence_into_two_clean_entries() {
+        let raw_burst = vec![
+            "2026-11-22 03:43:09 INFO [STATE_CHANGE] ONLINE → OFFLINE 准备自动登录校园网; 原因=AUTH_EXPIRED".to_string(),
+            "2026-11-22 03:43:09 INFO [STATE_CHANGE] OFFLINE → AUTHENTICATING 正在进行校园网认证; 原因=AUTH_EXPIRED".to_string(),
+            "2026-11-22 03:43:09 INFO [NOTIFY_SENT] 系统弹窗：校园网认证过期。准备自动登录校园网".to_string(),
+            "2026-11-22 03:43:10 INFO [LOGIN_ACCEPTED] 认证服务器未返回说明; 门户返回码=".to_string(),
+            "2026-11-22 03:43:10 INFO [STATE_CHANGE] AUTHENTICATING → VERIFYING 认证响应成功, 正在验证网络; 原因=AUTH_EXPIRED".to_string(),
+            "2026-11-22 03:43:11 INFO [LOGIN_VERIFIED] 校园网登录成功，公网已恢复".to_string(),
+            "2026-11-22 03:43:11 INFO [STATE_CHANGE] VERIFYING → ONLINE; 校园网登录成功，公网已恢复; 原因=ONLINE".to_string(),
+            "2026-11-22 03:43:11 INFO [NOTIFY_SENT] 网络恢复提醒；最后原因=校园网认证过期".to_string(),
+            "2026-11-22 03:43:12 INFO [NOTIFY_SENT] 系统弹窗：网络已恢复（断网 2 秒）".to_string(),
+        ];
+        let visible = build_visible_logs(&raw_burst);
+        assert_eq!(visible.len(), 2);
+        assert_eq!(visible[0].level, LogLevel::Warn);
+        assert_eq!(visible[0].level.label(), "WARN");
+        assert_eq!(visible[0].summary, "校园网认证已过期，正在自动重连…");
+        assert_eq!(visible[1].level, LogLevel::Info);
+        assert_eq!(visible[1].level.label(), "INFO");
+        assert_eq!(visible[1].summary, "自动重连成功，校园网已恢复上网");
+    }
 
-        let resumed = format_human_log(
-            "2026-11-22 03:17:39 INFO [STATE_CHANGE] PAUSED → ONLINE; 公网连接正常; 原因=ONLINE",
-        );
-        assert_eq!(resumed.status, LogStatus::Normal);
-        assert_eq!(resumed.summary, "已恢复守护，当前校园网在线");
-
-        let recovered = format_human_log(
-            "2026-11-22 02:47:42 INFO [STATE_CHANGE] VERIFYING → ONLINE; 校园网登录成功，公网已恢复; 原因=ONLINE",
-        );
-        assert_eq!(recovered.status, LogStatus::Normal);
-        assert!(recovered.is_conn_or_auth);
-        assert!(!recovered.is_anomaly);
-        assert_eq!(recovered.summary, "校园网重连成功，已恢复上网");
-
-        let accepted = format_human_log(
-            "2026-11-22 02:47:41 INFO [LOGIN_ACCEPTED] 认证服务器未返回说明; 门户返回码=",
-        );
-        assert_eq!(accepted.status, LogStatus::Activity);
-        assert_eq!(accepted.summary, "校园网认证已受理，等待网络放行");
+    #[test]
+    fn maps_errors_and_health_checks_to_exact_three_levels() {
+        let rejected = format_human_log(
+            "2026-11-22 03:18:48 WARNING [LOGIN_REJECTED] 账号密码校验未通过；门户返回码=1",
+        )
+        .unwrap();
+        assert_eq!(rejected.level, LogLevel::Err);
+        assert_eq!(rejected.level.label(), "ERR");
+        assert!(rejected.summary.contains("校园网认证失败"));
 
         let health = format_human_log(
             "2026-11-22 03:17:39 INFO [HEALTH_CHECK] 网络正常；IP=198.18.0.1；网关=198.18.0.2；检测耗时=0.03s；心跳间隔=30分钟",
-        );
-        assert_eq!(health.status, LogStatus::Normal);
-        assert!(!health.is_conn_or_auth);
+        )
+        .unwrap();
+        assert_eq!(health.level, LogLevel::Info);
         assert_eq!(health.summary, "例行巡检正常（耗时 0.03s）");
         assert!(health.detail.as_deref().unwrap().contains("198.18.0.1"));
-
-        let net_chg = format_human_log(
-            "2026-11-22 03:18:26 INFO [NETWORK_CHANGE] 接口变化或系统唤醒，开始只读复查",
-        );
-        assert_eq!(net_chg.status, LogStatus::Activity);
-        assert!(!net_chg.is_conn_or_auth);
-        assert_eq!(net_chg.summary, "检测到网络变动或电脑唤醒，正在检查连接");
     }
 }
