@@ -32,6 +32,12 @@ pub enum Icon {
     PanelLeft,
     Activity,
     Info,
+    Settings,
+    ArrowLeft,
+    User,
+    ArrowUpDown,
+    ChevronDown,
+    Folder,
 }
 
 /// 在给定矩形内按比例居中绘制矢量图标。
@@ -335,6 +341,50 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             painter.circle_stroke(c, s * 0.42, st);
             painter.circle_filled(pt(0.0, -0.34), (s * 0.075).max(1.0), color);
             painter.line_segment([pt(0.0, -0.06), pt(0.0, 0.42)], st);
+        }
+        Icon::Settings => {
+            painter.circle_stroke(c, s * 0.16, st);
+            painter.circle_stroke(c, s * 0.31, st);
+            for i in 0..8 {
+                let a = (i as f32) * (PI * 0.25);
+                let p0 = Pos2::new(c.x + s * 0.32 * a.cos(), c.y + s * 0.32 * a.sin());
+                let p1 = Pos2::new(c.x + s * 0.44 * a.cos(), c.y + s * 0.44 * a.sin());
+                painter.line_segment([p0, p1], st);
+            }
+        }
+        Icon::ArrowLeft => {
+            painter.line_segment([pt(0.54, 0.0), pt(-0.54, 0.0)], st);
+            painter.line_segment([pt(-0.10, -0.42), pt(-0.54, 0.0)], st);
+            painter.line_segment([pt(-0.10, 0.42), pt(-0.54, 0.0)], st);
+        }
+        Icon::User => {
+            painter.circle_stroke(pt(0.0, -0.28), s * 0.20, st);
+            paint_arc(painter, pt(0.0, 0.62), s * 0.38, PI * 1.15, PI * 1.85, st);
+        }
+        Icon::ArrowUpDown => {
+            // Left up arrow
+            painter.line_segment([pt(-0.30, 0.52), pt(-0.30, -0.52)], st);
+            painter.line_segment([pt(-0.56, -0.24), pt(-0.30, -0.52)], st);
+            painter.line_segment([pt(-0.04, -0.24), pt(-0.30, -0.52)], st);
+            // Right down arrow
+            painter.line_segment([pt(0.30, -0.52), pt(0.30, 0.52)], st);
+            painter.line_segment([pt(0.04, 0.24), pt(0.30, 0.52)], st);
+            painter.line_segment([pt(0.56, 0.24), pt(0.30, 0.52)], st);
+        }
+        Icon::ChevronDown => {
+            painter.line_segment([pt(-0.42, -0.18), pt(0.0, 0.26)], st);
+            painter.line_segment([pt(0.0, 0.26), pt(0.42, -0.18)], st);
+        }
+        Icon::Folder => {
+            let pts = vec![
+                pt(-0.66, -0.44),
+                pt(-0.18, -0.44),
+                pt(-0.02, -0.24),
+                pt(0.66, -0.24),
+                pt(0.66, 0.48),
+                pt(-0.66, 0.48),
+            ];
+            painter.add(egui::Shape::closed_line(pts, st));
         }
     }
 }
