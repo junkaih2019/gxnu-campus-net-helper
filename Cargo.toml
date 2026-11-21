@@ -1,6 +1,6 @@
 [package]
 name = "gxnu-guard"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "GXNU 校园网守护助手"
 repository = "https://github.com/junkaih2019/gxnu-campus-net-helper"
@@ -38,6 +38,12 @@ muda = "0.21.2"
 notify-rust = "4.19.0"
 winreg = "0.56.0"
 eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts"] }
+
+[dev-dependencies]
+md5 = "0.8"
+scraper = { version = "0.24", default-features = false }
+ureq = { version = "2", features = ["cookies"] }
+url = "2"
 
 [profile.release]
 opt-level = "z"
