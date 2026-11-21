@@ -231,39 +231,38 @@ pub fn draw_settings_view(
     let nav_w = 166.0_f32.min((total_w * 0.28).max(138.0));
     let content_w = (total_w - nav_w - 1.0).max(300.0);
     let dirty = form.is_dirty(saved);
+    // 左右栏共享同一底部高度，确保左右两条水平分割线严格像素级齐平
+    let footer_bar_h = 51.0_f32;
+    let upper_h = (total_height - footer_bar_h).max(200.0);
 
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
 
-        // ── 左侧分组目录（显式 top_down 容器，避免继承外层 horizontal_top 导致底部文字横向溢出） ──
+        // ── 左侧分组目录（上部导航 + 与右侧严格齐平的 51px 底部版本栏） ──
         ui.allocate_ui_with_layout(
             Vec2::new(nav_w, total_height),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
-                egui::Frame::new()
-                    .fill(p.sidebar)
-                    .inner_margin(egui::Margin {
-                        left: 10,
-                        right: 10,
-                        top: 12,
-                        bottom: 12,
-                    })
-                    .show(ui, |ui| {
-                        ui.spacing_mut().item_spacing.y = 0.0;
-                        let inner_w = (nav_w - 20.0).max(118.0);
-                        let inner_h = (total_height - 24.0).max(260.0);
-                        ui.set_min_size(Vec2::new(inner_w, inner_h));
-                        ui.set_max_size(Vec2::new(inner_w, inner_h));
 
-                        let footer_h = 44.0_f32;
-                        let top_h = (inner_h - footer_h).max(120.0);
-
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(inner_w, top_h),
-                            egui::Layout::top_down(egui::Align::LEFT),
-                            |ui| {
-                                ui.set_min_size(Vec2::new(inner_w, top_h));
+                // 上部导航目录
+                ui.allocate_ui_with_layout(
+                    Vec2::new(nav_w, upper_h),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        egui::Frame::new()
+                            .fill(p.sidebar)
+                            .inner_margin(egui::Margin {
+                                left: 10,
+                                right: 10,
+                                top: 12,
+                                bottom: 10,
+                            })
+                            .show(ui, |ui| {
+                                let inner_w = (nav_w - 20.0).max(118.0);
+                                let inner_h = (upper_h - 22.0).max(160.0);
+                                ui.set_min_size(Vec2::new(inner_w, inner_h));
+                                ui.set_max_size(Vec2::new(inner_w, inner_h));
                                 ui.spacing_mut().item_spacing.y = 3.0;
                                 if nav_rail_item(
                                     ui,
@@ -301,23 +300,46 @@ pub fn draw_settings_view(
                                 ) {
                                     form.tab = SettingsTab::Notify;
                                 }
+                            });
+                    },
+                );
+
+                // 左侧底部 1px 水平分割线（与右侧底部栏顶线精确处于同一 y 坐标）
+                let left_top_line = ui.allocate_space(Vec2::new(nav_w, 1.0)).1;
+                ui.painter().line_segment(
+                    [left_top_line.left_center(), left_top_line.right_center()],
+                    Stroke::new(1.0_f32, p.border),
+                );
+
+                // 左侧 50px 底部品牌与版本区
+                egui::Frame::new()
+                    .fill(p.sidebar)
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .show(ui, |ui| {
+                        let foot_w = (nav_w - 24.0).max(114.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(foot_w, 30.0),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.add(
+                                    egui::Label::new(bold_text(
+                                        crate::APP_NAME,
+                                        10.5,
+                                        p.text_secondary,
+                                    ))
+                                    .truncate(),
+                                );
+                                ui.add(
+                                    egui::Label::new(body_text(
+                                        format!("v{} · 关窗即释内存", env!("CARGO_PKG_VERSION")),
+                                        10.0,
+                                        p.text_muted,
+                                    ))
+                                    .truncate(),
+                                );
                             },
                         );
-
-                        // 左侧栏底部版本与架构提示
-                        let sep = ui.allocate_space(Vec2::new(inner_w, 1.0)).1;
-                        ui.painter().line_segment(
-                            [sep.left_center(), sep.right_center()],
-                            Stroke::new(1.0_f32, p.divider),
-                        );
-                        ui.add_space(7.0);
-                        ui.label(bold_text(
-                            format!("GXNU Guard v{}", env!("CARGO_PKG_VERSION")),
-                            10.5,
-                            p.text_secondary,
-                        ));
-                        ui.add_space(2.0);
-                        ui.label(body_text("关闭窗口即释放界面内存", 10.0, p.text_muted));
                     });
             },
         );
@@ -330,8 +352,7 @@ pub fn draw_settings_view(
         );
 
         // ── 右侧内容区 + 底部常驻操作栏 ──────────────────────────────
-        let footer_bar_h = 51.0_f32;
-        let scroll_h = (total_height - footer_bar_h).max(200.0);
+        let scroll_h = upper_h;
 
         ui.allocate_ui_with_layout(
             Vec2::new(content_w, total_height),
@@ -518,7 +539,7 @@ fn draw_account_page(
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if form.editing_account_id.is_none() && !saved.accounts.is_empty() {
                         badge(ui, p.accent, p.accent_soft, p.accent_border, "正在新增账号");
-                    } else if draw_compact_action_btn(ui, p, Some(Icon::Plus), "新增账号", false)
+                    } else if draw_compact_action_btn(ui, p, Some(Icon::Plus), "新增账号", true)
                         .clicked()
                     {
                         form.start_new_account();
