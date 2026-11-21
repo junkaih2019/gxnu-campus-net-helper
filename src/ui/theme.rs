@@ -42,8 +42,9 @@ pub const MIN_UI_ZOOM: f32 = 0.75;
 pub const MAX_UI_ZOOM: f32 = 1.25;
 pub const DEFAULT_WINDOW_SIZE: [f32; 2] = [840.0, 610.0];
 pub const MIN_WINDOW_SIZE: [f32; 2] = [620.0, 460.0];
-pub const DEFAULT_TRAFFIC_SPLIT: f32 = 0.51;
+pub const DEFAULT_TRAFFIC_SPLIT: f32 = 0.50;
 pub const DEFAULT_WIDE_SPLIT: f32 = 0.515;
+pub const CURRENT_LAYOUT_VERSION: u32 = 2;
 
 fn default_ui_zoom() -> f32 {
     1.0
@@ -63,6 +64,8 @@ fn default_wide_split() -> f32 {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UiPrefs {
+    #[serde(default)]
+    pub layout_version: u32,
     #[serde(default = "detect_windows_theme")]
     pub theme: ThemeMode,
     #[serde(default = "default_ui_zoom")]
@@ -82,6 +85,7 @@ pub struct UiPrefs {
 impl Default for UiPrefs {
     fn default() -> Self {
         Self {
+            layout_version: CURRENT_LAYOUT_VERSION,
             theme: detect_windows_theme(),
             zoom: 1.0,
             show_home_traffic: true,
@@ -95,6 +99,12 @@ impl Default for UiPrefs {
 
 impl UiPrefs {
     pub fn normalized(mut self) -> Self {
+        // v0.2.0 升级到 v0.2.1 时重置旧版 62:38 分栏与旧高度，自动启用对称 50:50 默认布局
+        if self.layout_version < CURRENT_LAYOUT_VERSION {
+            self.layout_version = CURRENT_LAYOUT_VERSION;
+            self.home_traffic_split = DEFAULT_TRAFFIC_SPLIT;
+            self.home_mid_height = None;
+        }
         self.zoom = clamp_ui_zoom(self.zoom);
         self.window_size = self.window_size.and_then(|[w, h]| {
             if w.is_finite() && h.is_finite() {
@@ -774,6 +784,7 @@ mod tests {
         assert!((legacy.home_wide_split - DEFAULT_WIDE_SPLIT).abs() < f32::EPSILON);
 
         let wild = UiPrefs {
+            layout_version: CURRENT_LAYOUT_VERSION,
             theme: ThemeMode::Light,
             zoom: 2.8,
             show_home_traffic: false,
@@ -783,11 +794,21 @@ mod tests {
             home_wide_split: 0.1,
         }
         .normalized();
+        assert_eq!(wild.layout_version, CURRENT_LAYOUT_VERSION);
         assert!((wild.zoom - MAX_UI_ZOOM).abs() < f32::EPSILON);
         assert_eq!(wild.window_size, Some(MIN_WINDOW_SIZE));
         assert_eq!(wild.home_mid_height, Some(136.0));
         assert!((wild.home_traffic_split - 0.64).abs() < f32::EPSILON);
         assert!((wild.home_wide_split - 0.38).abs() < f32::EPSILON);
+
+        let migrated = serde_json::from_str::<UiPrefs>(
+            r#"{"theme":"dark","home_traffic_split":0.62,"home_mid_height":210.0}"#,
+        )
+        .unwrap()
+        .normalized();
+        assert_eq!(migrated.layout_version, CURRENT_LAYOUT_VERSION);
+        assert!((migrated.home_traffic_split - 0.50).abs() < f32::EPSILON);
+        assert!(migrated.home_mid_height.is_none());
 
         let low = clamp_ui_zoom(0.2);
         assert!((low - MIN_UI_ZOOM).abs() < f32::EPSILON);

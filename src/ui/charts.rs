@@ -556,9 +556,9 @@ fn draw_traffic_info_column(
     note_secondary: &str,
     note_tooltip: Option<&str>,
 ) {
-    // 严格 80px 高度（19 + 2 + 19 + 5 + 1 + 5 + 14.5 + 14.5 = 80.0），与左圆环垂直居中对齐
+    // 严格 78px 高度（18 + 2 + 18 + 4 + 1 + 4 + 15.5 + 15.5 = 78.0），杜绝字体行高溢出撑高左卡
     ui.allocate_ui_with_layout(
-        Vec2::new(width, 80.0),
+        Vec2::new(width, 78.0),
         egui::Layout::top_down(egui::Align::LEFT),
         |ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
@@ -566,39 +566,18 @@ fn draw_traffic_info_column(
             draw_ring_metric_row(ui, p, width, row1.0, row1.1, row1.2, row1.3.as_deref());
             ui.add_space(2.0);
             draw_ring_metric_row(ui, p, width, row2.0, row2.1, row2.2, row2.3.as_deref());
-            ui.add_space(5.0);
+            ui.add_space(4.0);
 
             let sep = ui.allocate_space(Vec2::new(width, 1.0)).1;
             ui.painter().line_segment(
                 [sep.left_center(), sep.right_center()],
                 Stroke::new(1.0_f32, p.divider),
             );
-            ui.add_space(5.0);
+            ui.add_space(4.0);
 
-            let resp1 = ui
-                .allocate_ui_with_layout(
-                    Vec2::new(width, 14.5),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.add(
-                            egui::Label::new(body_text(note_primary, 10.2, p.text_secondary))
-                                .truncate(),
-                        )
-                    },
-                )
-                .inner;
-            let resp2 = ui
-                .allocate_ui_with_layout(
-                    Vec2::new(width, 14.5),
-                    egui::Layout::left_to_right(egui::Align::Center),
-                    |ui| {
-                        ui.add(
-                            egui::Label::new(body_text(note_secondary, 9.8, p.text_muted))
-                                .truncate(),
-                        )
-                    },
-                )
-                .inner;
+            let resp1 =
+                paint_clipped_note_line(ui, width, 15.5, note_primary, 10.2, p.text_secondary);
+            let resp2 = paint_clipped_note_line(ui, width, 15.5, note_secondary, 9.8, p.text_muted);
             if let Some(tip) = note_tooltip {
                 let full_tip = format!("{note_primary}\n{note_secondary}\n{tip}");
                 resp1.on_hover_text(&full_tip);
@@ -606,6 +585,27 @@ fn draw_traffic_info_column(
             }
         },
     );
+}
+
+fn paint_clipped_note_line(
+    ui: &mut egui::Ui,
+    width: f32,
+    height: f32,
+    text: &str,
+    size: f32,
+    color: Color32,
+) -> egui::Response {
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
+    let g = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), egui::FontId::proportional(size), color);
+    let painter = ui.painter().with_clip_rect(rect);
+    painter.galley(
+        Pos2::new(rect.left(), rect.center().y - g.size().y * 0.5),
+        g,
+        color,
+    );
+    resp
 }
 
 fn draw_ring_metric_row(
@@ -617,29 +617,45 @@ fn draw_ring_metric_row(
     value: &str,
     suffix: Option<&str>,
 ) {
-    ui.allocate_ui_with_layout(
-        Vec2::new(width, 19.0),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 5.0;
-            let (dr, _) = ui.allocate_exact_size(Vec2::splat(7.0), Sense::hover());
-            ui.painter().circle_filled(dr.center(), 3.2, dot_color);
-            ui.label(body_text(label, 11.0, p.text_secondary));
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(width, 18.0), Sense::hover());
+    let cy = rect.center().y;
+    let painter = ui.painter();
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.spacing_mut().item_spacing.x = 5.0;
-                if let Some(suf) = suffix {
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(32.0, 19.0),
-                        egui::Layout::right_to_left(egui::Align::Center),
-                        |ui| {
-                            ui.label(body_text(suf, 10.0, p.text_muted));
-                        },
-                    );
-                }
-                ui.label(bold_text(value, 12.0, p.text));
-            });
-        },
+    painter.circle_filled(Pos2::new(rect.left() + 3.5, cy), 3.2, dot_color);
+    let lbl_g = painter.layout_no_wrap(
+        label.to_string(),
+        egui::FontId::proportional(11.0),
+        p.text_secondary,
+    );
+    painter.galley(
+        Pos2::new(rect.left() + 12.0, cy - lbl_g.size().y * 0.5),
+        lbl_g,
+        p.text_secondary,
+    );
+
+    let mut right_x = rect.right();
+    if let Some(suf) = suffix {
+        let suf_g = painter.layout_no_wrap(
+            suf.to_string(),
+            egui::FontId::proportional(10.0),
+            p.text_muted,
+        );
+        painter.galley(
+            Pos2::new(right_x - suf_g.size().x, cy - suf_g.size().y * 0.5),
+            suf_g,
+            p.text_muted,
+        );
+        right_x -= 37.0;
+    }
+    let val_g = painter.layout_no_wrap(
+        value.to_string(),
+        egui::FontId::new(12.0, crate::ui::theme::bold_family()),
+        p.text,
+    );
+    painter.galley(
+        Pos2::new(right_x - val_g.size().x, cy - val_g.size().y * 0.5),
+        val_g,
+        p.text,
     );
 }
 
