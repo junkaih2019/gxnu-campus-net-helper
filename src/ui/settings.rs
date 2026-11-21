@@ -243,6 +243,8 @@ pub fn draw_settings_view(
             Vec2::new(nav_w, total_height),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
+                ui.painter()
+                    .rect_filled(ui.max_rect(), CornerRadius::ZERO, p.sidebar);
                 ui.spacing_mut().item_spacing.y = 0.0;
 
                 // 上部导航目录
@@ -317,6 +319,8 @@ pub fn draw_settings_view(
                     .inner_margin(egui::Margin::symmetric(12, 10))
                     .show(ui, |ui| {
                         let foot_w = (nav_w - 24.0).max(114.0);
+                        ui.set_min_size(Vec2::new(foot_w, 30.0));
+                        ui.set_max_size(Vec2::new(foot_w, 30.0));
                         ui.allocate_ui_with_layout(
                             Vec2::new(foot_w, 30.0),
                             egui::Layout::top_down(egui::Align::LEFT),
@@ -332,7 +336,7 @@ pub fn draw_settings_view(
                                 );
                                 ui.add(
                                     egui::Label::new(body_text(
-                                        format!("v{} · 关窗即释内存", env!("CARGO_PKG_VERSION")),
+                                        format!("v{}", env!("CARGO_PKG_VERSION")),
                                         10.0,
                                         p.text_muted,
                                     ))
@@ -621,9 +625,27 @@ fn draw_account_page(
         let col_gap = 12.0_f32;
         let col_w = ((full_w - col_gap) * 0.5).floor().max(140.0);
 
-        // 第一行：备注名称 | 校园网学号
+        // 第一行：校园网学号（左，与下方登录密码上下对齐） | 备注名称（右）
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = col_gap;
+            ui.allocate_ui_with_layout(
+                Vec2::new(col_w, 52.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.label(body_text("校园网学号", 11.5, p.text_secondary));
+                    ui.add_space(4.0);
+                    styled_text_box(
+                        ui,
+                        p,
+                        col_w,
+                        &mut form.student_id,
+                        "输入校园网学号",
+                        false,
+                        None,
+                    );
+                },
+            );
+
             ui.allocate_ui_with_layout(
                 Vec2::new(col_w, 52.0),
                 egui::Layout::top_down(egui::Align::LEFT),
@@ -640,24 +662,6 @@ fn draw_account_page(
                         col_w,
                         &mut form.remark,
                         "如：宿舍联通、实验室电信",
-                        false,
-                        None,
-                    );
-                },
-            );
-
-            ui.allocate_ui_with_layout(
-                Vec2::new(col_w, 52.0),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-                    ui.label(body_text("校园网学号", 11.5, p.text_secondary));
-                    ui.add_space(4.0);
-                    styled_text_box(
-                        ui,
-                        p,
-                        col_w,
-                        &mut form.student_id,
-                        "输入校园网学号",
                         false,
                         None,
                     );
