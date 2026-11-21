@@ -1,62 +1,86 @@
-# GXNU 校园网守护助手
+<p align="center">
+  <img src="docs/images/app-icon.png" width="96" height="96" alt="GXNU 校园网守护助手图标">
+</p>
+<h1 align="center">GXNU 校园网守护助手</h1>
+<p align="center">广西师范大学校园网的 Windows 托盘工具。自动重连，查看延迟，追踪断网原因。</p>
+<p align="center"><strong>简体中文</strong> · <a href="README.en.md" lang="en">English</a></p>
+<p align="center">
+  <a href="https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest"><strong>下载 Windows x64 版</strong></a>
+  &nbsp;·&nbsp; <a href="CHANGELOG.md">更新记录</a>
+  &nbsp;·&nbsp; <a href="LICENSE"><img src="docs/images/license-mit.svg" alt="MIT 许可证" align="absmiddle"></a>
+</p>
 
-面向广西师范大学校园网的 Windows 托盘应用。断线后先检查本机网络和校园网会话，再决定是否重新登录。主窗口可查看门户延迟曲线、最近的断网记录和诊断日志。
+## 能帮你做什么
 
-[下载 Windows x64 版](https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest) · [配置与常见问题](docs/CONFIGURATION.md) · [更新记录](CHANGELOG.md)
+- **掉线后自动重连。** 助手检查网卡、路由、公网连通性和校园网门户会话。确认需要认证时，使用已保存的账号登录，再次访问公网以确认恢复。你可以开启 Windows 通知，及时看到断网和恢复提醒。
+- **回看什么时候断过网。** 主窗口可切换最近 **1、7 或 24 小时**的门户响应延迟曲线。通断时间轴和断网记录显示异常发生的时刻，运行日志可按时间、级别或关键词筛选。
+- **从托盘掌控监控。** 右键托盘图标即可立即检测、暂停或恢复监控、打开日志。关闭主窗口后，后台守护继续工作；再次单击托盘图标即可查看详情。
 
-## 界面预览
+## 为什么适合校园网
 
-主窗口展示最近 24 小时的校园网延迟、断网记录和运行日志。图中的账号 `DEMO`、曲线和日志均为演示数据。
+| 遇到的情况 | 助手如何处理 |
+| --- | --- |
+| 从 Wi-Fi 切换到有线，或电脑刚从睡眠恢复 | 先等网络出口稳定再复查，给系统重新取得路由的时间，减少切网时的误报和重复登录。 |
+| 校园网账号仍在线，但网页打不开 | 对照公网探测和门户会话状态。门户确认在线时，标记公网出口异常并等待恢复，避免反复提交密码。 |
+| 密码或运营商选错，登录持续被拒 | 首次被拒后静默重试，连续被拒才提醒核对账号。重试间隔逐步延长，最长为 5 分钟。 |
+| 只想检查当前连接 | 暂停监控后点击 **立即检测**，助手只读检查一次，监控保持暂停。 |
 
-![v0.1.1 主窗口，左侧是账号设置，右侧是延迟曲线、两次断网记录和运行日志](docs/images/main-window.png)
+## 安装与使用
 
-右键点击托盘图标可查看守护状态、立即检测或切换监控开关。图中监控已暂停。
+1. 从页首下载链接进入 Releases，下载 Windows x64 的 ZIP 发行包，解压到固定目录，双击 `GXNU 校园网守护助手.exe`。
+2. 在 **账号与网络** 中填写自己的校园网学号和密码，选择运营商，点击 **保存并开始守护**。
+3. 需要随 Windows 登录启动时，在 **监控** 设置中开启 **开机自动启动到托盘**。如果还希望每次启动后自动开始巡检，同时开启 **启动后立即开始监控**。
 
-<img src="docs/images/tray-menu.png" alt="v0.1.1 托盘菜单，监控已暂停，可选择立即检测或开始监控" width="256">
+要完全退出，右键托盘图标，选择 **退出 GXNU 校园网守护助手**。
 
-## 开始使用
+<details>
+<summary>从 v0.1.0 升级或校验下载文件</summary>
 
-1. 在 Releases 下载 `gxnu-campus-net-helper-0.1.1-windows-x64.zip`，解压到固定目录，运行 `GXNU 校园网守护助手.exe`。
-2. 在账号页填写自己的校园网学号、运营商和密码，点击 **保存并开始守护**。
-3. 关闭主窗口后，守护进程继续在托盘运行。单击托盘图标可以重新打开界面，右键选择 **退出 GXNU 校园网守护助手** 可完全退出。需要随 Windows 启动时，在监控设置中开启 **开机自动启动到托盘**。
+从 v0.1.0 升级时，先从托盘退出旧版，再运行新 EXE。原先开了自启的用户，可在新 EXE 所在目录执行以下 PowerShell 命令更新自启路径。
 
-从 v0.1.0 升级时，请先从托盘退出旧版，再运行新 EXE。如果原先开启了开机自启，在新程序所在目录运行 `& ".\GXNU 校园网守护助手.exe" --autostart on`，将自启路径更新到新文件。
+```powershell
+& ".\GXNU 校园网守护助手.exe" --autostart on
+```
 
-每个二进制发行包附 SHA-256 校验文件。可以在下载目录运行以下命令，对照校验文件中的值。
+Release 附有 `.sha256` 校验文件。以下命令以 v0.1.1 为例，输出应与同版本校验文件中的哈希值一致。
 
 ```powershell
 Get-FileHash .\gxnu-campus-net-helper-0.1.1-windows-x64.zip -Algorithm SHA256
 ```
 
-## 掉线时会发生什么
+</details>
 
-| 检测结果 | 守护行为 |
-| --- | --- |
-| 从 Wi-Fi 切到有线，或电脑刚从睡眠恢复 | 等出口稳定后复查，短暂切换不会触发登录。 |
-| 校园网会话仍在线，但公网探测失败 | 显示出口或上游故障，等待网络恢复。 |
-| 门户报告离线，或检测到认证重定向 | 复核后尝试登录，再次探测公网以确认恢复。 |
-| 门户连续拒绝登录 | 提示核对账号和运营商，逐步延长重试间隔，最长 5 分钟。 |
-| 监控已暂停时点击「立即检测」 | 执行一次只读诊断。 |
+## 界面预览
 
-界面提供最近 1、7 或 24 小时的门户延迟和断网记录。探测和认证使用直连请求。完整判定条件见[网络诊断与状态机](docs/ARCHITECTURE.md)。
+**主窗口** · 同一屏查看账号设置、门户延迟、断网原因和运行日志。下图的 `DEMO` 账号和网络记录均为演示数据。
 
-## 常用命令
+![主窗口展示 24 小时的门户延迟曲线、两次断网记录和运行日志](docs/images/main-window.png)
 
-| PowerShell 命令 | 用途 |
-| --- | --- |
-| `& ".\GXNU 校园网守护助手.exe" --once` | 只读检测。退出码 0 表示在线，2 表示离线，3 表示连续采样时出口发生变化。 |
-| `& ".\GXNU 校园网守护助手.exe" --minimized` | 启动后驻留托盘。 |
-| `& ".\GXNU 校园网守护助手.exe" --minimized --start` | 在后台开始或恢复监控。 |
-| `& ".\GXNU 校园网守护助手.exe" --test-toast` | 发送测试系统通知。 |
-| `& ".\GXNU 校园网守护助手.exe" --autostart status` | 查询开机自启状态。 |
+**托盘菜单** · 菜单顶部显示当前状态。下图中监控已暂停，仍可执行一次检测。
+
+<img src="docs/images/tray-menu.png" alt="暂停状态的托盘菜单，含立即检测、开始监控和退出操作" width="256">
 
 ## 数据与隐私
 
-密码保存在当前用户的 Windows 凭据管理器中。学号和偏好写入 `%LOCALAPPDATA%\GXNUCampusLogin\config.json`，同目录还保存日志、界面偏好和最近的网络记录。提交问题时请只摘录相关日志，并遮盖设备和网络信息。[文件与配置字段](docs/CONFIGURATION.md)
+密码保存在当前 Windows 用户的凭据管理器中。学号与设置保存在 `%LOCALAPPDATA%\GXNUCampusLogin\config.json`，日志和近期网络记录也在该应用目录下。反馈问题时，请只摘录相关日志，并遮盖学号、设备名、IP 和个人目录。[配置与常见问题](docs/CONFIGURATION.md)
 
-## 从源码构建
+## 命令行与源码构建
 
-在 Windows x64 上安装 Rust 和 MinGW-w64。将 `gcc`、`dlltool`、`windres` 所在目录加入 PATH，在仓库根目录运行以下命令。
+在 EXE 所在目录打开 PowerShell。常用参数如下。
+
+| 参数 | 用途 |
+| --- | --- |
+| `--once` | 只读检测。退出码 0 表示在线，2 表示离线，3 表示连续采样时出口发生变化。 |
+| `--minimized` / `--minimized --start` | 驻留托盘；加上 `--start` 可在后台开始或恢复监控。 |
+| `--test-toast` | 发送一条测试系统通知。 |
+| `--autostart status` | 查询开机自启状态。 |
+
+例如，运行 `& ".\GXNU 校园网守护助手.exe" --once` 可做一次只读诊断。
+
+<details>
+<summary>在 Windows x64 上构建发行版</summary>
+
+安装 Rust 和 MinGW-w64，将 `gcc`、`dlltool`、`windres` 所在目录加入 PATH，在仓库根目录运行以下命令。
 
 ```powershell
 rustup toolchain install stable-x86_64-pc-windows-gnu --component rustfmt --component clippy
@@ -65,6 +89,8 @@ rustup override set stable-x86_64-pc-windows-gnu
 .\build.ps1 release
 ```
 
-`verify` 执行格式检查、Clippy、全量测试和 Release 构建，`release` 输出发行文件 `target\release\GXNU 校园网守护助手.exe`。参与开发可参考[贡献指南](CONTRIBUTING.md)，安全问题请参阅[私下报告方式](SECURITY.md)。
+`verify` 执行格式检查、Clippy、测试和 Release 构建。`release` 输出 `target\release\GXNU 校园网守护助手.exe`。
 
-本项目使用 [MIT 许可证](LICENSE)。
+</details>
+
+[架构与诊断策略](docs/ARCHITECTURE.md) · [参与贡献](CONTRIBUTING.md) · [安全问题报告](SECURITY.md) · [MIT 许可证](LICENSE)
