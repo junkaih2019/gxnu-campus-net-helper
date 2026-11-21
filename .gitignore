@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+*.pdb
+
+# Compiled binaries & installers
+*.exe
+*.dll
+*.msi
+
+# Runtime logs & local state
+*.log
+*.log.*
+*.jsonl
+config.json
+.env
+.env.local
+daemon.json
+ui_prefs.json
+
+# IDE & OS clutter
+.idea/
+.vscode/
+*.swp
+*.swo
+Thumbs.db
+Desktop.ini
+.DS_Store

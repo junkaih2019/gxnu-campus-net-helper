@@ -1,0 +1,747 @@
+//! GXNU 校园网守护（轻守护 + 按需界面双模式单文件架构）。
+//!
+//! - **守护模式（默认 / `--minimized`）**：纯 Win32 托盘 + 后台网络监控，不加载 OpenGL 与中文字库，
+//!   常驻内存仅约 5–10 MB、后台 CPU 0%。
+//! - **界面模式（`--ui`）**：点击托盘图标或双击程序时按需拉起完整图形界面；关闭窗口即退出界面进程，
+//!   立即 100% 释放 OpenGL 驱动与字体内存。
+
+// release 版不弹控制台窗口（debug 版保留，方便看输出）
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![allow(dead_code)]
+
+mod app_icon;
+mod authenticator;
+mod campus_status;
+mod config;
+mod credentials;
+mod diagnostics;
+mod http;
+mod ipc;
+mod logging;
+mod metrics_store;
+mod models;
+mod monitor;
+mod network_events;
+mod notify;
+mod single_instance;
+mod startup;
+mod tray;
+mod tray_menu;
+mod ui;
+
+use std::path::{Path, PathBuf};
+use std::process::{Child, ExitCode};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use chrono::Local;
+use eframe::egui;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+/// 守护进程和设置界面使用的 Windows 凭据目标。
+const CREDENTIAL_TARGET: &str = "GXNUCampusLogin/v4";
+/// 守护进程单实例互斥体。
+const MUTEX_NAME: &str = "Local\\GXNUCampusLoginRS";
+/// 按需界面进程单实例互斥体，确保同时只有一个主窗口。
+const UI_MUTEX_NAME: &str = "Local\\GXNUCampusLoginRS_UI";
+const APP_WINDOW_TITLE: &str = "GXNU 校园网守护";
+
+const WM_TRAY_REFRESH: u32 = 0x8000 + 1;
+const WM_DAEMON_QUIT: u32 = 0x8000 + 2;
+const WM_TRAY_SHOW_MENU: u32 = 0x8000 + 3;
+
+fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // ── 模式 1：按需拉起的图形界面子进程（关闭即彻底释放 OpenGL 与字库内存）────
+    if args.iter().any(|arg| arg == "--ui") {
+        return run_ui_process(&args);
+    }
+
+    let once = args.iter().any(|arg| arg == "--once");
+    let test_toast = args.iter().any(|arg| arg == "--test-toast");
+    let force_start = args.iter().any(|arg| arg == "--start");
+    let minimized = args.iter().any(|arg| arg == "--minimized");
+
+    let store = config::SettingsStore::new();
+    if let Err(err) = std::fs::create_dir_all(&store.app_dir) {
+        eprintln!("无法创建应用目录 {}：{err}", store.app_dir.display());
+        return ExitCode::FAILURE;
+    }
+
+    if test_toast {
+        let _ = logging::init(&store.app_dir.join("logs"), false);
+        startup::ensure_app_id(notify::AUMID);
+        let notifier = notify::ToastNotifier::new(true);
+        notifier.send_test("这是一条测试通知：断网/恢复时也会这样弹出");
+        println!("已请求发送测试通知");
+        return ExitCode::SUCCESS;
+    }
+
+    // --autostart on|off|status：写入/删除 HKCU Run 项并退出。
+    if let Some(index) = args.iter().position(|arg| arg == "--autostart") {
+        let _ = logging::init(&store.app_dir.join("logs"), false);
+        let value = args.get(index + 1).map(String::as_str).unwrap_or("status");
+        let result = match value {
+            "on" => startup::set_enabled(true),
+            "off" => startup::set_enabled(false),
+            _ => {
+                println!(
+                    "autostart = {}",
+                    if startup::is_enabled() { "on" } else { "off" }
+                );
+                return ExitCode::SUCCESS;
+            }
+        };
+        match result {
+            Ok(()) => {
+                logging::info(&format!(
+                    "[STARTUP] 开机自启已{}",
+                    if value == "on" { "开启" } else { "关闭" }
+                ));
+                println!("autostart = {value}");
+                return ExitCode::SUCCESS;
+            }
+            Err(err) => {
+                logging::error(&format!("[STARTUP] 设置自启失败：{err}"));
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    // --once 是只读自检，不占用互斥体，方便与守护实例并存。
+    if once {
+        let _ = logging::init(&store.app_dir.join("logs"), false);
+        logging::info("[SELF_CHECK] 一次性只读检测（不提交凭据）");
+        let diagnostics = diagnostics::NetworkDiagnostics::new()
+            .with_campus_status(campus_status::CampusStatusProbe::new());
+        let Some(result) = diagnostics.check() else {
+            eprintln!("网络出口正在切换，两次只读检测均未取得稳定结果");
+            return ExitCode::from(3);
+        };
+        println!(
+            "online={} reason={} message={}",
+            result.online,
+            result.reason.as_str(),
+            result.message
+        );
+        println!("ip={} gateway={}", result.local_ip, result.gateway);
+        println!("evidence: {}", result.evidence_text());
+        return if result.online {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
+        };
+    }
+
+    // 单实例检查：若守护已在运行，直接通知它拉起/前置主窗口并退出，不再重复启动。
+    let _instance = match single_instance::InstanceGuard::acquire(MUTEX_NAME) {
+        Ok((_guard, true)) => {
+            return match ipc::forward_launch(&store.app_dir, force_start, minimized) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(err) => {
+                    eprintln!("{err}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Ok((guard, false)) => Some(guard),
+        Err(err) => {
+            eprintln!("{err}");
+            None
+        }
+    };
+
+    let log_path = match logging::init(&store.app_dir.join("logs"), true) {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("无法初始化日志：{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    logging::info(&format!(
+        "[APP_STARTED] gxnu-guard(rs) {VERSION} 守护模式启动，日志路径：{}",
+        log_path.display()
+    ));
+    logging::info(
+        "[NET_POLICY] 探测与认证直连（不吃系统代理）；门户说在线则不重复登录；认证首次被拒只静默重试",
+    );
+
+    let mut settings = store.load();
+    settings.auto_boot = startup::is_enabled();
+    if force_start {
+        settings.auto_start_monitoring = true;
+    }
+    startup::ensure_app_id(notify::AUMID);
+    logging::info(&format!(
+        "[CONFIG] 学号={}；运营商={}；检测间隔={}s；复核={}次；离线复检={}s；开机自启={}",
+        mask_id(&settings.student_id),
+        settings.carrier,
+        settings.check_interval,
+        settings.confirm_failures,
+        settings.offline_interval,
+        if settings.auto_boot { "开" } else { "关" }
+    ));
+
+    run_daemon(store, settings, log_path, minimized)
+}
+
+/// ── 模式 2：超轻量常驻守护进程（无 OpenGL、无字库、纯 Win32 托盘消息循环）──
+fn run_daemon(
+    store: config::SettingsStore,
+    settings: models::Settings,
+    log_path: PathBuf,
+    minimized: bool,
+) -> ExitCode {
+    tray_menu::enable_dpi_awareness();
+    let main_tid = current_thread_id();
+    let mut tray = match tray::TrayUi::new() {
+        Ok(tray) => tray,
+        Err(err) => {
+            logging::error(&format!("[TRAY_ERROR] {err}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let notifier = Arc::new(Mutex::new(notify::ToastNotifier::new(
+        settings.notify_toast,
+    )));
+    let metrics_store = Arc::new(metrics_store::MetricsStore::new(&store.app_dir));
+    let latest_snapshot: Arc<Mutex<Option<models::MonitorSnapshot>>> = Arc::new(Mutex::new(None));
+    let online_since_unix: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
+    let last_check_unix: Arc<Mutex<Option<i64>>> = Arc::new(Mutex::new(None));
+    let last_check_seq: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    let ui_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
+
+    let (ipc_server, listener) = match ipc::IpcServer::bind(&store.app_dir) {
+        Ok((server, listener)) => (Arc::new(server), listener),
+        Err(err) => {
+            logging::error(&format!("[IPC_ERROR] {err}"));
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // 实时日志转发到已连接的 --ui 进程
+    let log_rx = logging::subscribe();
+    let ipc_for_logs = Arc::clone(&ipc_server);
+    let _ = std::thread::Builder::new()
+        .name("ipc-log-forwarder".to_string())
+        .spawn(move || {
+            while let Ok(line) = log_rx.recv() {
+                ipc_for_logs.broadcast_log(line);
+            }
+        });
+
+    let credential_provider: monitor::CredentialProvider =
+        Arc::new(move || match credentials::load(CREDENTIAL_TARGET) {
+            Ok(Some(stored)) => Some(stored),
+            Ok(None) => None,
+            Err(err) => {
+                logging::error(&format!("[CREDENTIAL_ERROR] 无法读取 Windows 凭据：{err}"));
+                None
+            }
+        });
+
+    let sink_notifier = Arc::clone(&notifier);
+    let sink_latest = Arc::clone(&latest_snapshot);
+    let sink_online = Arc::clone(&online_since_unix);
+    let sink_last_check = Arc::clone(&last_check_unix);
+    let sink_seq = Arc::clone(&last_check_seq);
+    let sink_ipc = Arc::clone(&ipc_server);
+
+    let sink: monitor::SnapshotSink = Arc::new(move |snapshot| {
+        if let Ok(mut n) = sink_notifier.lock() {
+            n.handle(&snapshot);
+        }
+
+        let now = Local::now().timestamp();
+        let online_ts = if let Ok(mut guard) = sink_online.lock() {
+            match snapshot.state {
+                models::MonitorState::Online => {
+                    if guard.is_none() {
+                        *guard = Some(now);
+                    }
+                }
+                models::MonitorState::Offline
+                | models::MonitorState::Paused
+                | models::MonitorState::Stopped
+                | models::MonitorState::Authenticating => {
+                    *guard = None;
+                }
+                _ => {}
+            }
+            *guard
+        } else {
+            None
+        };
+
+        let check_ts = if let Ok(mut seq) = sink_seq.lock() {
+            if snapshot.metrics.check_seq > *seq {
+                *seq = snapshot.metrics.check_seq;
+                if let Ok(mut ts) = sink_last_check.lock() {
+                    *ts = Some(now);
+                }
+            }
+            sink_last_check.lock().ok().and_then(|g| *g)
+        } else {
+            None
+        };
+
+        if let Ok(mut guard) = sink_latest.lock() {
+            *guard = Some(snapshot.clone());
+        }
+        post_thread_msg(main_tid, WM_TRAY_REFRESH);
+
+        sink_ipc.broadcast_snapshot(ipc::SnapshotEnvelope {
+            snapshot,
+            online_since_unix: online_ts,
+            last_check_unix: check_ts,
+        });
+    });
+
+    let diagnostics = diagnostics::NetworkDiagnostics::new()
+        .with_campus_status(campus_status::CampusStatusProbe::new());
+    let authenticator = authenticator::CampusAuthenticator::new();
+    let mut monitor = monitor::NetworkMonitor::new(
+        diagnostics,
+        authenticator,
+        credential_provider,
+        metrics_store,
+        settings.clone(),
+        sink,
+    );
+    let monitor_ctrl = monitor.control();
+    let action_ctrl = monitor_ctrl.clone();
+    let action_log_path = log_path.clone();
+    let endpoint = ipc_server.endpoint().clone();
+    let child = Arc::clone(&ui_child);
+    let app_dir = store.app_dir.clone();
+    let commands = Arc::new(Mutex::new(DaemonCommands {
+        control: monitor_ctrl.clone(),
+        store,
+        notifier,
+        show_ui: Box::new(move || show_or_spawn_ui(&child, &endpoint)),
+    }));
+    if settings.auto_start_monitoring {
+        if let Err(err) = commands.lock().unwrap().apply(ipc::UiToDaemon::Start) {
+            logging::error(&format!("[MONITOR_ERROR] {err}"));
+            monitor.shutdown();
+            return ExitCode::FAILURE;
+        }
+    } else {
+        logging::info("[MONITOR_PAUSED] 监控处于暂停状态");
+    }
+    let ipc_commands = Arc::clone(&commands);
+    if let Err(err) =
+        ipc_server.listen(listener, move |cmd| ipc_commands.lock().unwrap().apply(cmd))
+    {
+        logging::error(&format!("[IPC_ERROR] {err}"));
+        monitor.shutdown();
+        return ExitCode::FAILURE;
+    }
+
+    let tray_commands = Arc::clone(&commands);
+    let dispatch_tray_action = Arc::new(move |action: tray::TrayAction| {
+        let command = match action {
+            tray::TrayAction::Show => ipc::UiToDaemon::ShowUi,
+            tray::TrayAction::Start => ipc::UiToDaemon::Start,
+            tray::TrayAction::Pause => ipc::UiToDaemon::Pause,
+            tray::TrayAction::Check => ipc::UiToDaemon::ForceCheck,
+            tray::TrayAction::OpenMenu => return post_thread_msg(main_tid, WM_TRAY_SHOW_MENU),
+            tray::TrayAction::OpenLog => return open_path(&action_log_path),
+            tray::TrayAction::Exit => {
+                action_ctrl.signal_stop();
+                return post_thread_msg(main_tid, WM_DAEMON_QUIT);
+            }
+        };
+        if let Err(err) = tray_commands.lock().unwrap().apply(command) {
+            logging::warn(&format!("[COMMAND_FAILED] {err}"));
+        }
+    });
+
+    let menu_cb = Arc::clone(&dispatch_tray_action);
+    let mut fluent_menu =
+        match tray_menu::FluentTrayMenu::new(app_dir, Arc::clone(&latest_snapshot), move |action| {
+            menu_cb(action)
+        }) {
+            Ok(menu) => Some(menu),
+            Err(err) => {
+                logging::error(&format!("[TRAY_MENU_ERROR] {err}"));
+                None
+            }
+        };
+
+    let tray_cb = Arc::clone(&dispatch_tray_action);
+    tray.start_event_listener(move |action| tray_cb(action));
+
+    logging::info("[APP_READY] 轻守护进程已就绪（系统托盘运行中）");
+
+    // 非 --minimized 启动时立即弹出图形界面；关闭窗口后界面进程退出，守护继续留守托盘。
+    if !minimized {
+        if let Err(err) = commands.lock().unwrap().apply(ipc::UiToDaemon::ShowUi) {
+            logging::warn(&format!("[UI_ERROR] {err}"));
+        }
+    }
+
+    trim_working_set_win32();
+
+    // 零 CPU 原生 Win32 消息循环（仅在托盘点击、菜单交互或状态变化时被内核唤醒）
+    run_win32_tray_loop(
+        &mut tray,
+        fluent_menu.as_mut(),
+        &latest_snapshot,
+        &monitor_ctrl,
+    );
+
+    // ── 干净退出流程 ───────────────────────────────────────────────
+    monitor_ctrl.signal_stop();
+    logging::info("[APP_EXIT] 正在退出");
+    ipc_server.broadcast_shutdown();
+    if let Some(menu) = fluent_menu.as_mut() {
+        menu.hide();
+    }
+    drop(fluent_menu);
+    drop(tray);
+    stop_ui_child(&ui_child);
+    monitor.shutdown();
+    ExitCode::SUCCESS
+}
+
+struct DaemonCommands {
+    control: monitor::MonitorControl,
+    store: config::SettingsStore,
+    notifier: Arc<Mutex<notify::ToastNotifier>>,
+    show_ui: Box<dyn Fn() -> Result<(), String> + Send + Sync>,
+}
+
+impl DaemonCommands {
+    fn apply(&self, cmd: ipc::UiToDaemon) -> Result<(), String> {
+        use ipc::UiToDaemon::*;
+        match cmd {
+            Start => {
+                self.control.start()?;
+                logging::info("[MONITOR_STARTED] 用户开始监控");
+            }
+            Pause => {
+                self.control.pause()?;
+                logging::info("[MONITOR_PAUSED] 用户暂停监控");
+            }
+            ForceCheck => {
+                self.control.force_check()?;
+                logging::info("[FORCE_CHECK] 用户要求立即检测");
+            }
+            ReloadSettings {
+                start,
+                password_changed,
+                expected,
+            } => {
+                let settings = self
+                    .store
+                    .load_strict()
+                    .map_err(|e| format!("读取配置失败：{e}"))?;
+                if settings != expected {
+                    return Err("磁盘设置已被其他写入更新，请重新核对后保存".into());
+                }
+                let enabled = settings.notify_toast;
+                self.control.update_settings(settings, password_changed)?;
+                self.notifier.lock().unwrap().set_enabled(enabled);
+                if start {
+                    self.control.start()?;
+                }
+                logging::info("[SETTINGS_SAVED] 守护进程已应用设置");
+            }
+            ShowUi => (self.show_ui)()?,
+            TestToast { body } => self.notifier.lock().unwrap().send_test(&body),
+        }
+        Ok(())
+    }
+}
+
+/// 按需拉起的图形界面进程（关闭即完全退出，释放 OpenGL 驱动与字体内存）。
+fn run_ui_process(args: &[String]) -> ExitCode {
+    let port = parse_arg(args, "--ipc-port").and_then(|s| s.parse::<u16>().ok());
+    let token = parse_arg(args, "--ipc-token");
+
+    let (Some(port), Some(token)) = (port, token) else {
+        eprintln!("缺少 --ipc-port / --ipc-token 参数");
+        return ExitCode::FAILURE;
+    };
+
+    // 确保同时只存在一个界面窗口
+    let _ui_guard = match single_instance::InstanceGuard::acquire(UI_MUTEX_NAME) {
+        Ok((_guard, true)) => {
+            bring_any_ui_window_to_front();
+            return ExitCode::SUCCESS;
+        }
+        Ok((guard, false)) => Some(guard),
+        Err(_) => None,
+    };
+
+    let store = config::SettingsStore::new();
+    let log_path = store.app_dir.join("logs").join("app.log");
+    let mut settings = store.load();
+    settings.auto_boot = startup::is_enabled();
+
+    let (ipc_client, snap_rx, log_rx) = match ipc::IpcClient::connect(port, &token) {
+        Ok(res) => res,
+        Err(err) => {
+            eprintln!("{err}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let initial_telemetry = metrics_store::MetricsStore::history(&store.app_dir);
+    let initial_logs = logging::read_tail(&log_path, 800);
+
+    let deps = ui::GuardDeps {
+        store,
+        settings,
+        ipc: ipc_client,
+        snapshots: snap_rx,
+        logs: log_rx,
+        log_path,
+        initial_logs,
+        initial_telemetry,
+    };
+
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([980.0, 700.0])
+            .with_min_inner_size([840.0, 580.0])
+            .with_decorations(false)
+            .with_title(APP_WINDOW_TITLE)
+            .with_app_id("GXNUCampusLoginRS")
+            .with_icon(window_icon()),
+        ..Default::default()
+    };
+
+    match eframe::run_native(
+        "gxnu-guard",
+        options,
+        Box::new(move |cc| Ok(Box::new(ui::GuardApp::new(cc, deps)))),
+    ) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("窗口启动失败：{err}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn show_or_spawn_ui(
+    ui_child: &Arc<Mutex<Option<Child>>>,
+    endpoint: &ipc::DaemonEndpoint,
+) -> Result<(), String> {
+    let mut guard = ui_child.lock().map_err(|_| "无法访问界面进程状态")?;
+    if let Some(child) = guard.as_mut() {
+        match child.try_wait() {
+            Ok(None) => {
+                // 界面进程仍在运行：直接前置恢复窗口
+                bring_pid_window_to_front(child.id());
+                return Ok(());
+            }
+            _ => {
+                *guard = None;
+            }
+        }
+    }
+
+    let exe = std::env::current_exe().map_err(|e| format!("无法定位程序：{e}"))?;
+    let child = std::process::Command::new(exe)
+        .args([
+            "--ui",
+            "--ipc-port",
+            &endpoint.port.to_string(),
+            "--ipc-token",
+            &endpoint.token,
+        ])
+        .spawn()
+        .map_err(|e| format!("打开主界面失败：{e}"))?;
+    *guard = Some(child);
+    Ok(())
+}
+
+fn stop_ui_child(ui_child: &Arc<Mutex<Option<Child>>>) {
+    let Ok(mut guard) = ui_child.lock() else {
+        return;
+    };
+    let Some(mut child) = guard.take() else {
+        return;
+    };
+    let deadline = std::time::Instant::now() + Duration::from_millis(600);
+    while std::time::Instant::now() < deadline {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn run_win32_tray_loop(
+    tray: &mut tray::TrayUi,
+    mut fluent_menu: Option<&mut tray_menu::FluentTrayMenu>,
+    latest_snapshot: &Arc<Mutex<Option<models::MonitorSnapshot>>>,
+    control: &monitor::MonitorControl,
+) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, GetMessageW, TranslateMessage, MSG,
+    };
+
+    let events = network_events::NetworkEvents::register(current_thread_id());
+    unsafe {
+        let mut msg: MSG = std::mem::zeroed();
+        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            if events.handle(&msg, control) {
+                continue;
+            }
+            if msg.message == WM_TRAY_REFRESH {
+                if let Some(snap) = latest_snapshot.lock().ok().and_then(|g| g.clone()) {
+                    tray.apply(&snap);
+                }
+            } else if msg.message == WM_TRAY_SHOW_MENU {
+                if let Some(menu) = fluent_menu.as_deref_mut() {
+                    menu.show_at_cursor();
+                }
+            } else if msg.message == WM_DAEMON_QUIT {
+                break;
+            } else {
+                TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
+        }
+    }
+}
+
+fn current_thread_id() -> u32 {
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    unsafe { GetCurrentThreadId() }
+}
+
+fn post_thread_msg(tid: u32, msg: u32) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
+    unsafe {
+        PostThreadMessageW(tid, msg, 0, 0);
+    }
+}
+
+fn bring_pid_window_to_front(target_pid: u32) {
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextW, GetWindowThreadProcessId, SetForegroundWindow, ShowWindow,
+        SW_RESTORE, SW_SHOW,
+    };
+
+    struct Search {
+        pid: u32,
+        found: HWND,
+    }
+
+    unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let state = &mut *(lparam as *mut Search);
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid != state.pid {
+            return 1;
+        }
+        let mut buf = [0u16; 128];
+        let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        if len > 0 && String::from_utf16_lossy(&buf[..len as usize]) == APP_WINDOW_TITLE {
+            state.found = hwnd;
+            return 0;
+        }
+        1
+    }
+
+    let mut search = Search {
+        pid: target_pid,
+        found: std::ptr::null_mut(),
+    };
+    unsafe {
+        EnumWindows(Some(enum_cb), (&mut search as *mut Search) as LPARAM);
+        if !search.found.is_null() {
+            ShowWindow(search.found, SW_SHOW);
+            ShowWindow(search.found, SW_RESTORE);
+            SetForegroundWindow(search.found);
+        }
+    }
+}
+
+fn bring_any_ui_window_to_front() {
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetWindowTextW, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+    };
+
+    unsafe extern "system" fn enum_cb(hwnd: HWND, _lparam: LPARAM) -> BOOL {
+        let mut buf = [0u16; 128];
+        let len = GetWindowTextW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        if len > 0 && String::from_utf16_lossy(&buf[..len as usize]) == APP_WINDOW_TITLE {
+            ShowWindow(hwnd, SW_SHOW);
+            ShowWindow(hwnd, SW_RESTORE);
+            SetForegroundWindow(hwnd);
+            return 0;
+        }
+        1
+    }
+
+    unsafe {
+        EnumWindows(Some(enum_cb), 0);
+    }
+}
+
+fn trim_working_set_win32() {
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetProcessWorkingSetSize(
+            hprocess: *mut std::ffi::c_void,
+            dwminimumworkingsetsize: usize,
+            dwmaximumworkingsetsize: usize,
+        ) -> i32;
+    }
+
+    unsafe {
+        let proc = GetCurrentProcess();
+        let _ = SetProcessWorkingSetSize(proc, usize::MAX, usize::MAX);
+    }
+}
+
+fn parse_arg(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|idx| args.get(idx + 1))
+        .cloned()
+}
+
+fn open_path(path: &Path) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let _ = std::process::Command::new("cmd")
+        .args(["/C", "start", "", &path.to_string_lossy()])
+        .creation_flags(CREATE_NO_WINDOW)
+        .spawn();
+}
+
+fn mask_id(student_id: &str) -> String {
+    if student_id.is_empty() {
+        return "(未设置)".to_string();
+    }
+    let head: String = student_id.chars().take(4).collect();
+    format!("{head}***")
+}
+
+/// 柔和圆角矩形 Wi-Fi 品牌图标（与资源管理器 `.exe` 图标、主窗口左上角图标同源）。
+fn window_icon() -> egui::IconData {
+    const SIZE: u32 = 64;
+    let rgba = app_icon::render_icon_rgba(None, SIZE);
+    egui::IconData {
+        rgba,
+        width: SIZE,
+        height: SIZE,
+    }
+}

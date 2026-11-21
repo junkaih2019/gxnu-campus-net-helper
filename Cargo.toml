@@ -1,0 +1,47 @@
+[package]
+name = "gxnu-guard"
+version = "0.1.0"
+edition = "2021"
+description = "GXNU 校园网守护助手"
+repository = "https://github.com/junkaih2019/gxnu-campus-net-helper"
+license = "MIT"
+
+[[bin]]
+name = "gxnu-guard"
+path = "src/main.rs"
+
+[dependencies]
+tempfile = "3"
+getrandom = "0.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ureq = { version = "2", features = ["json", "native-certs"] }
+chrono = "0.4"
+if-addrs = "0.13"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Security_Credentials",
+    "Win32_Security_Cryptography",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_System_Power",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+    "Win32_UI_WindowsAndMessaging",
+] }
+tray-icon = "0.26.1"
+muda = "0.21.2"
+notify-rust = "4.19.0"
+winreg = "0.56.0"
+eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts"] }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
