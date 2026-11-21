@@ -645,7 +645,8 @@ fn draw_ring_metric_row(
             suf_g,
             p.text_muted,
         );
-        right_x -= 37.0;
+        // 固定 44px 百分比列宽，使流量数值列与百分比列各自右对齐且中间保持清爽列间距
+        right_x -= 44.0;
     }
     let val_g = painter.layout_no_wrap(
         value.to_string(),
@@ -940,7 +941,7 @@ fn draw_online_devices_card(
         let at_limit = data.max_online_devices.is_some_and(|m| count >= m as usize);
 
         // 2. 在线终端列表区（默认 58px：1 台舒展双行卡片 / 2 台两行齐平直出 / 3+ 台平滑滚动）
-        let footer_total_h = 22.0_f32;
+        let footer_total_h = 24.0_f32;
         let dev_area_h = (body_h - footer_total_h).max(52.0);
 
         ui.allocate_ui_with_layout(
@@ -1057,31 +1058,61 @@ fn draw_online_devices_card(
             ("认证成功后自动同步当前在线终端".to_string(), p.text_muted)
         };
 
-        ui.allocate_ui_with_layout(
-            Vec2::new(card_w, 14.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    if !data.recent_sessions.is_empty() {
-                        let resp = ui.add(
-                            egui::Label::new(body_text("近期记录", 10.0, p.accent))
-                                .sense(Sense::hover()),
-                        );
-                        resp.on_hover_ui(|ui| {
-                            draw_recent_sessions_full_tooltip(ui, p, data);
-                        });
-                    }
-                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                        ui.add(
-                            egui::Label::new(body_text(&summary_text, 10.0, summary_color))
-                                .truncate(),
-                        )
-                        .on_hover_text(&summary_text);
-                    });
-                });
-            },
+        // 纯 Painter 精确 16px 页脚，杜绝 egui::Label 行高在 100%/125% DPI 下撑高右卡
+        let (foot_rect, foot_resp) =
+            ui.allocate_exact_size(Vec2::new(card_w, 16.0), Sense::hover());
+        let foot_cy = foot_rect.center().y;
+        let mut right_limit = foot_rect.right();
+        if !data.recent_sessions.is_empty() {
+            let link_g = ui.painter().layout_no_wrap(
+                "近期记录".to_string(),
+                egui::FontId::proportional(10.0),
+                p.accent,
+            );
+            let link_rect = Rect::from_min_max(
+                Pos2::new(foot_rect.right() - link_g.size().x - 2.0, foot_rect.top()),
+                foot_rect.max,
+            );
+            let link_resp = ui.interact(
+                link_rect,
+                ui.id().with("recent_sessions_hover"),
+                Sense::hover(),
+            );
+            ui.painter().galley(
+                Pos2::new(
+                    foot_rect.right() - link_g.size().x,
+                    foot_cy - link_g.size().y * 0.5,
+                ),
+                link_g,
+                p.accent,
+            );
+            link_resp.on_hover_ui(|ui| {
+                draw_recent_sessions_full_tooltip(ui, p, data);
+            });
+            right_limit = link_rect.left() - 8.0;
+        }
+        let sum_clip = Rect::from_min_max(
+            foot_rect.min,
+            Pos2::new(right_limit.max(foot_rect.left()), foot_rect.bottom()),
         );
+        let sum_g = ui.painter().layout_no_wrap(
+            summary_text.clone(),
+            egui::FontId::proportional(10.0),
+            summary_color,
+        );
+        ui.painter().with_clip_rect(sum_clip).galley(
+            Pos2::new(foot_rect.left(), foot_cy - sum_g.size().y * 0.5),
+            sum_g,
+            summary_color,
+        );
+        if foot_resp.hovered()
+            && !ui.rect_contains_pointer(Rect::from_min_max(
+                Pos2::new(right_limit, foot_rect.top()),
+                foot_rect.max,
+            ))
+        {
+            foot_resp.on_hover_text(&summary_text);
+        }
     });
 
     refresh_clicked
@@ -1672,9 +1703,9 @@ fn legend_dot_item(ui: &mut egui::Ui, p: &Palette, filled: Option<Color32>, text
     );
 }
 
-/// 纤薄胶囊时间轴：
-/// - 24h = 48 枚细胶囊（30m/枚）、7h = 42 枚（10m/枚）、1h = 30 枚（2m/枚）
-/// - 胶囊高度压缩至 12px，整体仅 30px 高，悬停黄色/红色胶囊即弹出完整断联详情小卡
+/// 精致纤细胶囊时间轴：
+/// - 24h = 96 枚细胶囊（15m/枚）、7h = 84 枚（5m/枚）、1h = 90 枚（40s/枚）
+/// - 竖向修长胶囊比例（约 5.5–6.5px 宽 × 14px 高），悬停黄色/红色胶囊即弹出完整断联详情小卡
 fn draw_capsule_timeline(
     ui: &mut egui::Ui,
     p: &Palette,
@@ -1689,14 +1720,14 @@ fn draw_capsule_timeline(
     let window_start = now - window_secs;
 
     let slot_count: usize = match range {
-        TimeRange::H24 => 48,
-        TimeRange::H7 => 42,
-        TimeRange::H1 => 30,
+        TimeRange::H24 => 96,
+        TimeRange::H7 => 84,
+        TimeRange::H1 => 90,
     };
     let slot_secs = window_secs as f64 / slot_count as f64;
 
     let top_lift = 2.0_f32;
-    let bar_h = 12.0_f32;
+    let bar_h = 14.0_f32;
     let ruler_gap = 3.0_f32;
     let ruler_h = 13.0_f32;
     let total_h = top_lift + bar_h + ruler_gap + ruler_h;
@@ -1709,9 +1740,9 @@ fn draw_capsule_timeline(
     let ruler_top = bar_rect.bottom() + ruler_gap;
     let painter = ui.painter();
 
-    let gap = if total_w < 500.0 { 2.0_f32 } else { 2.8_f32 };
+    let gap = if total_w < 540.0 { 2.0_f32 } else { 2.8_f32 };
     let slot_w = ((total_w - gap * (slot_count as f32 - 1.0)) / slot_count as f32).max(2.0);
-    let pill_r = CornerRadius::same((slot_w * 0.30).clamp(2.0, 3.0).round() as u8);
+    let pill_r = CornerRadius::same((slot_w * 0.45).clamp(2.0, 3.0).round() as u8);
     let online_green = Color32::from_rgb(0x10, 0xB9, 0x81);
 
     struct HoveredSlotInfo {
