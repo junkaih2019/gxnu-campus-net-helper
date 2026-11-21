@@ -571,6 +571,122 @@ pub fn latency_histogram(points: &[&TelemetryPoint]) -> [HistogramBucket; 4] {
     ]
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TrackState {
+    Online,
+    Offline,
+    NoData,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrackSegment {
+    pub start_ts: i64,
+    pub end_ts: i64,
+    pub state: TrackState,
+}
+
+/// 将原始采样点还原为连续健康轨道片段（精确识别休眠/未运行间隙、在线区间与离线区间）。
+pub fn build_health_track(
+    points: &[TelemetryPoint],
+    now: i64,
+    range: TimeRange,
+) -> Vec<TrackSegment> {
+    let window_start = now - range.secs();
+    if now <= window_start {
+        return Vec::new();
+    }
+    let gap_secs: i64 = match range {
+        TimeRange::H1 => 8 * 60,
+        TimeRange::H7 => 18 * 60,
+        TimeRange::H24 => 30 * 60,
+    };
+
+    let mut in_window: Vec<&TelemetryPoint> = points
+        .iter()
+        .filter(|p| p.ts >= window_start && p.ts <= now + 5)
+        .collect();
+    in_window.sort_by_key(|p| p.ts);
+
+    let prior = points
+        .iter()
+        .filter(|p| p.ts < window_start && window_start - p.ts <= gap_secs)
+        .max_by_key(|p| p.ts);
+
+    let mut raw: Vec<TrackSegment> = Vec::new();
+    let mut push_seg = |start_ts: i64, end_ts: i64, state: TrackState| {
+        let s = start_ts.clamp(window_start, now);
+        let e = end_ts.clamp(window_start, now);
+        if e <= s {
+            return;
+        }
+        if let Some(last) = raw.last_mut() {
+            if last.state == state && last.end_ts >= s {
+                last.end_ts = last.end_ts.max(e);
+                return;
+            }
+        }
+        raw.push(TrackSegment {
+            start_ts: s,
+            end_ts: e,
+            state,
+        });
+    };
+
+    let state_of = |p: &TelemetryPoint| {
+        if p.online {
+            TrackState::Online
+        } else {
+            TrackState::Offline
+        }
+    };
+
+    if in_window.is_empty() {
+        if let Some(prev) = prior {
+            if now - prev.ts <= gap_secs {
+                push_seg(window_start, now, state_of(prev));
+            } else {
+                push_seg(window_start, now, TrackState::NoData);
+            }
+        } else {
+            push_seg(window_start, now, TrackState::NoData);
+        }
+        return raw;
+    }
+
+    let first = in_window[0];
+    if let Some(prev) = prior {
+        if first.ts - prev.ts <= gap_secs {
+            push_seg(window_start, first.ts, state_of(prev));
+        } else {
+            push_seg(window_start, first.ts, TrackState::NoData);
+        }
+    } else if first.ts > window_start {
+        push_seg(window_start, first.ts, TrackState::NoData);
+    }
+
+    for pair in in_window.windows(2) {
+        let a = pair[0];
+        let b = pair[1];
+        if b.ts <= a.ts {
+            continue;
+        }
+        if b.ts - a.ts <= gap_secs {
+            push_seg(a.ts, b.ts, state_of(a));
+        } else {
+            push_seg(a.ts, b.ts, TrackState::NoData);
+        }
+    }
+
+    let last = *in_window.last().unwrap();
+    if now - last.ts <= gap_secs {
+        push_seg(last.ts, now, state_of(last));
+    } else {
+        push_seg(last.ts, now, TrackState::NoData);
+    }
+
+    raw
+}
+
 /// 将指定时间窗口划分为 `slot_count` 个等距槽，用于绘制 Uptime 状态时间轴色带。
 pub fn uptime_timeline(
     points: &[&TelemetryPoint],
@@ -808,5 +924,29 @@ mod tests {
             summary.reason_counts(),
             vec![("AUTH_EXPIRED", 2), ("GATEWAY_UNREACHABLE", 1)]
         );
+    }
+
+    #[test]
+    fn health_track_distinguishes_sleep_gaps_online_and_offline_spans() {
+        let now = 100_000;
+        let window_start = now - TimeRange::H24.secs();
+        let points = [
+            // 休眠 10 小时后才启动
+            TelemetryPoint::check(window_start + 10 * 3600, 20, true, "ONLINE"),
+            TelemetryPoint::check(window_start + 10 * 3600 + 300, 22, true, "ONLINE"),
+            TelemetryPoint::check(window_start + 10 * 3600 + 600, 0, false, "AUTH_EXPIRED"),
+            TelemetryPoint::auth_event(window_start + 10 * 3600 + 620, true, "ONLINE"),
+            // 之后休眠 2 小时
+            TelemetryPoint::check(now - 300, 18, true, "ONLINE"),
+        ];
+        let segs = build_health_track(&points, now, TimeRange::H24);
+        assert_eq!(segs.len(), 5);
+        assert_eq!(segs[0].state, TrackState::NoData);
+        assert_eq!(segs[1].state, TrackState::Online);
+        assert_eq!(segs[2].state, TrackState::Offline);
+        assert_eq!(segs[2].end_ts - segs[2].start_ts, 20);
+        assert_eq!(segs[3].state, TrackState::NoData);
+        assert_eq!(segs[4].state, TrackState::Online);
+        assert_eq!(segs[4].end_ts, now);
     }
 }

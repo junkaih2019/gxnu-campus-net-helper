@@ -4,18 +4,18 @@
 
 use std::f32::consts::PI;
 
-use chrono::{Datelike, Local, NaiveDate, TimeZone, Weekday};
+use chrono::{Datelike, Local, NaiveDate, TimeZone, Timelike, Weekday};
 use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
 use crate::metrics_store::{
-    compute_stats, filter_range, outages_in_range, uptime_timeline, OutageEvent, SlotStatus,
-    TelemetryPoint, TimeRange, TimelineSlot,
+    build_health_track, compute_stats, filter_range, outages_in_range, OutageEvent, TelemetryPoint,
+    TimeRange, TrackSegment, TrackState,
 };
 use crate::models::{DailyTraffic, TrafficSummary};
 use crate::ui::icons::{self, Icon};
 use crate::ui::theme::{
-    body_text, bold_text, reason_hint, reason_label, with_alpha, Palette, ThemeMode,
-    DEFAULT_TRAFFIC_SPLIT, DEFAULT_WIDE_SPLIT,
+    body_text, bold_text, reason_hint, reason_label, with_alpha, Palette, DEFAULT_TRAFFIC_SPLIT,
+    DEFAULT_WIDE_SPLIT,
 };
 use crate::ui::widgets::{
     badge, card_padded, inner_vertical_splitter, section_heading, segmented_control,
@@ -124,9 +124,15 @@ pub fn draw_stability_wide_card(
     let points = filter_range(all_points, now, *range);
     let stats = compute_stats(&points);
     let outages = outages_in_range(all_points, now, *range);
-    let slots = uptime_timeline(&points, now, *range, 36);
+    let track = build_health_track(all_points, now, *range);
     let reasons = outages.reason_counts();
+    let has_outages = !outages.events.is_empty();
     let mut split_changed = false;
+
+    let link_id = ui.id().with("wide_linked_outage");
+    let prev_linked: Option<usize> = ui.ctx().data(|d| d.get_temp(link_id)).flatten();
+    let mut hovered_from_pin: Option<usize> = None;
+    let mut hovered_from_row: Option<usize> = None;
 
     card_padded(ui, p, 12, |ui| {
         let inner_h = (target_height - 24.0).max(170.0);
@@ -211,11 +217,7 @@ pub fn draw_stability_wide_card(
                                         Stroke::new(thickness, arc_color),
                                     );
                                 }
-                                let rate_text = if (pct - 100.0).abs() < 0.05 {
-                                    "100%".to_string()
-                                } else {
-                                    format!("{pct:.1}%")
-                                };
+                                let rate_text = format_uptime_pct(pct, has_outages);
                                 painter.text(
                                     Pos2::new(center.x, center.y - 6.0),
                                     egui::Align2::CENTER_CENTER,
@@ -349,30 +351,27 @@ pub fn draw_stability_wide_card(
                         },
                     );
 
-                    ui.add_space(8.0);
+                    ui.add_space(7.0);
                     let hsep = ui.allocate_space(Vec2::new(left_w, 1.0)).1;
                     ui.painter().line_segment(
                         [hsep.left_center(), hsep.right_center()],
                         Stroke::new(1.0_f32, p.divider),
                     );
-                    ui.add_space(7.0);
+                    ui.add_space(6.0);
 
-                    // 下半：通断健康时间轴
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(left_w, 16.0),
-                        egui::Layout::left_to_right(egui::Align::Center),
-                        |ui| {
-                            ui.label(bold_text("通断健康时间轴", 11.0, p.text_secondary));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(body_text("悬停色条查看时段", 10.0, p.text_muted));
-                                },
-                            );
-                        },
+                    // 下半：方案 A 连续状态轨道 + 精准事件针 + 真实时刻标尺
+                    draw_ribbon_legend_header(ui, p, left_w);
+                    ui.add_space(3.0);
+                    hovered_from_pin = draw_health_ribbon(
+                        ui,
+                        p,
+                        &track,
+                        &outages.events,
+                        now,
+                        *range,
+                        prev_linked,
+                        true,
                     );
-                    ui.add_space(5.0);
-                    draw_uptime_bars_sized(ui, p, &slots, *range, 22.0);
                 },
             );
 
@@ -454,8 +453,13 @@ pub fn draw_stability_wide_card(
                                     .show(ui, |ui| {
                                         ui.set_width(right_w);
                                         ui.spacing_mut().item_spacing.y = 5.0;
-                                        for ev in outages.events.iter().rev() {
-                                            draw_outage_event_row(ui, p, ev);
+                                        for (orig_idx, ev) in
+                                            outages.events.iter().enumerate().rev()
+                                        {
+                                            let is_linked = prev_linked == Some(orig_idx);
+                                            if draw_outage_event_row(ui, p, ev, is_linked) {
+                                                hovered_from_row = Some(orig_idx);
+                                            }
                                         }
                                     });
                             },
@@ -465,6 +469,12 @@ pub fn draw_stability_wide_card(
             );
         });
     });
+
+    let next_linked = hovered_from_pin.or(hovered_from_row);
+    if next_linked != prev_linked {
+        ui.ctx().data_mut(|d| d.insert_temp(link_id, next_linked));
+        ui.ctx().request_repaint();
+    }
     split_changed
 }
 
@@ -479,7 +489,7 @@ fn reason_severity_color(p: &Palette, reason: &str) -> Color32 {
     }
 }
 
-/// 左侧 62% 主卡：在线率 + 主因摘要 + 36 格通断健康时间轴 + 可上下滚动断联事件列表。
+/// 左侧 62% 主卡：在线率 + 连续状态轨道（方案 A）+ 可上下滚动断联事件列表。
 pub fn draw_stability_card(
     ui: &mut egui::Ui,
     p: &Palette,
@@ -491,7 +501,13 @@ pub fn draw_stability_card(
     let points = filter_range(all_points, now, *range);
     let stats = compute_stats(&points);
     let outages = outages_in_range(all_points, now, *range);
-    let slots = uptime_timeline(&points, now, *range, 36);
+    let track = build_health_track(all_points, now, *range);
+    let has_outages = !outages.events.is_empty();
+
+    let link_id = ui.id().with("compact_linked_outage");
+    let prev_linked: Option<usize> = ui.ctx().data(|d| d.get_temp(link_id)).flatten();
+    let mut hovered_from_pin: Option<usize> = None;
+    let mut hovered_from_row: Option<usize> = None;
 
     card_padded(ui, p, 12, |ui| {
         let inner_h = (target_height - 24.0).max(196.0);
@@ -514,14 +530,14 @@ pub fn draw_stability_card(
             },
         );
 
-        ui.add_space(6.0);
+        ui.add_space(5.0);
 
-        // 2. 在线率大字 + 一句话主因/稳定摘要
+        // 2. 在线率大字 + 一句话主因/稳定摘要 + 紧凑图例
         ui.allocate_ui_with_layout(
-            Vec2::new(ui.available_width(), 26.0),
+            Vec2::new(ui.available_width(), 24.0),
             egui::Layout::left_to_right(egui::Align::BOTTOM),
             |ui| {
-                ui.spacing_mut().item_spacing.x = 4.0;
+                ui.spacing_mut().item_spacing.x = 5.0;
                 if let Some(pct) = stats.uptime_pct {
                     let rate_color = if pct >= 98.0 {
                         p.text
@@ -530,40 +546,48 @@ pub fn draw_stability_card(
                     } else {
                         p.danger
                     };
-                    let rate_text = if (pct - 100.0).abs() < 0.05 {
-                        "100%".to_string()
-                    } else {
-                        format!("{pct:.1}%")
-                    };
-                    ui.label(bold_text(rate_text, 22.0, rate_color));
-                    ui.label(body_text("在线率", 11.0, p.text_muted));
+                    ui.label(bold_text(
+                        format_uptime_pct(pct, has_outages),
+                        21.0,
+                        rate_color,
+                    ));
+                    ui.label(body_text("在线率", 10.5, p.text_muted));
                 } else {
-                    ui.label(bold_text("—", 22.0, p.text_muted));
-                    ui.label(body_text("等待巡检采样", 11.0, p.text_muted));
+                    ui.label(bold_text("—", 21.0, p.text_muted));
+                    ui.label(body_text("等待巡检采样", 10.5, p.text_muted));
                 }
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(primary) = outages.primary_reason() {
                         ui.label(body_text(
-                            format!("主因：{} · 悬停色条看时段", reason_label(primary)),
-                            11.0,
+                            format!("主因：{}", reason_label(primary)),
+                            10.5,
                             p.text_secondary,
                         ));
                     } else if stats.check_count > 0 {
-                        ui.label(body_text("当前时段全程稳定，无断联", 11.0, p.ok));
+                        ui.label(body_text("当前时段全程稳定，无断联", 10.5, p.ok));
                     } else {
-                        ui.label(body_text("开启监控后自动记录", 11.0, p.text_muted));
+                        ui.label(body_text("开启监控后自动记录", 10.5, p.text_muted));
                     }
                 });
             },
         );
 
-        ui.add_space(7.0);
+        ui.add_space(4.0);
 
-        // 3. 36 格饱满圆角通断健康时间轴
-        draw_uptime_bars(ui, p, &slots, *range);
+        // 3. 方案 A 连续状态轨道 + 精准事件针 + 真实时刻标尺
+        hovered_from_pin = draw_health_ribbon(
+            ui,
+            p,
+            &track,
+            &outages.events,
+            now,
+            *range,
+            prev_linked,
+            false,
+        );
 
-        ui.add_space(7.0);
+        ui.add_space(6.0);
 
         // 4. 分隔线 + 断联事件列表标题
         let sep = ui.allocate_space(Vec2::new(ui.available_width(), 1.0)).1;
@@ -571,7 +595,7 @@ pub fn draw_stability_card(
             [sep.left_center(), sep.right_center()],
             Stroke::new(1.0_f32, p.divider),
         );
-        ui.add_space(5.0);
+        ui.add_space(4.0);
 
         ui.allocate_ui_with_layout(
             Vec2::new(ui.available_width(), 16.0),
@@ -585,7 +609,7 @@ pub fn draw_stability_card(
                 ui.label(body_text(count_text, 10.5, p.text_muted));
                 if !outages.events.is_empty() {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(body_text("按时间倒序", 10.0, p.text_muted));
+                        ui.label(body_text("悬停联动时间轴", 10.0, p.text_muted));
                     });
                 }
             },
@@ -623,131 +647,463 @@ pub fn draw_stability_card(
                 |ui| {
                     egui::ScrollArea::vertical()
                         .id_salt("home_outages_scroll")
+                        .max_height(list_h)
                         .auto_shrink([false, false])
                         .show(ui, |ui| {
                             ui.spacing_mut().item_spacing.y = 5.0;
-                            for ev in outages.events.iter().rev() {
-                                draw_outage_event_row(ui, p, ev);
+                            for (orig_idx, ev) in outages.events.iter().enumerate().rev() {
+                                let is_linked = prev_linked == Some(orig_idx);
+                                if draw_outage_event_row(ui, p, ev, is_linked) {
+                                    hovered_from_row = Some(orig_idx);
+                                }
                             }
                         });
                 },
             );
         }
     });
+
+    let next_linked = hovered_from_pin.or(hovered_from_row);
+    if next_linked != prev_linked {
+        ui.ctx().data_mut(|d| d.insert_temp(link_id, next_linked));
+        ui.ctx().request_repaint();
+    }
 }
 
-fn draw_uptime_bars(ui: &mut egui::Ui, p: &Palette, slots: &[TimelineSlot], range: TimeRange) {
-    draw_uptime_bars_sized(ui, p, slots, range, 22.0);
+fn format_uptime_pct(pct: f64, has_outages: bool) -> String {
+    if !has_outages && pct >= 99.95 {
+        "100%".to_string()
+    } else {
+        let capped = if has_outages { pct.min(99.9) } else { pct };
+        format!("{capped:.1}%")
+    }
 }
 
-fn draw_uptime_bars_sized(
+fn draw_ribbon_legend_header(ui: &mut egui::Ui, p: &Palette, width: f32) {
+    ui.allocate_ui_with_layout(
+        Vec2::new(width, 15.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.label(bold_text("通断时间轴", 11.0, p.text_secondary));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                legend_dot_item(ui, p, None, "未运行");
+                legend_dot_item(ui, p, Some(p.warn), "断联");
+                legend_dot_item(ui, p, Some(Color32::from_rgb(0x10, 0xB9, 0x81)), "在线");
+            });
+        },
+    );
+}
+
+fn legend_dot_item(ui: &mut egui::Ui, p: &Palette, filled: Option<Color32>, text: &str) {
+    let font = egui::FontId::proportional(9.8);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_string(), font, p.text_muted);
+    let total_w = 7.0 + 3.5 + galley.size().x;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(total_w, 14.0), Sense::hover());
+    let dot_center = Pos2::new(rect.left() + 3.5, rect.center().y);
+    match filled {
+        Some(c) => ui.painter().circle_filled(dot_center, 3.0, c),
+        None => ui
+            .painter()
+            .circle_stroke(dot_center, 2.8, Stroke::new(1.1_f32, p.text_muted)),
+    };
+    ui.painter().galley(
+        Pos2::new(rect.left() + 10.5, rect.center().y - galley.size().y * 0.5),
+        galley,
+        p.text_muted,
+    );
+}
+
+/// 方案 A：连续健康轨道 + 精准断联事件针（带防重叠时刻胶囊）+ 真实时钟标尺 + 双向悬停联动。
+#[allow(clippy::too_many_arguments)]
+fn draw_health_ribbon(
     ui: &mut egui::Ui,
     p: &Palette,
-    slots: &[TimelineSlot],
+    segments: &[TrackSegment],
+    outages: &[OutageEvent<'_>],
+    now: i64,
     range: TimeRange,
-    bar_h: f32,
-) {
+    linked_idx: Option<usize>,
+    wide: bool,
+) -> Option<usize> {
     let total_w = ui.available_width();
-    let gap = 2.5_f32;
-    let n = slots.len().max(1);
-    let slot_w = ((total_w - gap * (n as f32 - 1.0)) / n as f32).max(2.0);
+    let window_secs = range.secs().max(60);
+    let window_start = now - window_secs;
 
-    let (rect, _) = ui.allocate_exact_size(Vec2::new(total_w, bar_h), Sense::hover());
-    let mut hovered_slot: Option<&TimelineSlot> = None;
+    let pin_h = if wide { 20.0_f32 } else { 18.0_f32 };
+    let track_h = if wide { 12.0_f32 } else { 11.0_f32 };
+    let ruler_gap = 4.0_f32;
+    let ruler_h = 17.0_f32;
+    let total_h = pin_h + track_h + ruler_gap + ruler_h;
 
-    for (idx, slot) in slots.iter().enumerate() {
-        let x0 = rect.left() + idx as f32 * (slot_w + gap);
-        let cell = Rect::from_min_size(Pos2::new(x0, rect.top()), Vec2::new(slot_w, bar_h));
-        let resp = ui.interact(cell, ui.id().with(("uptime_slot", idx)), Sense::hover());
-        let base_color = match slot.status {
-            SlotStatus::Online => match p.mode {
-                ThemeMode::Light => Color32::from_rgb(0x10, 0xB9, 0x81),
-                ThemeMode::Dark => Color32::from_rgb(0x10, 0xB9, 0x81),
-            },
-            SlotStatus::Degraded => p.warn,
-            SlotStatus::Offline => p.danger,
-            SlotStatus::NoData => with_alpha(p.border_strong, 95),
-        };
-        let fill = if resp.hovered() {
-            hovered_slot = Some(slot);
-            base_color
-        } else if slot.status == SlotStatus::Online {
-            with_alpha(base_color, 215)
-        } else {
-            base_color
-        };
-        ui.painter().rect_filled(cell, CornerRadius::same(3), fill);
-        if resp.hovered() {
-            ui.painter().rect_stroke(
-                cell,
-                CornerRadius::same(3),
-                Stroke::new(1.2_f32, p.text),
-                StrokeKind::Outside,
+    let (full_rect, resp) = ui.allocate_exact_size(Vec2::new(total_w, total_h), Sense::hover());
+    let track_rect = Rect::from_min_size(
+        Pos2::new(full_rect.left(), full_rect.top() + pin_h),
+        Vec2::new(total_w, track_h),
+    );
+    let ruler_top = track_rect.bottom() + ruler_gap;
+    let painter = ui.painter();
+
+    let ts_to_x = |ts: i64| -> f32 {
+        let frac = ((ts - window_start) as f32 / window_secs as f32).clamp(0.0, 1.0);
+        track_rect.left() + frac * track_rect.width()
+    };
+
+    // 1. 轨道底色与各连续状态段（在线翡翠绿 / 休眠未运行轻斜纹 / 离线警示色）
+    let track_radius = CornerRadius::same((track_h * 0.5).round() as u8);
+    painter.rect_filled(track_rect, track_radius, p.subtle);
+
+    let online_fill = Color32::from_rgb(0x10, 0xB9, 0x81);
+    let inner_track = track_rect.shrink(1.0);
+    for seg in segments {
+        let x0 = ts_to_x(seg.start_ts).max(inner_track.left());
+        let x1 = ts_to_x(seg.end_ts).min(inner_track.right());
+        if x1 - x0 < 0.5 {
+            continue;
+        }
+        let seg_rect = Rect::from_min_max(
+            Pos2::new(x0, inner_track.top()),
+            Pos2::new(x1, inner_track.bottom()),
+        );
+        let seg_r = CornerRadius::same(3);
+        match seg.state {
+            TrackState::Online => {
+                painter.rect_filled(seg_rect, seg_r, with_alpha(online_fill, 225));
+                // 顶部极淡光泽发丝线，提升轨道层次感
+                painter.line_segment(
+                    [
+                        Pos2::new(seg_rect.left() + 1.0, seg_rect.top() + 1.0),
+                        Pos2::new(seg_rect.right() - 1.0, seg_rect.top() + 1.0),
+                    ],
+                    Stroke::new(1.0_f32, with_alpha(Color32::WHITE, 45)),
+                );
+            }
+            TrackState::Offline => {
+                painter.rect_filled(seg_rect, seg_r, with_alpha(p.warn, 220));
+            }
+            TrackState::NoData => {
+                // 未运行/休眠区：轻盈 45° 斜纹，视觉退后
+                let clip_p = painter.with_clip_rect(seg_rect);
+                let hatch_color = with_alpha(p.text_muted, 36);
+                let step = 6.0_f32;
+                let h = seg_rect.height();
+                let mut sx = seg_rect.left() - h;
+                while sx < seg_rect.right() + h {
+                    clip_p.line_segment(
+                        [
+                            Pos2::new(sx, seg_rect.bottom()),
+                            Pos2::new(sx + h, seg_rect.top()),
+                        ],
+                        Stroke::new(1.1_f32, hatch_color),
+                    );
+                    sx += step;
+                }
+            }
+        }
+    }
+
+    // 轨道外描边（收口干净）
+    painter.rect_stroke(
+        track_rect,
+        track_radius,
+        Stroke::new(1.0_f32, with_alpha(p.border_strong, 145)),
+        StrokeKind::Inside,
+    );
+
+    // 2. 精准断联事件针与轨道高亮细条
+    let mut hovered_pin: Option<usize> = None;
+    let pointer_pos = resp.hover_pos();
+    if let Some(pos) = pointer_pos {
+        if pos.y >= full_rect.top() && pos.y <= track_rect.bottom() + 2.0 {
+            let mut best: Option<(usize, f32)> = None;
+            for (idx, ev) in outages.iter().enumerate() {
+                let x = ts_to_x(ev.start.ts);
+                let dist = (pos.x - x).abs();
+                if dist <= 10.0 && best.is_none_or(|(_, d)| dist < d) {
+                    best = Some((idx, dist));
+                }
+            }
+            hovered_pin = best.map(|(i, _)| i);
+        }
+    }
+    let active_pin = hovered_pin.or(linked_idx);
+
+    let mut placed_pills: Vec<(f32, f32)> = Vec::new();
+    let show_static_pills = outages.len() <= 3;
+
+    // 先绘制非高亮事件针，再把激活事件针叠在最顶层
+    for pass in 0..2 {
+        for (idx, ev) in outages.iter().enumerate() {
+            let is_active = active_pin == Some(idx);
+            if (pass == 0 && is_active) || (pass == 1 && !is_active) {
+                continue;
+            }
+            let pin_color = if !ev.recovered {
+                p.danger
+            } else {
+                reason_severity_color(p, &ev.start.reason)
+            };
+            let x = ts_to_x(ev.start.ts);
+            let dur_w = ((ev.duration_secs.unwrap_or(1) as f32 / window_secs as f32)
+                * track_rect.width())
+            .max(3.0);
+            let sliver_x = x.clamp(
+                inner_track.left(),
+                (inner_track.right() - dur_w).max(inner_track.left()),
+            );
+            let sliver = Rect::from_min_size(
+                Pos2::new(sliver_x, inner_track.top()),
+                Vec2::new(dur_w, inner_track.height()),
+            );
+            painter.rect_filled(sliver, CornerRadius::same(1), pin_color);
+
+            let stem_x = sliver.center().x;
+            let stem_top = full_rect.top() + if is_active { 14.0 } else { 15.0 };
+            painter.line_segment(
+                [
+                    Pos2::new(stem_x, stem_top),
+                    Pos2::new(stem_x, track_rect.bottom() + 1.0),
+                ],
+                Stroke::new(if is_active { 2.4_f32 } else { 1.8_f32 }, pin_color),
+            );
+            if is_active {
+                painter.circle_filled(
+                    Pos2::new(stem_x, track_rect.center().y),
+                    6.5,
+                    with_alpha(pin_color, 55),
+                );
+            }
+            painter.circle_filled(
+                Pos2::new(stem_x, track_rect.bottom() + 0.5),
+                if is_active { 3.2 } else { 2.2 },
+                pin_color,
+            );
+
+            // 时刻胶囊标签（激活态必显；常规最多 3 条且自动防重叠）
+            if is_active || show_static_pills {
+                let tag = match ev.duration_secs {
+                    Some(secs) if ev.recovered => {
+                        format!(
+                            "{} · {}",
+                            format_hm(ev.start.ts),
+                            format_duration_short(secs)
+                        )
+                    }
+                    _ => format!("{} · 离线", format_hm(ev.start.ts)),
+                };
+                let font = egui::FontId::new(9.5, crate::ui::theme::bold_family());
+                let galley = painter.layout_no_wrap(tag, font, pin_color);
+                let pill_w = galley.size().x + 10.0;
+                let pill_h = 15.0_f32;
+                let pill_x = (stem_x - pill_w * 0.5).clamp(
+                    track_rect.left(),
+                    (track_rect.right() - pill_w).max(track_rect.left()),
+                );
+                let overlaps = placed_pills
+                    .iter()
+                    .any(|(l, r)| pill_x < *r + 4.0 && pill_x + pill_w > *l - 4.0);
+                if is_active || !overlaps {
+                    let pill_rect = Rect::from_min_size(
+                        Pos2::new(pill_x, full_rect.top()),
+                        Vec2::new(pill_w, pill_h),
+                    );
+                    let (bg, border) = if pin_color == p.danger {
+                        (p.danger_soft, p.danger_border)
+                    } else {
+                        (p.warn_soft, p.warn_border)
+                    };
+                    painter.rect(
+                        pill_rect,
+                        CornerRadius::same(4),
+                        bg,
+                        Stroke::new(if is_active { 1.2_f32 } else { 0.9_f32 }, border),
+                        StrokeKind::Inside,
+                    );
+                    painter.galley(
+                        Pos2::new(
+                            pill_rect.center().x - galley.size().x * 0.5,
+                            pill_rect.center().y - galley.size().y * 0.5,
+                        ),
+                        galley,
+                        pin_color,
+                    );
+                    placed_pills.push((pill_x, pill_x + pill_w));
+                }
+            }
+        }
+    }
+
+    // 3. 悬停交互：命中事件针显示断联详情；命中轨道空白处显示纵线时间游标与瞬时状态
+    if let Some(idx) = hovered_pin {
+        if let Some(ev) = outages.get(idx) {
+            egui::show_tooltip(
+                ui.ctx(),
+                ui.layer_id(),
+                ui.id().with("ribbon_pin_tip"),
+                |ui| {
+                    ui.set_max_width(230.0);
+                    ui.label(bold_text(
+                        format!(
+                            "{} · {}",
+                            ev.start.local_md_hm(),
+                            reason_label(&ev.start.reason)
+                        ),
+                        11.5,
+                        p.text,
+                    ));
+                    let status = match (ev.recovered, ev.auto_reconnected, ev.duration_secs) {
+                        (true, true, Some(s)) => {
+                            format!("断联 {} · 守护已自动重连", format_duration_short(s))
+                        }
+                        (true, false, Some(s)) => {
+                            format!("断联 {} · 网络已恢复", format_duration_short(s))
+                        }
+                        (false, _, Some(s)) => {
+                            format!("已持续离线 {}", format_duration_short(s))
+                        }
+                        _ => "断联事件".to_string(),
+                    };
+                    ui.label(body_text(status, 10.8, p.text_secondary));
+                    ui.label(body_text(reason_hint(&ev.start.reason), 10.2, p.text_muted));
+                },
+            );
+        }
+    } else if let Some(pos) = pointer_pos {
+        if pos.y >= track_rect.top() - 3.0 && pos.y <= track_rect.bottom() + 3.0 {
+            let cx = pos.x.clamp(track_rect.left(), track_rect.right());
+            painter.line_segment(
+                [
+                    Pos2::new(cx, track_rect.top() - 2.0),
+                    Pos2::new(cx, track_rect.bottom() + 2.0),
+                ],
+                Stroke::new(1.2_f32, with_alpha(p.text, 185)),
+            );
+            let frac = ((cx - track_rect.left()) / track_rect.width().max(1.0)).clamp(0.0, 1.0);
+            let hover_ts = window_start + (frac * window_secs as f32).round() as i64;
+            let state = segments
+                .iter()
+                .find(|s| hover_ts >= s.start_ts && hover_ts <= s.end_ts)
+                .map(|s| s.state)
+                .unwrap_or(TrackState::NoData);
+            let (st_text, st_color) = match state {
+                TrackState::Online => ("校园网在线", p.ok),
+                TrackState::Offline => ("网络连接中断", p.warn),
+                TrackState::NoData => ("守护未运行或电脑休眠", p.text_muted),
+            };
+            egui::show_tooltip(
+                ui.ctx(),
+                ui.layer_id(),
+                ui.id().with("ribbon_cursor_tip"),
+                |ui| {
+                    ui.label(bold_text(format_hm(hover_ts), 11.5, p.text));
+                    ui.label(body_text(st_text, 10.8, st_color));
+                },
             );
         }
     }
 
-    if let Some(slot) = hovered_slot {
-        let from = format_hm(slot.start_ts);
-        let to = format_hm(slot.end_ts);
-        let status_str = match slot.status {
-            SlotStatus::Online => "连接稳定",
-            SlotStatus::Degraded => "曾发生断联并恢复",
-            SlotStatus::Offline => "持续离线",
-            SlotStatus::NoData => "暂无采样",
-        };
-        egui::show_tooltip(
-            ui.ctx(),
-            ui.layer_id(),
-            ui.id().with("uptime_slot_tip"),
-            |ui| {
-                ui.set_max_width(220.0);
-                ui.label(bold_text(format!("{from} – {to}"), 11.5, p.text));
-                ui.label(body_text(status_str, 11.0, p.text_secondary));
-                if slot.checks > 0 {
-                    let mut detail = format!("在线 {}/{} 次", slot.online_checks, slot.checks);
-                    if let Some(ms) = slot.avg_ms {
-                        detail.push_str(&format!(" · 平均网关 {ms} ms"));
-                    }
-                    ui.label(body_text(detail, 10.5, p.text_muted));
-                }
-            },
-        );
-    }
+    // 4. 真实时钟标尺（顶部细基线 + 自然整点短刻度线 + 真实 HH:MM 标签）
+    painter.line_segment(
+        [
+            Pos2::new(track_rect.left(), ruler_top),
+            Pos2::new(track_rect.right(), ruler_top),
+        ],
+        Stroke::new(1.0_f32, p.divider),
+    );
+    let tick_stroke = Stroke::new(1.0_f32, with_alpha(p.text_muted, 130));
+    let tick_font = egui::FontId::proportional(9.5);
+    let label_y = ruler_top + 11.5;
 
-    // 底部时间刻度（左 / 中 / 右）
-    ui.add_space(3.0);
-    let (left_lbl, mid_lbl) = match range {
-        TimeRange::H1 => ("1 小时前", "30 分钟前"),
-        TimeRange::H7 => ("7 小时前", "3.5 小时前"),
-        TimeRange::H24 => ("24 小时前", "12 小时前"),
-    };
-    let (axis_rect, _) = ui.allocate_exact_size(Vec2::new(total_w, 12.0), Sense::hover());
-    let font = egui::FontId::proportional(9.5);
-    ui.painter().text(
-        axis_rect.left_center(),
+    // 左端起点时刻
+    painter.line_segment(
+        [
+            Pos2::new(track_rect.left(), ruler_top),
+            Pos2::new(track_rect.left(), ruler_top + 4.0),
+        ],
+        tick_stroke,
+    );
+    painter.text(
+        Pos2::new(track_rect.left(), label_y),
         egui::Align2::LEFT_CENTER,
-        left_lbl,
-        font.clone(),
+        format_hm(window_start),
+        tick_font.clone(),
         p.text_muted,
     );
-    ui.painter().text(
-        axis_rect.center(),
-        egui::Align2::CENTER_CENTER,
-        mid_lbl,
-        font.clone(),
-        p.text_muted,
+
+    // 右端「现在」
+    painter.line_segment(
+        [
+            Pos2::new(track_rect.right(), ruler_top),
+            Pos2::new(track_rect.right(), ruler_top + 4.0),
+        ],
+        tick_stroke,
     );
-    ui.painter().text(
-        axis_rect.right_center(),
+    painter.text(
+        Pos2::new(track_rect.right(), label_y),
         egui::Align2::RIGHT_CENTER,
         "现在",
-        font,
-        p.text_muted,
+        egui::FontId::new(9.5, crate::ui::theme::bold_family()),
+        p.text_secondary,
     );
+
+    // 中间自然整点刻度（24h 每 6 小时 / 7h 每 2 小时 / 1h 每 15 分钟），自动防碰撞
+    let step_secs: i64 = match range {
+        TimeRange::H1 => 15 * 60,
+        TimeRange::H7 => 2 * 3600,
+        TimeRange::H24 => 6 * 3600,
+    };
+    let mut last_tick_x = track_rect.left() + 42.0;
+    let right_limit = track_rect.right() - 40.0;
+    for tick_ts in aligned_clock_ticks(window_start, now, step_secs) {
+        let tx = ts_to_x(tick_ts);
+        if tx < last_tick_x || tx > right_limit {
+            continue;
+        }
+        painter.line_segment(
+            [Pos2::new(tx, ruler_top), Pos2::new(tx, ruler_top + 4.0)],
+            tick_stroke,
+        );
+        painter.text(
+            Pos2::new(tx, label_y),
+            egui::Align2::CENTER_CENTER,
+            format_hm(tick_ts),
+            tick_font.clone(),
+            p.text_muted,
+        );
+        last_tick_x = tx + 44.0;
+    }
+
+    hovered_pin
 }
 
-fn draw_outage_event_row(ui: &mut egui::Ui, p: &Palette, ev: &OutageEvent<'_>) {
+fn aligned_clock_ticks(start_ts: i64, end_ts: i64, step_secs: i64) -> Vec<i64> {
+    let mut out = Vec::new();
+    let Some(start_dt) = Local.timestamp_opt(start_ts, 0).single() else {
+        return out;
+    };
+    let secs_since_midnight =
+        (start_dt.hour() * 3600 + start_dt.minute() * 60 + start_dt.second()) as i64;
+    let rem = secs_since_midnight % step_secs;
+    let mut first_tick = if rem == 0 {
+        start_ts + step_secs
+    } else {
+        start_ts + (step_secs - rem)
+    };
+    while first_tick < end_ts {
+        out.push(first_tick);
+        first_tick += step_secs;
+    }
+    out
+}
+
+fn draw_outage_event_row(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    ev: &OutageEvent<'_>,
+    highlighted: bool,
+) -> bool {
     let dot_color = if !ev.recovered
         || matches!(
             ev.start.reason.as_str(),
@@ -758,9 +1114,15 @@ fn draw_outage_event_row(ui: &mut egui::Ui, p: &Palette, ev: &OutageEvent<'_>) {
         p.warn
     };
 
+    let (fill, stroke) = if highlighted {
+        (p.card_hover, Stroke::new(1.1_f32, p.accent_border))
+    } else {
+        (p.subtle, Stroke::new(1.0_f32, p.divider))
+    };
+
     let frame_resp = egui::Frame::new()
-        .fill(p.subtle)
-        .stroke(Stroke::new(1.0_f32, p.divider))
+        .fill(fill)
+        .stroke(stroke)
         .corner_radius(CornerRadius::same(6))
         .inner_margin(egui::Margin::symmetric(9, 5))
         .show(ui, |ui| {
@@ -804,9 +1166,11 @@ fn draw_outage_event_row(ui: &mut egui::Ui, p: &Palette, ev: &OutageEvent<'_>) {
             );
         });
 
+    let hovered = frame_resp.response.hovered();
     frame_resp
         .response
         .on_hover_text(reason_hint(&ev.start.reason));
+    hovered
 }
 
 /// 右侧 38% 辅卡：双模式自适应环形流量图 + 近 7 天比例柱状图。
