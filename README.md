@@ -4,6 +4,16 @@
 
 [下载 Windows x64 版](https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest) · [配置与常见问题](docs/CONFIGURATION.md) · [更新记录](CHANGELOG.md)
 
+## 界面预览
+
+主窗口展示最近 24 小时的校园网延迟、断网记录和运行日志。图中的账号 `DEMO`、曲线和日志均为演示数据。
+
+![v0.1.1 主窗口，左侧是账号设置，右侧是延迟曲线、两次断网记录和运行日志](docs/images/main-window.png)
+
+右键点击托盘图标可查看守护状态、立即检测或切换监控开关。图中监控已暂停。
+
+<img src="docs/images/tray-menu.png" alt="v0.1.1 托盘菜单，监控已暂停，可选择立即检测或开始监控" width="256">
+
 ## 开始使用
 
 1. 在 Releases 下载 `gxnu-campus-net-helper-0.1.1-windows-x64.zip`，解压到固定目录，运行 `GXNU 校园网守护助手.exe`。
