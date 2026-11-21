@@ -41,27 +41,6 @@ impl TrafficPeriod {
     }
 }
 
-/// 兼容旧入口：按 62:38 非对称排布稳定性主卡与流量辅卡。
-pub fn draw_monitoring_card(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    all_points: &[TelemetryPoint],
-    range: &mut TimeRange,
-    target_height: f32,
-) {
-    let mut period = TrafficPeriod::Today;
-    draw_home_visual_row(
-        ui,
-        p,
-        all_points,
-        range,
-        &TrafficSummary::default(),
-        &mut period,
-        0,
-        target_height,
-    );
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn draw_home_visual_row(
     ui: &mut egui::Ui,

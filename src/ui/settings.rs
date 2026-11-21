@@ -127,32 +127,6 @@ pub struct SettingsActions {
     pub reset: bool,
 }
 
-/// 兼容旧分栏入口（Commit 5 切入双视图后移除）。
-#[allow(clippy::too_many_arguments)]
-pub fn draw_panel(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    form: &mut SettingsForm,
-    saved: &Settings,
-    app_dir: &Path,
-    credential_account: Option<&str>,
-    target_height: f32,
-) -> SettingsActions {
-    let log_path = app_dir.join("logs").join("app.log");
-    draw_settings_view(
-        ui,
-        p,
-        form,
-        saved,
-        app_dir,
-        &log_path,
-        credential_account,
-        false,
-        false,
-        target_height,
-    )
-}
-
 /// 成熟版 Windows 11 Fluent 设置中心视图（左侧分组导航 + 右侧分组卡片 + 底部常驻保存栏）。
 #[allow(clippy::too_many_arguments)]
 pub fn draw_settings_view(

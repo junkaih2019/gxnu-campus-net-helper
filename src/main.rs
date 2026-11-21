@@ -606,8 +606,8 @@ fn run_ui_process(args: &[String]) -> ExitCode {
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([980.0, 700.0])
-            .with_min_inner_size([840.0, 580.0])
+            .with_inner_size([840.0, 580.0])
+            .with_min_inner_size([760.0, 520.0])
             .with_decorations(false)
             .with_title(APP_NAME)
             .with_app_id("GXNUCampusLoginRS")

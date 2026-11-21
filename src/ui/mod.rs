@@ -1,7 +1,7 @@
-//! 主窗口包含双主题监控看板和设置面板。
-//! - 无侧边栏，零整页切换
-//! - 顶部：无边框自定义标题栏 + 统一状态/操作栏 + 紧凑四层诊断条
-//! - 主体：可拖拽左右分栏（左：账号/监控/通知三标签设置卡，支持一键折叠；右：监控图表 + 实时日志上下可拖分栏）
+//! 主窗口双视图架构（极简薄顶栏 + 主页 / 成熟版 Windows 11 Fluent 设置中心）：
+//! - 顶部：36px 无边框自定义标题栏（主页右侧提供「设置」入口，设置页左上角提供「← 返回主页」）
+//! - 主页：上窄状态条（含当前账号入口）→ 中 62:38 非对称图文双卡（连接稳定性 + 双模式环形流量）→ 下通栏运行日志
+//! - 设置页：左侧分组目录（账号管理 / 监控与自启 / 通知与数据）+ 右侧分组卡片 + 底部常驻保存栏
 
 mod charts;
 mod icons;
@@ -29,6 +29,7 @@ use crate::metrics_store::{TelemetryPoint, TimeRange};
 use crate::models::{MonitorSnapshot, MonitorState, Settings, TrafficSummary};
 use crate::startup;
 
+use charts::TrafficPeriod;
 use icons::Icon;
 use logs as logs_page;
 use settings as settings_page;
@@ -36,15 +37,18 @@ use theme::{
     body_text, bold_text, carrier_label, format_check_ms, format_check_time, format_uptime,
     status_title, with_alpha, Palette, ThemeMode,
 };
-use widgets::{
-    accent_card, badge, horizontal_splitter, icon_button, primary_button, pulsing_dot, save_button,
-    secondary_button, vertical_splitter,
-};
+use widgets::{accent_card, badge, icon_button, primary_button, pulsing_dot, secondary_button};
 
 const CREDENTIAL_TARGET: &str = "GXNUCampusLogin/v4";
 const MAX_LOG_LINES: usize = 4000;
 const MAX_TELEMETRY_POINTS: usize = 5000;
-const TITLEBAR_HEIGHT: f32 = 34.0;
+const TITLEBAR_HEIGHT: f32 = 36.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppView {
+    Home,
+    Settings,
+}
 
 pub struct GuardDeps {
     pub store: SettingsStore,
@@ -104,15 +108,14 @@ pub struct GuardApp {
     log_lines: Vec<String>,
     log_path: PathBuf,
     theme_mode: ThemeMode,
+    view: AppView,
     form: settings_page::SettingsForm,
     credential_account: Option<String>,
     logs_state: logs_page::LogsState,
     telemetry: Vec<TelemetryPoint>,
     traffic: TrafficSummary,
     time_range: TimeRange,
-    left_pane_width: f32,
-    settings_collapsed: bool,
-    chart_ratio: f32,
+    traffic_period: TrafficPeriod,
     last_check_seq: u64,
     last_check_unix: Option<i64>,
     online_since_unix: Option<i64>,
@@ -143,8 +146,10 @@ impl GuardApp {
         }
         // 不把已保存密码回填到输入框，仅在用户输入新密码时才允许预览并保存。
         form.password.clear();
-        if let Ok(tab) = std::env::var("GXNU_SETTINGS_TAB") {
-            form.tab = match tab.as_str() {
+
+        let env_tab = std::env::var("GXNU_SETTINGS_TAB").ok();
+        if let Some(tab) = env_tab.as_deref() {
+            form.tab = match tab {
                 "monitor" => settings_page::SettingsTab::Monitor,
                 "notify" => settings_page::SettingsTab::Notify,
                 _ => settings_page::SettingsTab::Account,
@@ -156,17 +161,20 @@ impl GuardApp {
             log_lines = log_lines.split_off(log_lines.len() - MAX_LOG_LINES);
         }
 
-        // 默认折叠左侧设置栏，保持主画面清爽聚焦；点击顶部「设置」或标题栏侧栏按钮随时展开。
-        let settings_collapsed = std::env::var("GXNU_COLLAPSE")
-            .map(|v| v != "0")
-            .unwrap_or(true);
-
         let needs_setup =
             needs_account_setup(&deps.settings.student_id, credential_account.as_deref());
-        let settings_collapsed = settings_collapsed && !needs_setup;
-        if needs_setup {
-            form.tab = settings_page::SettingsTab::Account;
-        }
+        let env_open_settings = std::env::var("GXNU_VIEW")
+            .map(|v| v.eq_ignore_ascii_case("settings"))
+            .unwrap_or(false)
+            || env_tab.is_some();
+        let view = if needs_setup || env_open_settings {
+            if needs_setup {
+                form.tab = settings_page::SettingsTab::Account;
+            }
+            AppView::Settings
+        } else {
+            AppView::Home
+        };
 
         // 上传与 .exe / 任务栏 / 托盘同源的 64×64 柔和圆角矩形品牌图标用于标题栏左上角。
         let icon_rgba = crate::app_icon::render_icon_rgba(None, 64);
@@ -187,15 +195,14 @@ impl GuardApp {
             log_lines,
             log_path: deps.log_path,
             theme_mode,
+            view,
             form,
             credential_account,
             logs_state: logs_page::LogsState::default(),
             telemetry: deps.initial_telemetry,
             traffic: deps.initial_traffic,
             time_range: TimeRange::H24,
-            left_pane_width: 292.0,
-            settings_collapsed,
-            chart_ratio: 0.50,
+            traffic_period: TrafficPeriod::Today,
             last_check_seq: 0,
             last_check_unix: None,
             online_since_unix: None,
@@ -252,6 +259,7 @@ impl GuardApp {
         ) && result.is_ok()
         {
             self.needs_setup = false;
+            self.view = AppView::Home;
         }
         if matches!(pending.command, UiToDaemon::ForceCheck) && result.is_err() {
             self.pending_manual_check = false;
@@ -363,7 +371,7 @@ impl GuardApp {
                 merge_sample(&mut self.telemetry, point);
             }
             if prompt_account(&snapshot, &mut self.account_alert_opened) {
-                self.settings_collapsed = false;
+                self.view = AppView::Settings;
                 self.form.tab = settings_page::SettingsTab::Account;
             }
             self.latest = Some(snapshot);
@@ -389,11 +397,16 @@ impl GuardApp {
             Stroke::new(1.0_f32, p.border),
         );
 
-        let controls_w = 152.0;
+        let left_skip = if self.view == AppView::Settings {
+            110.0
+        } else {
+            0.0
+        };
+        let controls_w = 186.0;
         let drag_rect = Rect::from_min_max(
-            bar_rect.min,
+            Pos2::new(bar_rect.left() + left_skip, bar_rect.top()),
             Pos2::new(
-                (bar_rect.right() - controls_w).max(bar_rect.left()),
+                (bar_rect.right() - controls_w).max(bar_rect.left() + left_skip),
                 bar_rect.bottom(),
             ),
         );
@@ -410,24 +423,36 @@ impl GuardApp {
             ctx.send_viewport_cmd(ViewportCommand::Maximized(!maximized));
         }
 
+        let dirty = self.form.is_dirty(&self.settings);
+
         ui.horizontal_centered(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
             ui.add_space(10.0);
-            let (badge_rect, _) = ui.allocate_exact_size(Vec2::splat(22.0), Sense::hover());
-            ui.painter().image(
-                self.brand_icon.id(),
-                badge_rect,
-                Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
-                egui::Color32::WHITE,
-            );
-            ui.label(bold_text(crate::APP_NAME, 12.5, p.text));
-            ui.label(body_text(
-                format!("v{}", env!("CARGO_PKG_VERSION")),
-                11.0,
-                p.text_muted,
-            ));
+            if self.view == AppView::Settings {
+                if draw_titlebar_chip_btn(ui, p, Icon::ArrowLeft, "返回主页", false, false)
+                    .clicked()
+                {
+                    self.view = AppView::Home;
+                }
+                ui.add_space(4.0);
+                ui.label(body_text("设置中心", 11.5, p.text_muted));
+            } else {
+                let (badge_rect, _) = ui.allocate_exact_size(Vec2::splat(20.0), Sense::hover());
+                ui.painter().image(
+                    self.brand_icon.id(),
+                    badge_rect,
+                    Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)),
+                    egui::Color32::WHITE,
+                );
+                ui.label(bold_text(crate::APP_NAME, 12.5, p.text));
+                ui.label(body_text(
+                    format!("v{}", env!("CARGO_PKG_VERSION")),
+                    10.5,
+                    p.text_muted,
+                ));
+            }
 
-            // 右侧窗口控制按钮
+            // 右侧窗口控制区：设置入口 + 主题 + 最小化 + 关闭
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
 
@@ -442,7 +467,6 @@ impl GuardApp {
                 )
                 .clicked()
                 {
-                    // 关闭界面进程以彻底释放 OpenGL 驱动与字体内存，后台守护进程仍在托盘轻量运行。
                     ctx.send_viewport_cmd(ViewportCommand::Close);
                 }
 
@@ -481,33 +505,24 @@ impl GuardApp {
                     self.toggle_theme(ctx);
                 }
 
-                ui.add_space(2.0);
-                let panel_tip = if self.settings_collapsed {
-                    "展开左侧设置面板"
-                } else {
-                    "收起左侧设置面板（宽屏看图表）"
-                };
-                if icon_button(
-                    ui,
-                    p,
-                    Icon::PanelLeft,
-                    Vec2::new(28.0, 26.0),
-                    14.0,
-                    false,
-                    panel_tip,
-                )
-                .clicked()
+                ui.add_space(4.0);
+                let in_settings = self.view == AppView::Settings;
+                if draw_titlebar_chip_btn(ui, p, Icon::Settings, "设置", in_settings, dirty)
+                    .clicked()
                 {
-                    self.settings_collapsed = !self.settings_collapsed;
+                    self.view = if in_settings {
+                        AppView::Home
+                    } else {
+                        AppView::Settings
+                    };
                 }
             });
         });
     }
 
-    fn draw_top_header_card(&mut self, ui: &mut egui::Ui, p: &Palette) {
+    fn draw_status_ribbon(&mut self, ui: &mut egui::Ui, p: &Palette) {
         let state = self.state();
         let running = self.monitoring();
-        let dirty = self.form.is_dirty(&self.settings);
         let (status_fg, status_soft, status_border) = p.state_colors(state);
         let pulse = matches!(
             state,
@@ -524,131 +539,101 @@ impl GuardApp {
         let mut open_account_settings = false;
 
         accent_card(ui, p, status_fg, |ui| {
-            // 第一行：主状态信息 + 常驻主操作按钮（统一中线对齐）
             ui.allocate_ui_with_layout(
-                Vec2::new(ui.available_width(), 40.0),
+                Vec2::new(ui.available_width(), 44.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
                     pulsing_dot(ui, status_fg, 26.0, pulse);
                     ui.add_space(4.0);
                     ui.vertical(|ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(420.0, 22.0),
-                            egui::Layout::left_to_right(egui::Align::Center),
-                            |ui| {
-                                ui.spacing_mut().item_spacing.x = 6.0;
-                                ui.label(bold_text(status_title(state), 15.5, p.text));
-                                let now_unix = Local::now().timestamp();
-                                if let Some(since_ts) = self.online_since_unix {
-                                    if state == Some(MonitorState::Online) {
-                                        let elapsed = (now_unix - since_ts).max(0) as u64;
-                                        badge(
-                                            ui,
-                                            status_fg,
-                                            status_soft,
-                                            status_border,
-                                            &format!("在线 {}", format_uptime(elapsed)),
-                                        );
-                                    }
+                        ui.spacing_mut().item_spacing.y = 3.0;
+                        // 第一行：连接状态 + 在线时长 + 嵌入式账号胶囊
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 7.0;
+                            ui.label(bold_text(status_title(state), 15.0, p.text));
+                            let now_unix = Local::now().timestamp();
+                            if let Some(since_ts) = self.online_since_unix {
+                                if state == Some(MonitorState::Online) {
+                                    let elapsed = (now_unix - since_ts).max(0) as u64;
+                                    badge(
+                                        ui,
+                                        status_fg,
+                                        status_soft,
+                                        status_border,
+                                        &format!("在线 {}", format_uptime(elapsed)),
+                                    );
                                 }
-                                if running && state == Some(MonitorState::Online) {
-                                    if let Some(last_ts) = self.last_check_unix {
-                                        let interval = self.settings.check_interval.max(1) as u64;
-                                        let elapsed = (now_unix - last_ts).max(0) as u64;
-                                        let rem = interval.saturating_sub(elapsed);
-                                        badge(
-                                            ui,
-                                            p.text_muted,
-                                            p.subtle,
-                                            p.divider,
-                                            &format!("{rem}s 后巡检"),
-                                        );
-                                    }
-                                }
-                            },
-                        );
+                            }
+                            if draw_account_chip(
+                                ui,
+                                p,
+                                &self.settings.student_id,
+                                carrier_label(&self.settings.carrier),
+                            ) {
+                                open_account_settings = true;
+                            }
+                        });
 
-                        let msg = if self.ipc.connection_lost.load(Ordering::Acquire) {
-                            "与守护进程的连接已断开，请重新打开主界面"
+                        // 第二行：巡检倒计时与最近检测，异常时直接显示可读故障说明
+                        let meta_text = if self.ipc.connection_lost.load(Ordering::Acquire) {
+                            "与守护进程的连接已断开，请重新打开主界面".to_string()
+                        } else if state == Some(MonitorState::Online) {
+                            let mut parts: Vec<String> = Vec::new();
+                            if running {
+                                if let Some(last_ts) = self.last_check_unix {
+                                    let interval = self.settings.check_interval.max(1) as u64;
+                                    let elapsed =
+                                        (Local::now().timestamp() - last_ts).max(0) as u64;
+                                    let rem = interval.saturating_sub(elapsed);
+                                    parts.push(format!("{rem}s 后自动巡检"));
+                                }
+                            }
+                            if last_at_str != "—" {
+                                if dur != "—" {
+                                    parts.push(format!("上次检测 {last_at_str}（网关 {dur}）"));
+                                } else {
+                                    parts.push(format!("上次检测 {last_at_str}"));
+                                }
+                            }
+                            if parts.is_empty() {
+                                "校园网已连接，守护运行正常".to_string()
+                            } else {
+                                parts.join(" · ")
+                            }
                         } else {
                             self.latest
                                 .as_ref()
-                                .map(|s| s.message.as_str())
+                                .map(|s| s.message.clone())
                                 .filter(|m| !m.is_empty())
-                                .unwrap_or("正在初始化网络诊断…")
+                                .unwrap_or_else(|| "正在初始化网络诊断…".to_string())
                         };
-                        ui.label(body_text(msg, 11.5, p.text_secondary));
+                        ui.label(body_text(meta_text, 11.0, p.text_muted));
                     });
 
+                    // 右侧主操作按钮（精简为 2 枚：暂停/开始 + 立即检测）
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 7.0;
-                        if !self.settings_collapsed || dirty || self.needs_setup {
-                            let saving = self
-                                .pending
-                                .values()
-                                .any(|p| matches!(p.command, UiToDaemon::ReloadSettings { .. }));
-                            let response = ui
-                                .add_enabled_ui(!saving, |ui| {
-                                    if self.needs_setup {
-                                        primary_button(ui, p, Some(Icon::Check), "保存并开始守护")
-                                    } else {
-                                        save_button(ui, p, dirty)
-                                    }
-                                })
-                                .inner;
-                            if response.clicked() {
-                                self.save();
-                            }
-                        }
-                        let settings_label = if self.settings_collapsed {
-                            "设置"
-                        } else {
-                            "收起设置"
-                        };
-                        if secondary_button(ui, p, Some(Icon::Sliders), settings_label).clicked() {
-                            self.settings_collapsed = !self.settings_collapsed;
-                        }
                         if primary_button(ui, p, Some(Icon::Refresh), "立即检测").clicked() {
                             self.pending_manual_check = true;
                             self.show_toast("正在检测校园网连接…", false);
                             self.request(UiToDaemon::ForceCheck, None);
                         }
                         if running {
-                            if secondary_button(ui, p, Some(Icon::Pause), "暂停监控").clicked()
-                            {
+                            if secondary_button(ui, p, Some(Icon::Pause), "暂停").clicked() {
                                 self.request(UiToDaemon::Pause, None);
                             }
                         } else if !self.needs_setup
-                            && secondary_button(ui, p, Some(Icon::Play), "开始监控").clicked()
+                            && secondary_button(ui, p, Some(Icon::Play), "开始").clicked()
                         {
                             self.request(UiToDaemon::Start, None);
                         }
                     });
                 },
             );
-
-            // 细分隔线 + 当前账号与运营商摘要条
-            ui.add_space(6.0);
-            let sep = ui.allocate_space(Vec2::new(ui.available_width(), 1.0)).1;
-            ui.painter().line_segment(
-                [sep.left_center(), sep.right_center()],
-                Stroke::new(1.0_f32, p.divider),
-            );
-            ui.add_space(5.0);
-
-            open_account_settings = draw_account_info_strip(
-                ui,
-                p,
-                &self.settings.student_id,
-                carrier_label(&self.settings.carrier),
-                &dur,
-                &last_at_str,
-            );
         });
 
         if open_account_settings {
-            self.settings_collapsed = false;
+            self.view = AppView::Settings;
             self.form.tab = settings_page::SettingsTab::Account;
         }
     }
@@ -733,13 +718,11 @@ impl eframe::App for GuardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_channels();
 
-        // 若守护进程已退出（例如从托盘点「退出」），界面进程自动关闭。
         if self.ipc.daemon_closed.load(Ordering::Relaxed) {
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
         }
 
-        // 最小化到任务栏时停止重绘并裁剪工作集，保持 0% 后台 CPU。
         let minimized = ctx.input(|input| input.viewport().minimized.unwrap_or(false));
         if minimized {
             if !self.trimmed_while_idle {
@@ -750,7 +733,6 @@ impl eframe::App for GuardApp {
         }
         self.trimmed_while_idle = false;
 
-        // 窗口可见时按需低频刷新（平时 1s 刷一次在线计时；活跃检测/Toast 时 250ms）。
         let fast_refresh = !self.pending.is_empty()
             || self.toast.is_some()
             || matches!(
@@ -769,135 +751,95 @@ impl eframe::App for GuardApp {
         let p = Palette::of(self.theme_mode);
         handle_window_resize(ctx);
 
-        // 1. 顶部无边框自定义标题栏
+        // 1. 36px 原生极简无边框标题栏
         egui::TopBottomPanel::top("custom_titlebar")
             .exact_height(TITLEBAR_HEIGHT)
             .frame(egui::Frame::NONE)
             .show(ctx, |ui| self.draw_titlebar(ctx, ui, &p));
 
-        // 2. 底部极简提示条（增加清晰上下呼吸边距，避免贴紧左卡底部）
-        egui::TopBottomPanel::bottom("footer_hint")
-            .exact_height(28.0)
-            .frame(
-                egui::Frame::new()
-                    .fill(p.bg)
-                    .inner_margin(egui::Margin { left: 14, right: 14, top: 2, bottom: 4 }),
-            )
-            .show(ctx, |ui| {
-                ui.horizontal_centered(|ui| {
-                    ui.label(body_text(
-                        "拖动分隔线可调整图表与日志比例 · 关闭窗口立即释放界面内存，守护程序仍在系统托盘轻量运行",
-                        10.5,
-                        p.text_muted,
-                    ));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.label(body_text(
-                            format!("遥测样本 {} 条", self.telemetry.len()),
-                            10.5,
-                            p.text_muted,
-                        ));
-                    });
-                });
-            });
+        // 2. 主工作区：主页 or 成熟版 Fluent 设置中心
+        match self.view {
+            AppView::Home => {
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin {
+                        left: 12,
+                        right: 12,
+                        top: 10,
+                        bottom: 10,
+                    }))
+                    .show(ctx, |ui| {
+                        ui.spacing_mut().item_spacing.y = 0.0;
 
-        // 3. 主单屏工作台（上：状态操作栏；下：左设置 + 右图表/日志可拖分栏）
-        egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(p.bg).inner_margin(egui::Margin {
-                left: 12,
-                right: 12,
-                top: 8,
-                bottom: 4,
-            }))
-            .show(ctx, |ui| {
-                // 统一卡片间纵向间距为精确 8px（与下方图表和日志之间的 8px 分隔条完全一致）
-                ui.spacing_mut().item_spacing.y = 0.0;
-                self.draw_top_header_card(ui, &p);
-                ui.add_space(8.0);
+                        // Tier 1: 精简状态主条
+                        self.draw_status_ribbon(ui, &p);
+                        ui.add_space(10.0);
 
-                let work_h = ui.available_height().max(340.0);
-                let total_w = ui.available_width();
+                        // Tier 2 + Tier 3 垂直比例分配（中部非对称双图 ~56%，底部全宽日志 ~44%）
+                        let avail_h = ui.available_height().max(320.0);
+                        let gap = 10.0_f32;
+                        let usable_h = (avail_h - gap).max(300.0);
+                        let min_mid = 236.0_f32;
+                        let min_log = 148.0_f32;
+                        let mid_h = (usable_h * 0.56)
+                            .clamp(min_mid, (usable_h - min_log).max(min_mid))
+                            .floor();
+                        let log_h = (usable_h - mid_h).max(min_log);
 
-                let max_left = (total_w - 430.0).max(260.0);
-                self.left_pane_width = self.left_pane_width.clamp(256.0, max_left.min(380.0));
-
-                let mut test_toast_clicked = false;
-
-                ui.horizontal_top(|ui| {
-                    ui.spacing_mut().item_spacing.x = 0.0;
-
-                    let right_w = if !self.settings_collapsed {
-                        let lw = self.left_pane_width.floor();
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(lw, work_h),
-                            egui::Layout::top_down(egui::Align::LEFT),
-                            |ui| {
-                                let act = settings_page::draw_panel(
-                                    ui,
-                                    &p,
-                                    &mut self.form,
-                                    &self.settings,
-                                    &self.store.app_dir,
-                                    self.credential_account.as_deref(),
-                                    work_h,
-                                );
-                                if act.test_toast {
-                                    test_toast_clicked = true;
-                                }
-                            },
+                        // Tier 2: 左 62% 稳定性主卡 + 右 38% 紧凑双模式环形流量卡
+                        charts::draw_home_visual_row(
+                            ui,
+                            &p,
+                            &self.telemetry,
+                            &mut self.time_range,
+                            &self.traffic,
+                            &mut self.traffic_period,
+                            self.settings.monthly_quota_gb,
+                            mid_h,
                         );
+                        ui.add_space(gap);
 
-                        let dx = vertical_splitter(ui, &p, work_h);
-                        if dx.abs() > 0.01 {
-                            self.left_pane_width =
-                                (self.left_pane_width + dx).clamp(256.0, max_left.min(380.0));
-                        }
-                        (total_w - lw - 8.0).max(360.0)
-                    } else {
-                        total_w
-                    };
-
-                    // 右侧主监控区：上监控图表 + 横向分隔线 + 下实时日志
-                    ui.allocate_ui_with_layout(
-                        Vec2::new(right_w, work_h),
-                        egui::Layout::top_down(egui::Align::LEFT),
-                        |ui| {
-                            ui.spacing_mut().item_spacing.y = 0.0;
-                            let usable_h = (work_h - 8.0).max(300.0);
-                            let min_chart = 220.0_f32;
-                            let min_log = 150.0_f32;
-                            let top_h = (usable_h * self.chart_ratio)
-                                .clamp(min_chart, (usable_h - min_log).max(min_chart))
-                                .floor();
-                            let bottom_h = (usable_h - top_h).max(min_log);
-
-                            charts::draw_monitoring_card(
-                                ui,
-                                &p,
-                                &self.telemetry,
-                                &mut self.time_range,
-                                top_h,
-                            );
-
-                            let dy = horizontal_splitter(ui, &p, right_w);
-                            if dy.abs() > 0.01 {
-                                let new_top = (top_h + dy)
-                                    .clamp(min_chart, (usable_h - min_log).max(min_chart));
-                                self.chart_ratio = (new_top / usable_h).clamp(0.36, 0.72);
-                            }
-
-                            logs_page::draw_card(
-                                ui,
-                                &p,
-                                &self.log_lines,
-                                &mut self.logs_state,
-                                &self.log_path,
-                                bottom_h,
-                            );
-                        },
-                    );
-                });
-
-                if test_toast_clicked {
+                        // Tier 3: 通栏静谧运行日志
+                        logs_page::draw_card(
+                            ui,
+                            &p,
+                            &self.log_lines,
+                            &mut self.logs_state,
+                            &self.log_path,
+                            log_h,
+                        );
+                    });
+            }
+            AppView::Settings => {
+                let saving = self
+                    .pending
+                    .values()
+                    .any(|p| matches!(p.command, UiToDaemon::ReloadSettings { .. }));
+                let mut actions = settings_page::SettingsActions::default();
+                egui::CentralPanel::default()
+                    .frame(egui::Frame::new().fill(p.bg))
+                    .show(ctx, |ui| {
+                        let total_h = ui.available_height().max(320.0);
+                        actions = settings_page::draw_settings_view(
+                            ui,
+                            &p,
+                            &mut self.form,
+                            &self.settings,
+                            &self.store.app_dir,
+                            &self.log_path,
+                            self.credential_account.as_deref(),
+                            self.needs_setup,
+                            saving,
+                            total_h,
+                        );
+                    });
+                if actions.save {
+                    self.save();
+                }
+                if actions.reset {
+                    self.form.reset_from(&self.settings);
+                    self.show_toast("已还原未保存的修改", false);
+                }
+                if actions.test_toast {
                     self.request(
                         UiToDaemon::TestToast {
                             body: "这是一条测试通知：断网或恢复时会弹出类似提醒".to_string(),
@@ -905,7 +847,8 @@ impl eframe::App for GuardApp {
                         None,
                     );
                 }
-            });
+            }
+        }
 
         self.draw_toast(ctx, &p);
 
@@ -926,123 +869,132 @@ impl eframe::App for GuardApp {
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {}
 }
 
-/// 顶部卡片下方：展示当前登录账号与运营商出口（点击可快速打开账号设置），右侧显示最近检测时间与延迟。
-fn draw_account_info_strip(
-    ui: &mut egui::Ui,
-    p: &Palette,
-    student_id: &str,
-    carrier: &str,
-    dur: &str,
-    last_at: &str,
-) -> bool {
-    let mut open_settings = false;
-    let has_account = !student_id.trim().is_empty();
-    let account_val = if has_account { student_id } else { "未设置" };
-
-    ui.allocate_ui_with_layout(
-        Vec2::new(ui.available_width(), 24.0),
-        egui::Layout::left_to_right(egui::Align::Center),
-        |ui| {
-            ui.spacing_mut().item_spacing.x = 12.0;
-
-            // 1) 当前账号
-            if draw_info_chip(
-                ui,
-                p,
-                Icon::Key,
-                if has_account { p.accent } else { p.warn },
-                "当前账号",
-                account_val,
-                if has_account { p.text } else { p.warn },
-                "点击修改校园网学号与密码",
-            ) {
-                open_settings = true;
-            }
-
-            // 2) 运营商出口
-            if draw_info_chip(
-                ui,
-                p,
-                Icon::Wifi,
-                p.ok,
-                "运营商",
-                carrier,
-                p.text,
-                "点击切换校园网运营商出口",
-            ) {
-                open_settings = true;
-            }
-
-            // 右侧检测摘要
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut parts: Vec<String> = Vec::new();
-                if dur != "—" {
-                    parts.push(format!("延迟 {dur}"));
-                }
-                parts.push(format!("上次检测 {last_at}"));
-                ui.label(body_text(parts.join(" · "), 11.0, p.text_muted));
-            });
-        },
-    );
-
-    open_settings
-}
-
-#[allow(clippy::too_many_arguments)]
-fn draw_info_chip(
+fn draw_titlebar_chip_btn(
     ui: &mut egui::Ui,
     p: &Palette,
     icon: Icon,
-    icon_color: egui::Color32,
     label: &str,
-    value: &str,
-    value_color: egui::Color32,
-    tip: &str,
-) -> bool {
-    let mut job = egui::text::LayoutJob::default();
-    job.append(
-        label,
-        0.0,
-        egui::TextFormat {
-            font_id: egui::FontId::proportional(11.5),
-            color: p.text_muted,
-            ..Default::default()
-        },
-    );
-    job.append(
-        value,
-        5.0,
-        egui::TextFormat {
-            font_id: egui::FontId::new(11.5, crate::ui::theme::bold_family()),
-            color: value_color,
-            ..Default::default()
-        },
-    );
-    let galley = ui.painter().layout_job(job);
-    let chip_w = 6.0 + 12.0 + 5.0 + galley.size().x + 6.0;
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(chip_w, 24.0), Sense::click());
-    if resp.hovered() {
-        ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+    active: bool,
+    dot: bool,
+) -> egui::Response {
+    let font = egui::FontId::new(11.5, crate::ui::theme::bold_family());
+    let fg = if active { p.accent } else { p.text_secondary };
+    let galley = ui.painter().layout_no_wrap(label.to_string(), font, fg);
+    let w = 8.0 + 13.0 + 5.0 + galley.size().x + 8.0 + if dot { 8.0 } else { 0.0 };
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 25.0), Sense::click());
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    if active || resp.hovered() {
+        let (fill, stroke) = if active {
+            (p.card, Stroke::new(1.0_f32, p.accent_border))
+        } else {
+            (p.card, Stroke::new(1.0_f32, p.border))
+        };
         ui.painter().rect(
             rect,
             CornerRadius::same(6),
-            p.subtle,
-            Stroke::new(1.0_f32, p.border),
+            fill,
+            stroke,
             StrokeKind::Inside,
         );
     }
     let cy = rect.center().y;
-    let mut x = rect.left() + 6.0;
-    let icon_rect = Rect::from_center_size(Pos2::new(x + 6.0, cy), Vec2::splat(11.5));
-    icons::paint(ui.painter(), icon_rect, icon, icon_color);
-    x += 17.0;
+    let icon_rect = Rect::from_center_size(Pos2::new(rect.left() + 14.0, cy), Vec2::splat(13.0));
+    let ic_color = if active {
+        p.accent
+    } else if resp.hovered() {
+        p.text
+    } else {
+        p.text_secondary
+    };
+    icons::paint(ui.painter(), icon_rect, icon, ic_color);
+    let text_color = if active {
+        p.accent
+    } else if resp.hovered() {
+        p.text
+    } else {
+        p.text_secondary
+    };
     ui.painter().galley(
-        Pos2::new(x, cy - galley.size().y * 0.5),
+        Pos2::new(rect.left() + 25.0, cy - galley.size().y * 0.5),
         galley,
-        value_color,
+        text_color,
     );
+    if dot {
+        ui.painter()
+            .circle_filled(Pos2::new(rect.right() - 7.0, cy), 3.0, p.warn);
+    }
+    resp
+}
+
+/// 顶部状态条内的嵌入式账号胶囊（阶段二将升级为一键下拉切号菜单）。
+fn draw_account_chip(ui: &mut egui::Ui, p: &Palette, student_id: &str, carrier: &str) -> bool {
+    let trimmed = student_id.trim();
+    let has_account = !trimmed.is_empty();
+    let display = if !has_account {
+        "未配置账号".to_string()
+    } else if trimmed.chars().count() <= 4 {
+        trimmed.to_string()
+    } else {
+        let head: String = trimmed.chars().take(4).collect();
+        format!("{head}***")
+    };
+
+    let mut job = egui::text::LayoutJob::default();
+    job.append(
+        &display,
+        0.0,
+        egui::TextFormat {
+            font_id: egui::FontId::new(11.5, crate::ui::theme::bold_family()),
+            color: if has_account { p.text } else { p.warn },
+            ..Default::default()
+        },
+    );
+    job.append(
+        &format!(" · {carrier}"),
+        0.0,
+        egui::TextFormat {
+            font_id: egui::FontId::proportional(11.0),
+            color: p.text_muted,
+            ..Default::default()
+        },
+    );
+    let galley = ui.painter().layout_job(job);
+    let w = 8.0 + 12.0 + 5.0 + galley.size().x + 5.0 + 10.0 + 7.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 23.0), Sense::click());
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    let stroke = if resp.hovered() {
+        Stroke::new(1.0_f32, p.accent)
+    } else {
+        Stroke::new(1.0_f32, p.border)
+    };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(6),
+        p.subtle,
+        stroke,
+        StrokeKind::Inside,
+    );
+    let cy = rect.center().y;
+    let user_r = Rect::from_center_size(Pos2::new(rect.left() + 13.0, cy), Vec2::splat(11.5));
+    icons::paint(
+        ui.painter(),
+        user_r,
+        Icon::User,
+        if has_account {
+            p.text_secondary
+        } else {
+            p.warn
+        },
+    );
+    ui.painter().galley(
+        Pos2::new(rect.left() + 24.0, cy - galley.size().y * 0.5),
+        galley,
+        p.text,
+    );
+    let chev_r = Rect::from_center_size(Pos2::new(rect.right() - 11.0, cy), Vec2::splat(9.5));
+    icons::paint(ui.painter(), chev_r, Icon::ChevronDown, p.accent);
     let clicked = resp.clicked();
-    resp.on_hover_text(tip);
+    resp.on_hover_text("点击管理校园网账号与运营商出口");
     clicked
 }
 
