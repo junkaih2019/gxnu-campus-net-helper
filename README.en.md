@@ -10,28 +10,51 @@
   &nbsp;·&nbsp; <a href="LICENSE"><img src="docs/images/license-mit.svg" alt="MIT License" align="absmiddle"></a>
 </p>
 
-## What you can do
+## Screenshots
 
-- **Reconnect after an outage.** The helper checks the network adapter, route, internet connection, and campus portal session. When a sign-in is needed, it uses your saved account, then checks internet access again to confirm recovery. Enable Windows notifications to see when the connection drops or returns.
-- **See when your connection dropped.** The dashboard plots campus portal response times over the last **1, 7, or 24 hours**. Match a gap in the connection timeline to an outage record, then filter the log by time, severity, or keyword.
-- **Control monitoring from the tray.** Right-click the tray icon to run a check, pause or resume monitoring, or open the log. Closing the dashboard leaves monitoring running in the background. Click the tray icon to reopen it.
+| Light theme | Dark theme |
+| :---: | :---: |
+| [![Light dashboard with portal latency and outage history](docs/images/main-window-light.png)](docs/images/main-window-light.png) | [![Dark dashboard with portal latency and outage history](docs/images/main-window.png)](docs/images/main-window.png) |
 
-## How it handles campus network problems
+Select a dashboard screenshot to view it at full size. Both dashboard screenshots use the `DEMO` account and sample network history.
 
-| Situation | What the helper does |
-| --- | --- |
-| You switch from Wi-Fi to Ethernet or wake the computer from sleep | It waits for the route to settle before checking again, reducing false alerts and unnecessary sign-ins. |
-| Websites stop loading while your campus session is still active | It compares internet probes with the portal’s session status. If the portal confirms you are online, it reports an upstream connection problem and waits for recovery without resubmitting your password. |
-| The portal repeatedly rejects your account or carrier | It retries the first rejection silently. Repeated rejections prompt you to check your account, and the retry interval grows to a maximum of five minutes. |
-| You want a one-off connection check | Pause monitoring and select **立即检测** (Check now). The helper runs one read-only check and stays paused. |
+## Why use it
+
+- **A small Rust process stays in the tray.** One Windows executable contains the background monitor and the on-demand dashboard. Closing the dashboard ends its process. The project recorded about **2.9 MB of private memory and a 5.8 MB working set** for the background process alone. The open dashboard uses additional memory. [Architecture and memory figures (Chinese)](docs/ARCHITECTURE.md)
+- **Prompt reconnection when the network changes.** Switching Wi-Fi, plugging or unplugging Ethernet, or waking the computer triggers a check. Once the route settles, the helper checks the campus session, signs in when needed, and verifies internet access. If the portal still reports an active session, it reports an upstream fault and avoids repeated sign-ins.
+- **An outage history you can investigate.** View **1, 7, or 24 hours** of campus portal latency. Match a drop on the chart to an outage record, then filter the log by time, severity, or keyword to distinguish an expired session from an unreachable gateway.
 
 ## Get started
 
-1. Open Releases using the download link above. Download the Windows x64 ZIP, extract it to a folder you plan to keep, and run `GXNU 校园网守护助手.exe`.
-2. Under **账号与网络** (Account and network), enter your campus student ID and password, select your carrier, and click **保存并开始守护** (Save and start monitoring).
-3. To launch the app at Windows sign-in, open **监控** (Monitoring) and enable **开机自动启动到托盘** (Start in the tray). To begin checking the connection whenever the app launches, also enable **启动后立即开始监控** (Start monitoring on launch).
+1. **Download and extract.** Follow the Windows x64 download link above, extract the ZIP to a folder you plan to keep, and run `GXNU 校园网守护助手.exe`.
+2. **Set up your account.** Under **账号与网络** (Account and network), enter your campus student ID and password, choose your carrier, and select **保存并开始守护** (Save and start monitoring). The top of the dashboard shows your connection status and last check time.
+3. **Set startup preferences.** Under **监控** (Monitoring), enable **开机自动启动到托盘** to launch the app in the tray when you sign in to Windows. Enable **启动后立即开始监控** as well if you want checks to start on launch.
 
-To quit completely, right-click the tray icon and select **退出 GXNU 校园网守护助手** (Exit).
+### Everyday controls
+
+| Task | How to do it |
+| --- | --- |
+| Keep monitoring in the background | Close the dashboard. The monitor stays in the tray. Click its icon in the Windows notification area to reopen the dashboard. |
+| Investigate the last outage | Choose a time range, find the event under **断网记录与原因** (Outages and causes), then check **运行日志** (Log) for the same time. |
+| Run a single check | Right-click the tray icon, select **暂停监控** (Pause), then **立即检测** (Check now). The check is read-only and monitoring stays paused. |
+| Resume monitoring or quit | Select **开始监控** (Start monitoring) from the tray, or **退出 GXNU 校园网守护助手** (Exit) to quit completely. |
+| Switch themes | Click the sun or moon in the upper-right corner of the dashboard to switch between light and dark themes. |
+
+### Tray icon states
+
+The dot in the lower-right corner of the tray icon shows the current state. Hover over the icon for the exact status, including which of the three amber stages is active.
+
+<img src="docs/images/tray-menu.png" alt="Windows taskbar with a green dot on the helper icon. The open menu reports an active campus connection and 59 ms gateway latency." width="300">
+
+The green dot on the helper’s Wi-Fi icon means the connection is online. The open menu confirms **校园网已连接** (Campus network connected) and shows the gateway latency measured at that moment, 59 ms.
+
+| Icon | Tooltip in the app | Meaning |
+| :---: | --- | --- |
+| <img src="docs/images/tray-online.png" width="28" alt="Green dot"> | 网络正常 · Online | An internet probe succeeded. Routine checks continue at the configured interval. |
+| <img src="docs/images/tray-checking.png" width="28" alt="Sky-blue dot"> | 检测中 · Checking | A connection check is in progress. |
+| <img src="docs/images/tray-recovery.png" width="28" alt="Amber dot"> | 正在复核 / 正在登录 / 正在验证 | Rechecking a failure, signing in to the portal, or verifying internet access after sign-in, respectively. A recheck can also return directly to online. |
+| <img src="docs/images/tray-offline.png" width="28" alt="Red dot"> | 连接异常 · Offline | Open the dashboard to see the cause. If the portal repeatedly rejects sign-in, check the student ID, password, and carrier. |
+| <img src="docs/images/tray-paused.png" width="28" alt="Gray dot"> | 已暂停 / 已停止 · Paused or stopped | Automatic checks are inactive. While paused, you can run a single check or resume monitoring from the tray. |
 
 <details>
 <summary>Upgrade from v0.1.0 or verify a download</summary>
@@ -49,16 +72,6 @@ Get-FileHash .\gxnu-campus-net-helper-0.1.1-windows-x64.zip -Algorithm SHA256
 ```
 
 </details>
-
-## Screenshots
-
-**Dashboard** · Account settings, portal latency, outage history, and logs share one screen. The `DEMO` account and network history in this screenshot are sample data.
-
-![Dashboard showing 24 hours of portal latency, two outages, and the event log](docs/images/main-window.png)
-
-**Tray menu** · The menu shows the current monitoring state. Here monitoring is paused, and a one-off check is still available.
-
-<img src="docs/images/tray-menu.png" alt="Tray menu with monitoring paused and actions to check now, start monitoring, or exit" width="256">
 
 ## Data and privacy
 
