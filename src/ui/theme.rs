@@ -5,8 +5,9 @@
 //! - 克制的交互主色（Fluent 蓝 `#2563EB` / `#3B82F6`），语义状态色仅用于状态反馈
 //! - 单一微软雅黑 Regular + Bold 字体栈，中英文与数字基线严格齐平
 
-use std::path::Path;
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use eframe::egui;
 use serde::{Deserialize, Serialize};
@@ -404,6 +405,73 @@ pub fn mono_text(text: impl Into<String>, size: f32, color: egui::Color32) -> eg
         .color(color)
 }
 
+const MAX_FONT_BYTES: usize = 64 * 1024 * 1024;
+
+fn map_font_bytes(path: &Path) -> Option<&'static [u8]> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use std::ptr::{null, NonNull};
+    use windows_sys::Win32::Storage::FileSystem::{GetFileSizeEx, FILE_SHARE_READ};
+    use windows_sys::Win32::System::Memory::{
+        CreateFileMappingW, MapViewOfFile, FILE_MAP_READ, PAGE_READONLY,
+    };
+
+    let file = std::fs::File::options()
+        .read(true)
+        .share_mode(FILE_SHARE_READ)
+        .open(path)
+        .ok()?;
+    let mut len = 0;
+    // SAFETY: file 持有有效句柄，len 是可写的 i64。
+    if unsafe { GetFileSizeEx(file.as_raw_handle(), &mut len) } == 0 {
+        return None;
+    }
+    let len = usize::try_from(len).ok()?;
+    if !(1..=MAX_FONT_BYTES).contains(&len) {
+        return None;
+    }
+
+    // SAFETY: 文件禁止写入和删除。匿名映射覆盖整份文件，视图长度已按同一句柄校验。
+    let view = unsafe {
+        let mapping = CreateFileMappingW(file.as_raw_handle(), null(), PAGE_READONLY, 0, 0, null());
+        if mapping.is_null() {
+            return None;
+        }
+        let mapping = OwnedHandle::from_raw_handle(mapping);
+        MapViewOfFile(mapping.as_raw_handle(), FILE_MAP_READ, 0, 0, len)
+    };
+    let start = NonNull::new(view.Value.cast::<u8>())?;
+    // 进程退出时由 Windows 回收视图和文件句柄。只有保留原文件句柄才能维持共享限制。
+    std::mem::forget(file);
+    // SAFETY: 该只读视图永不解除映射，且底层文件在切片的整个生命周期内禁止写入。
+    Some(unsafe { std::slice::from_raw_parts(start.as_ptr(), len) })
+}
+
+fn cached_font_bytes(path: &Path) -> Option<&'static [u8]> {
+    static FONTS: OnceLock<Mutex<HashMap<PathBuf, &'static [u8]>>> = OnceLock::new();
+    let mut fonts = FONTS
+        .get_or_init(Mutex::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(&bytes) = fonts.get(path) {
+        return Some(bytes);
+    }
+
+    // 首次加载也在锁内，避免两个调用同时为同一路径保留视图或缓冲。
+    let bytes = map_font_bytes(path).or_else(|| {
+        if !(1..=MAX_FONT_BYTES as u64).contains(&path.metadata().ok()?.len()) {
+            return None;
+        }
+        let bytes = std::fs::read(path).ok()?;
+        if !(1..=MAX_FONT_BYTES).contains(&bytes.len()) {
+            return None;
+        }
+        Some(bytes.leak() as &'static [u8])
+    })?;
+    fonts.insert(path.to_owned(), bytes);
+    Some(bytes)
+}
+
 pub fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
 
@@ -413,8 +481,8 @@ pub fn install_fonts(ctx: &egui::Context) {
                            index: u32,
                            tweak: egui::FontTweak|
      -> bool {
-        if let Ok(bytes) = std::fs::read(path) {
-            let mut data = egui::FontData::from_owned(bytes).tweak(tweak);
+        if let Some(bytes) = cached_font_bytes(Path::new(path)) {
+            let mut data = egui::FontData::from_static(bytes).tweak(tweak);
             data.index = index;
             fonts.font_data.insert(key.to_owned(), data.into());
             true
@@ -770,6 +838,87 @@ pub fn format_ms_compact(ms: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mapped_font_is_read_only_and_reuses_its_address() {
+        use std::mem::{size_of, MaybeUninit};
+        use windows_sys::Win32::Foundation::ERROR_SHARING_VIOLATION;
+        use windows_sys::Win32::System::Memory::{
+            VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_MAPPED, PAGE_READONLY,
+        };
+
+        const CHILD_PATH: &str = "GXNU_TEST_MAPPED_FONT_PATH";
+        const CONTENTS: &[u8] = b"ttcf\0\x01\x80\xff\0end";
+        if let Some(path) = std::env::var_os(CHILD_PATH) {
+            let path = Path::new(&path);
+            let bytes: &'static [u8] = cached_font_bytes(path).unwrap();
+            assert_eq!(bytes, CONTENTS);
+            assert!(std::ptr::eq(bytes, cached_font_bytes(path).unwrap()));
+
+            let mut info = MaybeUninit::<MEMORY_BASIC_INFORMATION>::uninit();
+            let size = size_of::<MEMORY_BASIC_INFORMATION>();
+            // SAFETY: VirtualQuery 写入 info，只有返回完整结构体时才读取。
+            let info = unsafe {
+                assert_eq!(
+                    VirtualQuery(bytes.as_ptr().cast(), info.as_mut_ptr(), size),
+                    size
+                );
+                info.assume_init()
+            };
+            assert_eq!((info.Type, info.Protect), (MEM_MAPPED, PAGE_READONLY));
+            let err = std::fs::File::options().write(true).open(path).unwrap_err();
+            assert_eq!(err.raw_os_error(), Some(ERROR_SHARING_VIOLATION as i32));
+            return;
+        }
+
+        // 静态视图随子进程退出才释放。由父进程持有临时目录，以便退出后正常删除文件。
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("字体.bin");
+        std::fs::write(&path, CONTENTS).unwrap();
+        let test = std::thread::current();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test.name().unwrap(), "--nocapture"])
+            .env(CHILD_PATH, &path)
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        dir.close().unwrap();
+    }
+
+    #[test]
+    fn font_read_fallback_keeps_one_snapshot() {
+        use std::io::Write;
+
+        // 已打开的写句柄与 FILE_SHARE_READ 冲突，但仍允许普通读取。
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        let original = b"\0font\xff";
+        file.write_all(original).unwrap();
+        let bytes = cached_font_bytes(file.path()).unwrap();
+        file.as_file().set_len(0).unwrap();
+        assert!(std::ptr::eq(bytes, cached_font_bytes(file.path()).unwrap()));
+        assert_eq!(bytes, original);
+    }
+
+    #[test]
+    fn missing_empty_and_oversized_fonts_return_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("font.bin");
+        assert!(cached_font_bytes(&path).is_none());
+        std::fs::write(&path, []).unwrap();
+        assert!(cached_font_bytes(&path).is_none());
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_FONT_BYTES as u64 + 1)
+            .unwrap();
+        assert!(cached_font_bytes(&path).is_none());
+    }
 
     #[test]
     fn ui_prefs_backward_compat_and_clamp() {
