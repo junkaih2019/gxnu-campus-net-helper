@@ -119,7 +119,7 @@ impl CampusAuthenticator {
                 code: String::new(),
             });
         }
-        let carrier = if matches!(carrier, "0" | "1" | "2" | "3") {
+        let carrier = if matches!(carrier, "0" | "1" | "2" | "3" | "4") {
             carrier
         } else {
             "2"
@@ -543,6 +543,36 @@ mod tests {
         assert!(req.contains("&R3=2&"));
         assert!(req.contains("&v4ip=192.0.2.42&"));
         assert!(!req.contains("%00"));
+    }
+
+    #[test]
+    fn authenticate_supports_broadnet_carrier_r3_4() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap();
+            let req = String::from_utf8_lossy(&buf[..n]).to_string();
+            let body = r#"dr1004({"result":1,"msg":"Portal协议认证成功"});"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/javascript\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(resp.as_bytes()).unwrap();
+            req
+        });
+
+        let auth = CampusAuthenticator::with_url(format!("http://127.0.0.1:{port}/drcom/login"));
+        let res = auth.authenticate("demo-student", "pass123", "4", "172.16.24.195");
+        let req = handle.join().unwrap();
+
+        assert!(res.success);
+        assert!(req.contains("&R3=4&"));
     }
 
     #[test]

@@ -79,14 +79,14 @@ impl SettingsForm {
                 Some(acc.id.clone()),
                 acc.remark.clone(),
                 acc.student_id.clone(),
-                acc.carrier.parse::<usize>().unwrap_or(2).min(3),
+                acc.carrier.parse::<usize>().unwrap_or(2).min(4),
                 acc.monthly_quota_gb,
             ),
             None => (
                 None,
                 String::new(),
                 settings.student_id.clone(),
-                settings.carrier.parse::<usize>().unwrap_or(2).min(3),
+                settings.carrier.parse::<usize>().unwrap_or(2).min(4),
                 settings.monthly_quota_gb,
             ),
         };
@@ -125,7 +125,7 @@ impl SettingsForm {
         self.student_id = profile.student_id.clone();
         self.password.clear();
         self.show_password = false;
-        self.carrier = profile.carrier.parse::<usize>().unwrap_or(2).min(3);
+        self.carrier = profile.carrier.parse::<usize>().unwrap_or(2).min(4);
         self.verify_error = None;
         self.monthly_quota_gb = profile.monthly_quota_gb;
     }
@@ -1203,17 +1203,19 @@ fn draw_compact_action_btn(
 
 fn draw_carrier_row(ui: &mut egui::Ui, p: &Palette, carrier: &mut usize) -> bool {
     let mut changed = false;
-    let labels = ["校园网", "中国电信", "中国联通", "中国移动"];
-    let gap = 8.0_f32;
+    // 与师大认证门户 `yc.gxnu.edu.cn` (`ISP_select` value="0".."4") 严格一一对应
+    let labels = ["校园网", "中国电信", "中国联通", "中国移动", "广电网络"];
+    let n = labels.len();
+    let gap = 7.0_f32;
     let total_w = ui.available_width();
-    let usable_w = (total_w - gap * 3.0).max(296.0);
-    let base_w = (usable_w * 0.25).floor();
+    let usable_w = (total_w - gap * (n.saturating_sub(1) as f32)).max(310.0);
+    let base_w = (usable_w / n as f32).floor();
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = gap;
         for (idx, label) in labels.iter().enumerate() {
             let active = *carrier == idx;
-            let btn_w = if idx == 3 {
-                (usable_w - base_w * 3.0).max(base_w)
+            let btn_w = if idx + 1 == n {
+                (usable_w - base_w * (n.saturating_sub(1) as f32)).max(base_w)
             } else {
                 base_w
             };

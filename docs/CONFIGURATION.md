@@ -50,7 +50,7 @@
 
 | 字段 | 类型 | 合法范围 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- | :--- |
-| `accounts` | array | — | `[]` | 多账号配置列表，每项包含 `id`、`remark`（备注名）、`student_id`、`carrier`、`monthly_quota_gb`；旧版单账号配置启动时自动迁入 |
+| `accounts` | array | — | `[]` | 多账号配置列表，每项包含 `id`、`remark`（备注名）、`student_id`、`carrier`（`"0"` 校园网 / `"1"` 中国电信 / `"2"` 中国联通 / `"3"` 中国移动 / `"4"` 广电网络）、`monthly_quota_gb`；旧版单账号配置启动时自动迁入 |
 | `active_account_id` | string | — | `""` | 当前活跃账号的 `id` |
 | `student_id` / `carrier` / `monthly_quota_gb` | — | — | — | 当前活跃账号的镜像字段（向后兼容旧版配置） |
 | `check_interval` | integer | `10` ~ `3600` | `30` | 在线巡检间隔（秒） |

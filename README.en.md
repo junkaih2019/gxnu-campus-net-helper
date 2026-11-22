@@ -85,7 +85,7 @@
 
 1. **Download & Run**: Grab **`gxnu-campus-net-helper-v0.2.2.exe`** from [Releases](https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest), place it in a **permanent folder**, and run it directly (no installer or extraction needed).
    > 💡 If Windows SmartScreen appears on first launch, click **More info → Run anyway** (you can verify the hash against `SHA256SUMS.txt` on the release page).
-2. **Add Account**: Enter your student ID, password, and exit (`校园网` / Telecom / Unicom / Mobile) in **设置 → 账号管理 (Settings → Accounts)**, then click **保存并开始守护 (Save & Start)**.
+2. **Add Account**: Enter your student ID, password, and exit (`校园网` / Telecom / Unicom / Mobile / Broadnet) in **设置 → 账号管理 (Settings → Accounts)**, then click **保存并开始守护 (Save & Start)**.
 3. **Everyday Use**:
    - **Close the main window (`×`)** anytime to keep monitoring silently in the tray with minimal RAM;
    - **Left-click** the tray icon for the quick flyout, **double-click** for the main window, or **right-click** for the context menu;
@@ -102,7 +102,7 @@
 ## ❓ FAQ
 
 - **Why are there both "Carrier" (`运营商`) and "Campus" (`校园网`) traffic views?**  
-  Carrier broadband exits (Telecom / Unicom / Mobile) are unmetered, whereas the self-service package quota only applies to the Campus (`校园网`) exit. The app defaults to your active exit and lets you toggle anytime.
+  Carrier broadband exits (Telecom / Unicom / Mobile / Broadnet) are unmetered, whereas the self-service package quota only applies to the Campus (`校园网`) exit. The app defaults to your active exit and lets you toggle anytime.
 - **Does it conflict with Clash / Mihomo (TUN mode)?**  
   Not on Carrier exits — probes, portal logins, and self-service queries bypass system proxies and pierce virtual TUN adapters. When using the **Campus (`校园网`)** exit, please close VPN/proxy tools first as prompted to avoid campus anti-proxy account suspension.
 - **Where is my data stored, and how do I upgrade or uninstall?**  
