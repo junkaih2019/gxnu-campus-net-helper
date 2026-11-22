@@ -1,7 +1,7 @@
 //! Windows 11 Fluent 风格设置中心：
-//! - 左侧分组目录（账号管理 / 监控与自启 / 外观与显示 / 通知与数据）
+//! - 左侧分组目录（账号管理 / 监控与自启 / 外观与显示 / 通知与数据）+ 左下角极简版本号轻水印
 //! - 右侧带标题与说明的分组卡片
-//! - 底部常驻状态与操作栏（还原修改 / 保存设置）
+//! - 按需浮现的底部胶囊保存栏（仅在有未保存修改时出现，避免误触与常态视觉干扰）
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -246,15 +246,19 @@ pub fn draw_settings_view(
     let total_w = ui.available_width();
     let nav_w = 166.0_f32.min((total_w * 0.28).max(138.0));
     let content_w = (total_w - nav_w - 1.0).max(300.0);
-    let dirty = form.is_dirty(saved);
-    // 左右栏共享同一底部高度，确保左右两条水平分割线严格像素级齐平
-    let footer_bar_h = 51.0_f32;
-    let upper_h = (total_height - footer_bar_h).max(200.0);
+    let global_dirty = form.is_global_dirty(saved);
+    let draft_dirty = form.is_account_draft_dirty(saved);
+    let show_floating_bar = global_dirty
+        || (draft_dirty && form.tab != SettingsTab::Account)
+        || (needs_setup && form.tab != SettingsTab::Account);
+
+    let left_wm_h = 34.0_f32;
+    let left_nav_h = (total_height - left_wm_h).max(180.0);
 
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
 
-        // ── 左侧分组目录（上部导航 + 与右侧严格齐平的 51px 底部版本栏） ──
+        // ── 左侧分组目录（无底部分割线 + 左下角极简版本号轻水印） ──
         ui.allocate_ui_with_layout(
             Vec2::new(nav_w, total_height),
             egui::Layout::top_down(egui::Align::LEFT),
@@ -265,7 +269,7 @@ pub fn draw_settings_view(
 
                 // 上部导航目录
                 ui.allocate_ui_with_layout(
-                    Vec2::new(nav_w, upper_h),
+                    Vec2::new(nav_w, left_nav_h),
                     egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
                         egui::Frame::new()
@@ -278,7 +282,7 @@ pub fn draw_settings_view(
                             })
                             .show(ui, |ui| {
                                 let inner_w = (nav_w - 20.0).max(118.0);
-                                let inner_h = (upper_h - 22.0).max(160.0);
+                                let inner_h = (left_nav_h - 22.0).max(150.0);
                                 ui.set_min_size(Vec2::new(inner_w, inner_h));
                                 ui.set_max_size(Vec2::new(inner_w, inner_h));
                                 ui.spacing_mut().item_spacing.y = 3.0;
@@ -322,17 +326,10 @@ pub fn draw_settings_view(
                     },
                 );
 
-                // 左侧底部 1px 水平分割线（与右侧底部栏顶线精确处于同一 y 坐标）
-                let left_top_line = ui.allocate_space(Vec2::new(nav_w, 1.0)).1;
-                ui.painter().line_segment(
-                    [left_top_line.left_center(), left_top_line.right_center()],
-                    Stroke::new(1.0_f32, p.border),
-                );
-
-                // 左侧 50px 底部优雅双层英文品牌水印（视觉几何中心锁定 wm_cy，与右侧状态栏严格共轴）
+                // 左下角仅保留极简版本号轻水印（无分割线、低对比度融入侧栏底色）
                 let has_new_ver = update_state.has_visible_update(&saved.skipped_update_version);
                 let (wm_rect, wm_resp) = ui.allocate_exact_size(
-                    Vec2::new(nav_w, 50.0),
+                    Vec2::new(nav_w, left_wm_h),
                     if has_new_ver {
                         Sense::click()
                     } else {
@@ -341,105 +338,37 @@ pub fn draw_settings_view(
                 );
                 ui.painter()
                     .rect_filled(wm_rect, CornerRadius::ZERO, p.sidebar);
-                let wm_cx = wm_rect.center().x;
-                let wm_cy = wm_rect.center().y;
                 let is_dark = p.sidebar.r() < 128;
-                let base_alpha: u8 = if wm_resp.hovered() {
+                let alpha: u8 = if wm_resp.hovered() {
                     if is_dark {
-                        172
+                        162
                     } else {
-                        208
+                        198
                     }
                 } else if is_dark {
-                    132
+                    112
                 } else {
-                    174
+                    152
                 };
-                let sub_alpha: u8 = base_alpha.saturating_sub(28);
-                let rule_alpha: u8 = if wm_resp.hovered() {
-                    if is_dark {
-                        78
-                    } else {
-                        132
-                    }
-                } else if is_dark {
-                    52
+                let wm_color = if has_new_ver {
+                    with_alpha(p.accent, if wm_resp.hovered() { 235 } else { 195 })
                 } else {
-                    104
+                    with_alpha(p.text_muted, alpha)
                 };
-                let wm_brand_c = crate::ui::theme::with_alpha(p.text_muted, base_alpha);
-                let wm_rule_c = crate::ui::theme::with_alpha(p.text_muted, rule_alpha);
-                let wm_ver_c = if has_new_ver {
-                    crate::ui::theme::with_alpha(
-                        p.accent,
-                        if wm_resp.hovered() { 235 } else { 195 },
-                    )
-                } else {
-                    crate::ui::theme::with_alpha(p.text_muted, sub_alpha)
-                };
-
-                let mut brand_g = ui.painter().layout_no_wrap(
-                    "GXNU Campus Net Helper".to_string(),
-                    egui::FontId::proportional(9.8),
-                    wm_brand_c,
-                );
-                if brand_g.size().x > nav_w - 16.0 {
-                    brand_g = ui.painter().layout_no_wrap(
-                        "GXNU Campus Net Helper".to_string(),
-                        egui::FontId::proportional(9.0),
-                        wm_brand_c,
-                    );
-                }
-                let ver_label = if has_new_ver {
+                let ver_txt = if has_new_ver {
                     format!("v{} ↑", crate::VERSION)
                 } else {
                     format!("v{}", crate::VERSION)
                 };
-                let ver_g = ui.painter().layout_no_wrap(
-                    ver_label,
-                    egui::FontId::proportional(9.2),
-                    wm_ver_c,
+                let vg = ui.painter().layout_no_wrap(
+                    ver_txt,
+                    egui::FontId::proportional(10.0),
+                    wm_color,
                 );
-
-                let line1_cy = wm_cy - 6.6;
-                let line2_cy = wm_cy + 6.8;
-
-                ui.painter().galley(
-                    egui::Pos2::new(
-                        wm_cx - brand_g.size().x * 0.5,
-                        line1_cy - brand_g.size().y * 0.5,
-                    ),
-                    brand_g,
-                    wm_brand_c,
-                );
-
-                let ver_half_w = ver_g.size().x * 0.5;
-                ui.painter().galley(
-                    egui::Pos2::new(wm_cx - ver_half_w, line2_cy - ver_g.size().y * 0.5),
-                    ver_g,
-                    wm_ver_c,
-                );
-
-                // 版本号两侧纤细对称装饰短线，收束倒金字塔水印视觉重心
-                let rule_gap = 6.0_f32;
-                let rule_len = 12.0_f32;
-                if ver_half_w + rule_gap + rule_len < nav_w * 0.5 - 14.0 {
-                    let rule_stroke = Stroke::new(1.0_f32, wm_rule_c);
-                    ui.painter().line_segment(
-                        [
-                            egui::Pos2::new(wm_cx - ver_half_w - rule_gap - rule_len, line2_cy),
-                            egui::Pos2::new(wm_cx - ver_half_w - rule_gap, line2_cy),
-                        ],
-                        rule_stroke,
-                    );
-                    ui.painter().line_segment(
-                        [
-                            egui::Pos2::new(wm_cx + ver_half_w + rule_gap, line2_cy),
-                            egui::Pos2::new(wm_cx + ver_half_w + rule_gap + rule_len, line2_cy),
-                        ],
-                        rule_stroke,
-                    );
-                }
+                let lx = wm_rect.left() + 18.0;
+                let cy = wm_rect.bottom() - 15.0;
+                ui.painter()
+                    .galley(Pos2::new(lx, cy - vg.size().y * 0.5), vg, wm_color);
 
                 if has_new_ver {
                     let wm_resp = wm_resp
@@ -461,172 +390,139 @@ pub fn draw_settings_view(
             Stroke::new(1.0_f32, p.border),
         );
 
-        // ── 右侧内容区 + 底部常驻操作栏 ──────────────────────────────
-        let scroll_h = upper_h;
-
+        // ── 右侧内容区（方案 B：平时一通到底无底栏，有未保存修改时底部浮出胶囊条） ──
         ui.allocate_ui_with_layout(
             Vec2::new(content_w, total_height),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
                 ui.spacing_mut().item_spacing.y = 0.0;
+                let pane_rect = ui.max_rect();
 
-                // 上部可滚动分组表单
-                ui.allocate_ui_with_layout(
-                    Vec2::new(content_w, scroll_h),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        egui::Frame::new()
-                            .fill(p.bg)
-                            .inner_margin(egui::Margin {
-                                left: 18,
-                                right: 18,
-                                top: 14,
-                                bottom: 14,
-                            })
-                            .show(ui, |ui| {
-                                let inner_w = (content_w - 36.0).max(260.0);
-                                let inner_h = (scroll_h - 28.0).max(160.0);
-                                ui.set_min_size(Vec2::new(inner_w, inner_h));
-                                ui.set_max_size(Vec2::new(inner_w, inner_h));
-                                egui::ScrollArea::vertical()
-                                    .id_salt(("settings_content_scroll", form.tab.index()))
-                                    .max_height(inner_h)
-                                    .auto_shrink([false, false])
-                                    .show(ui, |ui| {
-                                        ui.set_width(inner_w);
-                                        match form.tab {
-                                            SettingsTab::Account => draw_account_page(
-                                                ui,
-                                                p,
-                                                form,
-                                                saved,
-                                                account_creds,
-                                                verifying_account,
-                                                &mut actions,
-                                            ),
-                                            SettingsTab::Monitor => draw_monitor_page(
-                                                ui,
-                                                p,
-                                                form,
-                                                update_state,
-                                                &mut actions,
-                                            ),
-                                            SettingsTab::Display => {
-                                                draw_display_page(ui, p, ui_prefs, &mut actions)
-                                            }
-                                            SettingsTab::Notify => {
-                                                if draw_notify_data_page(
-                                                    ui, p, form, app_dir, log_path,
-                                                ) {
-                                                    actions.test_toast = true;
-                                                }
-                                            }
-                                        }
-                                    });
-                            });
-                    },
-                );
-
-                // 底部常驻操作条（顶边 1px 描边 + 50px 精确水平中线绘制，与左侧水印严格共线）
-                let top_line = ui.allocate_space(Vec2::new(content_w, 1.0)).1;
-                ui.painter().line_segment(
-                    [top_line.left_center(), top_line.right_center()],
-                    Stroke::new(1.0_f32, p.border),
-                );
-                let (bar_rect, bar_resp) =
-                    ui.allocate_exact_size(Vec2::new(content_w, 50.0), Sense::hover());
-                ui.painter()
-                    .rect_filled(bar_rect, CornerRadius::ZERO, p.card);
-                let bar_cy = bar_rect.center().y;
-                let bar_inner = bar_rect.shrink2(Vec2::new(16.0, 0.0));
-
-                let mut buttons_left_x = bar_inner.right();
-                let mut btn_ui = ui.new_child(
-                    egui::UiBuilder::new()
-                        .max_rect(bar_inner)
-                        .layout(egui::Layout::right_to_left(egui::Align::Center)),
-                );
-                btn_ui.spacing_mut().item_spacing.x = 8.0;
-                let save_resp = btn_ui
-                    .add_enabled_ui(!saving && !verifying_account, |ui| {
-                        if verifying_account {
-                            primary_button(ui, p, Some(Icon::Refresh), "正在验证…")
-                        } else if needs_setup {
-                            primary_button(ui, p, Some(Icon::Check), "保存并开始守护")
-                        } else {
-                            save_button(ui, p, dirty)
-                        }
+                egui::Frame::new()
+                    .fill(p.bg)
+                    .inner_margin(egui::Margin {
+                        left: 18,
+                        right: 18,
+                        top: 14,
+                        bottom: 14,
                     })
-                    .inner;
-                buttons_left_x = buttons_left_x.min(save_resp.rect.left());
-                if save_resp.clicked() {
-                    actions.save = true;
-                }
-                if dirty && !verifying_account {
-                    let reset_resp = secondary_button(&mut btn_ui, p, None, "还原修改");
-                    buttons_left_x = buttons_left_x.min(reset_resp.rect.left());
-                    if reset_resp.clicked() {
+                    .show(ui, |ui| {
+                        let inner_w = (content_w - 36.0).max(260.0);
+                        let inner_h = (total_height - 28.0).max(160.0);
+                        ui.set_min_size(Vec2::new(inner_w, inner_h));
+                        ui.set_max_size(Vec2::new(inner_w, inner_h));
+                        egui::ScrollArea::vertical()
+                            .id_salt(("settings_content_scroll", form.tab.index()))
+                            .max_height(inner_h)
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                ui.set_width(inner_w);
+                                match form.tab {
+                                    SettingsTab::Account => draw_account_page(
+                                        ui,
+                                        p,
+                                        form,
+                                        saved,
+                                        account_creds,
+                                        verifying_account,
+                                        &mut actions,
+                                    ),
+                                    SettingsTab::Monitor => {
+                                        draw_monitor_page(ui, p, form, update_state, &mut actions)
+                                    }
+                                    SettingsTab::Display => {
+                                        draw_display_page(ui, p, ui_prefs, &mut actions)
+                                    }
+                                    SettingsTab::Notify => {
+                                        if draw_notify_data_page(ui, p, form, app_dir, log_path) {
+                                            actions.test_toast = true;
+                                        }
+                                    }
+                                }
+                                if show_floating_bar {
+                                    ui.add_space(52.0);
+                                }
+                            });
+                    });
+
+                if show_floating_bar {
+                    let pill_h = 42.0_f32;
+                    let pill_rect = Rect::from_min_max(
+                        Pos2::new(pane_rect.left() + 18.0, pane_rect.bottom() - pill_h - 12.0),
+                        Pos2::new(pane_rect.right() - 18.0, pane_rect.bottom() - 12.0),
+                    );
+                    let shadow = match p.mode {
+                        ThemeMode::Light => egui::Shadow {
+                            offset: [0, 4],
+                            blur: 14,
+                            spread: 0,
+                            color: with_alpha(egui::Color32::BLACK, 28),
+                        },
+                        ThemeMode::Dark => egui::Shadow {
+                            offset: [0, 6],
+                            blur: 18,
+                            spread: 0,
+                            color: with_alpha(egui::Color32::BLACK, 135),
+                        },
+                    };
+                    ui.painter()
+                        .add(shadow.as_shape(pill_rect, CornerRadius::same(10)));
+                    ui.painter().rect(
+                        pill_rect,
+                        CornerRadius::same(10),
+                        p.card,
+                        Stroke::new(1.0_f32, p.warn_border),
+                        StrokeKind::Inside,
+                    );
+                    let pcy = pill_rect.center().y;
+                    ui.painter().circle_filled(
+                        Pos2::new(pill_rect.left() + 16.0, pcy),
+                        3.4,
+                        p.warn,
+                    );
+                    let msg = if verifying_account {
+                        "正在核验账号密码…"
+                    } else if global_dirty {
+                        "有未保存的设置修改"
+                    } else {
+                        "账号编辑草稿尚未保存"
+                    };
+                    let sg = ui.painter().layout_no_wrap(
+                        msg.to_string(),
+                        egui::FontId::new(11.5, crate::ui::theme::bold_family()),
+                        p.text,
+                    );
+                    ui.painter().galley(
+                        Pos2::new(pill_rect.left() + 26.0, pcy - sg.size().y * 0.5),
+                        sg,
+                        p.text,
+                    );
+
+                    let mut btn_ui = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(pill_rect.shrink2(Vec2::new(10.0, 0.0)))
+                            .layout(egui::Layout::right_to_left(egui::Align::Center)),
+                    );
+                    btn_ui.spacing_mut().item_spacing.x = 8.0;
+                    let save_resp = btn_ui
+                        .add_enabled_ui(!saving && !verifying_account, |ui| {
+                            if verifying_account {
+                                primary_button(ui, p, Some(Icon::Refresh), "正在验证…")
+                            } else if needs_setup {
+                                primary_button(ui, p, Some(Icon::Check), "保存并开始守护")
+                            } else {
+                                save_button(ui, p, true)
+                            }
+                        })
+                        .inner;
+                    if save_resp.clicked() {
+                        actions.save = true;
+                    }
+                    if !verifying_account
+                        && secondary_button(&mut btn_ui, p, None, "还原").clicked()
+                    {
                         actions.reset = true;
                     }
-                }
-
-                let (dot_c, status_str) = if verifying_account {
-                    (p.accent, "正在核验账号密码…")
-                } else if form.verify_error.is_some() {
-                    (p.danger, "账号密码未通过校验")
-                } else if dirty {
-                    (p.warn, "有未保存修改")
-                } else {
-                    (p.ok, "配置已生效")
-                };
-                let summary = format!(
-                    "· {} · {} · {}s 巡检 · 自启{}",
-                    saved.active_display_name(),
-                    carrier_label(&saved.carrier),
-                    saved.check_interval,
-                    if saved.auto_boot { "开" } else { "关" },
-                );
-
-                let dot_center = egui::Pos2::new(bar_inner.left() + 4.0, bar_cy);
-                ui.painter().circle_filled(dot_center, 3.4, dot_c);
-
-                let status_g = ui.painter().layout_no_wrap(
-                    status_str.to_string(),
-                    egui::FontId::new(11.5, crate::ui::theme::bold_family()),
-                    p.text,
-                );
-                let status_x = bar_inner.left() + 13.5;
-                ui.painter().galley(
-                    egui::Pos2::new(status_x, bar_cy - status_g.size().y * 0.5),
-                    status_g.clone(),
-                    p.text,
-                );
-
-                let sum_x = status_x + status_g.size().x + 6.0;
-                let max_sum_right = (buttons_left_x - 12.0).max(sum_x);
-                if max_sum_right > sum_x + 12.0 {
-                    let sum_clip = egui::Rect::from_min_max(
-                        egui::Pos2::new(sum_x, bar_rect.top()),
-                        egui::Pos2::new(max_sum_right, bar_rect.bottom()),
-                    );
-                    let sum_g = ui.painter().layout_no_wrap(
-                        summary.clone(),
-                        egui::FontId::proportional(11.0),
-                        p.text_muted,
-                    );
-                    ui.painter().with_clip_rect(sum_clip).galley(
-                        egui::Pos2::new(sum_x, bar_cy - sum_g.size().y * 0.5),
-                        sum_g,
-                        p.text_muted,
-                    );
-                }
-                if bar_resp.hovered()
-                    && !ui.rect_contains_pointer(egui::Rect::from_min_max(
-                        egui::Pos2::new(buttons_left_x - 4.0, bar_rect.top()),
-                        bar_rect.max,
-                    ))
-                {
-                    bar_resp.on_hover_text(format!("{status_str} {summary}"));
                 }
             },
         );
@@ -969,17 +865,34 @@ fn draw_account_page(
 
         row_divider(ui, p);
 
-        // 卡片底部操作行：左安全隔离说明 + 右保存账号按钮
+        // 卡片底部操作行：左安全隔离说明 + 右还原/保存账号按钮
+        let foot_w = ui.available_width();
+        let right_reserve = if draft_dirty && !verifying_account {
+            216.0_f32
+        } else {
+            136.0_f32
+        };
         ui.allocate_ui_with_layout(
-            Vec2::new(ui.available_width(), 30.0),
+            Vec2::new(foot_w, 30.0),
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
-                ui.label(body_text(
-                    "保存时将自动无损核验学号与密码；密码按账号 ID 独立加密存储，绝不明文落盘",
-                    10.5,
-                    p.text_muted,
-                ));
+                let note_w = (foot_w - right_reserve).max(120.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(note_w, 30.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        ui.add(
+                            egui::Label::new(body_text(
+                                "保存时将自动无损核验学号与密码；密码按账号 ID 独立加密存储，绝不明文落盘",
+                                10.5,
+                                p.text_muted,
+                            ))
+                            .truncate(),
+                        );
+                    },
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.spacing_mut().item_spacing.x = 8.0;
                     let btn_label = if verifying_account {
                         "正在核验账号…"
                     } else if is_new {
@@ -998,6 +911,18 @@ fn draw_account_page(
                         .inner;
                     if clicked {
                         actions.save_profile = true;
+                    }
+                    if draft_dirty
+                        && !verifying_account
+                        && secondary_button(ui, p, None, "还原").clicked()
+                    {
+                        if let Some(id) = form.editing_account_id.clone() {
+                            if let Some(acc) = saved.find_account(&id) {
+                                form.load_account_draft(acc);
+                            }
+                        } else {
+                            form.start_new_account();
+                        }
                     }
                 });
             },
