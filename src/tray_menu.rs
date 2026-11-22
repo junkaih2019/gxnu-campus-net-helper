@@ -32,7 +32,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WS_EX_TOPMOST, WS_POPUP,
 };
 
-use crate::models::{MonitorSnapshot, MonitorState};
+use crate::models::{MonitorSnapshot, MonitorState, UpdateState};
 use crate::tray::TrayAction;
 
 const MENU_CLASS_NAME: &str = "GXNUGuardFluentTrayMenu";
@@ -118,6 +118,7 @@ impl MenuPalette {
 #[derive(Clone, Copy)]
 enum ItemIcon {
     Window,
+    Update,
     Refresh,
     Pause,
     Play,
@@ -128,7 +129,7 @@ enum ItemIcon {
 #[derive(Clone)]
 struct MenuItemSpec {
     action: TrayAction,
-    label: &'static str,
+    label: String,
     icon: ItemIcon,
     is_primary: bool,
     is_danger: bool,
@@ -142,6 +143,8 @@ struct MenuState {
     on_action: Arc<dyn Fn(TrayAction) + Send + Sync>,
     latest_snapshot: Arc<Mutex<Option<MonitorSnapshot>>>,
     active_account_label: Arc<Mutex<String>>,
+    latest_update: Arc<Mutex<UpdateState>>,
+    skipped_update_version: Arc<Mutex<String>>,
     palette: MenuPalette,
     items: Vec<MenuItemSpec>,
     hovered: Option<usize>,
@@ -162,6 +165,8 @@ impl FluentTrayMenu {
         app_dir: PathBuf,
         latest_snapshot: Arc<Mutex<Option<MonitorSnapshot>>>,
         active_account_label: Arc<Mutex<String>>,
+        latest_update: Arc<Mutex<UpdateState>>,
+        skipped_update_version: Arc<Mutex<String>>,
         on_action: F,
     ) -> Result<Self, String>
     where
@@ -190,6 +195,8 @@ impl FluentTrayMenu {
                 on_action: Arc::new(on_action),
                 latest_snapshot,
                 active_account_label,
+                latest_update,
+                skipped_update_version,
                 palette,
                 items: Vec::new(),
                 hovered: None,
@@ -428,41 +435,66 @@ fn refresh_menu_content(state: &mut MenuState, snap: Option<&MonitorSnapshot>) {
         (_, None) => title.to_owned(),
     };
 
-    let mut items = vec![
-        MenuItemSpec {
-            action: TrayAction::Show,
-            label: "显示主窗口",
-            icon: ItemIcon::Window,
-            is_primary: true,
-            is_danger: false,
-            separator_before: true,
-            rect: RECT {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            },
+    let mut items = vec![MenuItemSpec {
+        action: TrayAction::Show,
+        label: "显示主窗口".to_string(),
+        icon: ItemIcon::Window,
+        is_primary: true,
+        is_danger: false,
+        separator_before: true,
+        rect: RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
         },
-        MenuItemSpec {
-            action: TrayAction::Check,
-            label: "立即检测",
-            icon: ItemIcon::Refresh,
-            is_primary: false,
-            is_danger: false,
-            separator_before: false,
-            rect: RECT {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            },
+    }];
+
+    let skipped = state
+        .skipped_update_version
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    if let Ok(upd) = state.latest_update.lock() {
+        if upd.has_visible_update(&skipped) {
+            if let Some(rel) = &upd.release {
+                items.push(MenuItemSpec {
+                    action: TrayAction::OpenUpdate,
+                    label: format!("发现新版本 v{}（点击更新）", rel.version),
+                    icon: ItemIcon::Update,
+                    is_primary: true,
+                    is_danger: false,
+                    separator_before: false,
+                    rect: RECT {
+                        left: 0,
+                        top: 0,
+                        right: 0,
+                        bottom: 0,
+                    },
+                });
+            }
+        }
+    }
+
+    items.push(MenuItemSpec {
+        action: TrayAction::Check,
+        label: "立即检测".to_string(),
+        icon: ItemIcon::Refresh,
+        is_primary: false,
+        is_danger: false,
+        separator_before: false,
+        rect: RECT {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
         },
-    ];
+    });
 
     if running {
         items.push(MenuItemSpec {
             action: TrayAction::Pause,
-            label: "暂停监控",
+            label: "暂停监控".to_string(),
             icon: ItemIcon::Pause,
             is_primary: false,
             is_danger: false,
@@ -477,7 +509,7 @@ fn refresh_menu_content(state: &mut MenuState, snap: Option<&MonitorSnapshot>) {
     } else {
         items.push(MenuItemSpec {
             action: TrayAction::Start,
-            label: "开始监控",
+            label: "开始监控".to_string(),
             icon: ItemIcon::Play,
             is_primary: false,
             is_danger: false,
@@ -493,7 +525,7 @@ fn refresh_menu_content(state: &mut MenuState, snap: Option<&MonitorSnapshot>) {
 
     items.push(MenuItemSpec {
         action: TrayAction::OpenLog,
-        label: "打开运行日志",
+        label: "打开运行日志".to_string(),
         icon: ItemIcon::Log,
         is_primary: false,
         is_danger: false,
@@ -507,7 +539,7 @@ fn refresh_menu_content(state: &mut MenuState, snap: Option<&MonitorSnapshot>) {
     });
     items.push(MenuItemSpec {
         action: TrayAction::Exit,
-        label: concat!("退出 ", env!("CARGO_PKG_DESCRIPTION")),
+        label: concat!("退出 ", env!("CARGO_PKG_DESCRIPTION")).to_string(),
         icon: ItemIcon::Exit,
         is_primary: false,
         is_danger: true,
@@ -781,7 +813,7 @@ unsafe fn paint_menu(hwnd: HWND, state: &MenuState) {
             right: item.rect.right - scale(10, dpi),
             bottom: item.rect.bottom,
         };
-        let lbl_w = to_wide(item.label);
+        let lbl_w = to_wide(&item.label);
         DrawTextW(
             mem_dc,
             lbl_w.as_ptr(),
@@ -835,6 +867,16 @@ unsafe fn draw_item_icon(
             );
             MoveToEx(hdc, cx - s, cy - s / 2 + 1, null_mut());
             LineTo(hdc, cx + s + 1, cy - s / 2 + 1);
+        }
+        ItemIcon::Update => {
+            let h = scale(5, dpi);
+            MoveToEx(hdc, cx, cy + h - scale(2, dpi), null_mut());
+            LineTo(hdc, cx, cy - h);
+            MoveToEx(hdc, cx - scale(3, dpi), cy - h + scale(3, dpi), null_mut());
+            LineTo(hdc, cx, cy - h);
+            LineTo(hdc, cx + scale(3, dpi), cy - h + scale(3, dpi));
+            MoveToEx(hdc, cx - s + 1, cy + h, null_mut());
+            LineTo(hdc, cx + s, cy + h);
         }
         ItemIcon::Refresh => {
             Ellipse(hdc, cx - s + 1, cy - s + 1, cx + s, cy + s);

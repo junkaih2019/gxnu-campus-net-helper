@@ -31,6 +31,7 @@ mod tray;
 mod tray_flyout;
 mod tray_menu;
 mod ui;
+mod updater;
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, ExitCode};
@@ -41,7 +42,7 @@ use std::time::Duration;
 use chrono::Local;
 use eframe::egui;
 
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+const VERSION: &str = updater::CURRENT_VERSION;
 /// 守护进程和设置界面使用的 Windows 凭据目标。
 const CREDENTIAL_TARGET: &str = "GXNUCampusLogin/v4";
 /// 守护进程单实例互斥体。
@@ -59,9 +60,38 @@ const WM_TRAY_TOGGLE_FLYOUT: u32 = 0x8000 + 5;
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
+    // ── 模式 0：受保护目录 UAC 提权覆盖辅助模式（`--apply-update <target_exe> <old_pid>`）──
+    if let Some(idx) = args.iter().position(|arg| arg == "--apply-update") {
+        let Some(target) = args.get(idx + 1).map(PathBuf::from) else {
+            return ExitCode::FAILURE;
+        };
+        let wait_pid = args
+            .get(idx + 2)
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        return match updater::run_elevated_apply_update(&target, wait_pid) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(err) => {
+                eprintln!("{err}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     // ── 模式 1：按需拉起的图形界面子进程（关闭即彻底释放 OpenGL 与字库内存）────
     if args.iter().any(|arg| arg == "--ui") {
         return run_ui_process(&args);
+    }
+
+    // 若由自动更新原位覆盖后拉起（`--after-update <old_pid>`），先等待旧守护进程彻底退出并释放单实例互斥体
+    let mut just_updated = false;
+    if let Some(idx) = args.iter().position(|arg| arg == "--after-update") {
+        let wait_pid = args
+            .get(idx + 1)
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+        updater::wait_for_pid_exit(wait_pid, Duration::from_secs(12));
+        just_updated = true;
     }
 
     let once = args.iter().any(|arg| arg == "--once");
@@ -74,6 +104,7 @@ fn main() -> ExitCode {
         eprintln!("无法创建应用目录 {}：{err}", store.app_dir.display());
         return ExitCode::FAILURE;
     }
+    updater::cleanup_old_artifacts(&store.app_dir);
 
     if test_toast {
         let _ = logging::init(&store.app_dir.join("logs"), false);
@@ -190,7 +221,19 @@ fn main() -> ExitCode {
         if settings.auto_boot { "开" } else { "关" }
     ));
 
-    run_daemon(store, settings, log_path, minimized)
+    if just_updated {
+        logging::info(&format!("[UPDATER] 已成功原位覆盖升级并重启至 v{VERSION}"));
+    }
+
+    run_daemon(store, settings, log_path, minimized, just_updated)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UiOpenTarget {
+    Normal,
+    AccountSettings,
+    UpdateModal,
+    AfterUpdateToast,
 }
 
 /// ── 模式 2：超轻量常驻守护进程（无 OpenGL、无字库、纯 Win32 托盘消息循环）──
@@ -199,6 +242,7 @@ fn run_daemon(
     settings: models::Settings,
     log_path: PathBuf,
     minimized: bool,
+    just_updated: bool,
 ) -> ExitCode {
     tray_menu::enable_dpi_awareness();
     let main_tid = current_thread_id();
@@ -230,6 +274,12 @@ fn run_daemon(
     let last_check_seq: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
     let latest_self_service: Arc<Mutex<models::SelfServiceState>> =
         Arc::new(Mutex::new(models::SelfServiceState::default()));
+    let latest_update: Arc<Mutex<models::UpdateState>> =
+        Arc::new(Mutex::new(models::UpdateState {
+            current_version: VERSION.to_string(),
+            ..Default::default()
+        }));
+    let skipped_update_ver = Arc::new(Mutex::new(settings.skipped_update_version.clone()));
     let ui_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
 
     let (ipc_server, listener) = match ipc::IpcServer::bind(&store.app_dir) {
@@ -261,6 +311,7 @@ fn run_daemon(
             let last_check = Arc::clone(&last_check_unix);
             let shared_traffic = Arc::clone(&latest_traffic);
             let acct_id_ref = Arc::clone(&active_account_id);
+            let shared_upd = Arc::clone(&latest_update);
             let ipc = Arc::clone(&ipc_server);
             Arc::new(move |state| {
                 if let Ok(mut g) = shared_ss.lock() {
@@ -278,6 +329,7 @@ fn run_daemon(
                             .map(|g| g.clone())
                             .unwrap_or_default(),
                         self_service: state,
+                        update: shared_upd.lock().map(|g| g.clone()).unwrap_or_default(),
                     });
                 }
             })
@@ -328,6 +380,7 @@ fn run_daemon(
     let sink_traffic = Arc::clone(&latest_traffic);
     let sink_acct_id = Arc::clone(&active_account_id);
     let sink_self_service_state = Arc::clone(&latest_self_service);
+    let sink_update_state = Arc::clone(&latest_update);
     let sink_self_service_mgr = Arc::clone(&self_service_mgr);
     let sink_hook = Arc::new(Mutex::new(SelfServiceHookState::default()));
 
@@ -436,6 +489,10 @@ fn run_daemon(
             .lock()
             .map(|g| g.clone())
             .unwrap_or_default();
+        let upd_state = sink_update_state
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
         sink_ipc.broadcast_snapshot(ipc::SnapshotEnvelope {
             snapshot,
             online_since_unix: online_ts,
@@ -443,6 +500,7 @@ fn run_daemon(
             traffic: traffic_summary,
             active_account_id: active_id,
             self_service: ss_state,
+            update: upd_state,
         });
 
         if let Some(trigger) = maybe_trigger {
@@ -463,6 +521,7 @@ fn run_daemon(
         let shared_traffic = Arc::clone(&latest_traffic);
         let acct_id_ref = Arc::clone(&active_account_id);
         let shared_ss = Arc::clone(&latest_self_service);
+        let shared_upd = Arc::clone(&latest_update);
         let ipc = Arc::clone(&ipc_server);
         std::thread::Builder::new()
             .name("traffic-sampler".to_string())
@@ -505,6 +564,7 @@ fn run_daemon(
                                     .lock()
                                     .map(|g| g.clone())
                                     .unwrap_or_default(),
+                                update: shared_upd.lock().map(|g| g.clone()).unwrap_or_default(),
                             });
                         }
                     }
@@ -527,6 +587,32 @@ fn run_daemon(
         sink,
     );
     let monitor_ctrl = monitor.control();
+    let updater_ctrl = monitor_ctrl.clone();
+    let updater_mgr = Arc::new(updater::UpdateManager::new(
+        store.app_dir.clone(),
+        settings.auto_check_updates,
+        settings.skipped_update_version.clone(),
+        Arc::clone(&is_online),
+        {
+            let shared_upd = Arc::clone(&latest_update);
+            let ipc = Arc::clone(&ipc_server);
+            Arc::new(move |upd_state| {
+                if let Ok(mut g) = shared_upd.lock() {
+                    *g = upd_state.clone();
+                }
+                ipc.broadcast_update_state(upd_state);
+                post_thread_msg(main_tid, WM_TRAY_REFRESH);
+            })
+        },
+        Arc::new(move || {
+            updater_ctrl.signal_stop();
+            post_thread_msg(main_tid, WM_DAEMON_QUIT);
+        }),
+    ));
+    if let Ok(mut g) = latest_update.lock() {
+        *g = updater_mgr.current_state();
+    }
+
     let action_ctrl = monitor_ctrl.clone();
     let action_log_path = log_path.clone();
     let endpoint = ipc_server.endpoint().clone();
@@ -544,12 +630,12 @@ fn run_daemon(
         active_account_label: Arc::clone(&active_account_label),
         active_carrier: Arc::clone(&active_carrier),
         active_account_key: Arc::clone(&active_account_key),
+        skipped_update_ver: Arc::clone(&skipped_update_ver),
         traffic_tracker: Arc::clone(&traffic_tracker),
         latest_traffic: Arc::clone(&latest_traffic),
         self_service: Arc::clone(&self_service_mgr),
-        show_ui: Box::new(move |open_account_settings| {
-            show_or_spawn_ui(&child, &endpoint, &ipc_for_show, open_account_settings)
-        }),
+        updater: Arc::clone(&updater_mgr),
+        show_ui: Box::new(move |target| show_or_spawn_ui(&child, &endpoint, &ipc_for_show, target)),
     }));
     if settings.auto_start_monitoring {
         if let Err(err) = commands.lock().unwrap().apply(ipc::UiToDaemon::Start) {
@@ -578,6 +664,12 @@ fn run_daemon(
             tray::TrayAction::Show => ipc::UiToDaemon::ShowUi,
             tray::TrayAction::OpenAccountSettings => {
                 if let Err(err) = tray_commands.lock().unwrap().open_account_settings() {
+                    logging::warn(&format!("[COMMAND_FAILED] {err}"));
+                }
+                return;
+            }
+            tray::TrayAction::OpenUpdate => {
+                if let Err(err) = tray_commands.lock().unwrap().open_update_modal() {
                     logging::warn(&format!("[COMMAND_FAILED] {err}"));
                 }
                 return;
@@ -614,6 +706,8 @@ fn run_daemon(
         app_dir.clone(),
         Arc::clone(&latest_snapshot),
         Arc::clone(&active_account_label),
+        Arc::clone(&latest_update),
+        Arc::clone(&skipped_update_ver),
         move |action| menu_cb(action),
     ) {
         Ok(menu) => Some(menu),
@@ -651,7 +745,12 @@ fn run_daemon(
 
     // 非 --minimized 启动时立即弹出图形界面；关闭窗口后界面进程退出，守护继续留守托盘。
     if !minimized {
-        if let Err(err) = commands.lock().unwrap().apply(ipc::UiToDaemon::ShowUi) {
+        let open_res = if just_updated {
+            commands.lock().unwrap().open_after_update()
+        } else {
+            commands.lock().unwrap().apply(ipc::UiToDaemon::ShowUi)
+        };
+        if let Err(err) = open_res {
             logging::warn(&format!("[UI_ERROR] {err}"));
         }
     }
@@ -669,6 +768,7 @@ fn run_daemon(
     );
 
     // ── 干净退出流程 ───────────────────────────────────────────────
+    updater_mgr.shutdown();
     monitor_ctrl.signal_stop();
     {
         let (lock, cv) = &*traffic_stop;
@@ -705,10 +805,12 @@ struct DaemonCommands {
     active_account_label: Arc<Mutex<String>>,
     active_carrier: Arc<Mutex<String>>,
     active_account_key: Arc<Mutex<String>>,
+    skipped_update_ver: Arc<Mutex<String>>,
     traffic_tracker: Arc<Mutex<traffic::TrafficTracker>>,
     latest_traffic: Arc<Mutex<models::TrafficSummary>>,
     self_service: Arc<self_service::SelfServiceManager>,
-    show_ui: Box<dyn Fn(bool) -> Result<(), String> + Send + Sync>,
+    updater: Arc<updater::UpdateManager>,
+    show_ui: Box<dyn Fn(UiOpenTarget) -> Result<(), String> + Send + Sync>,
 }
 
 impl DaemonCommands {
@@ -733,7 +835,21 @@ impl DaemonCommands {
     }
 
     fn open_account_settings(&self) -> Result<(), String> {
-        (self.show_ui)(true)?;
+        (self.show_ui)(UiOpenTarget::AccountSettings)?;
+        self.self_service
+            .trigger(self_service::FetchTrigger::UiOpen);
+        Ok(())
+    }
+
+    fn open_update_modal(&self) -> Result<(), String> {
+        (self.show_ui)(UiOpenTarget::UpdateModal)?;
+        self.self_service
+            .trigger(self_service::FetchTrigger::UiOpen);
+        Ok(())
+    }
+
+    fn open_after_update(&self) -> Result<(), String> {
+        (self.show_ui)(UiOpenTarget::AfterUpdateToast)?;
         self.self_service
             .trigger(self_service::FetchTrigger::UiOpen);
         Ok(())
@@ -839,6 +955,12 @@ impl DaemonCommands {
             KickDevice { ip, is_local } => {
                 self.kick_device(ip, is_local)?;
             }
+            CheckUpdate { manual } => {
+                self.updater.request_check(manual);
+            }
+            StartUpdate => {
+                self.updater.request_install()?;
+            }
             ReloadSettings {
                 start,
                 password_changed,
@@ -852,6 +974,11 @@ impl DaemonCommands {
                     return Err("磁盘设置已被其他写入更新，请重新核对后保存".into());
                 }
                 let enabled = settings.notify_toast;
+                *self.skipped_update_ver.lock().unwrap() = settings.skipped_update_version.clone();
+                self.updater.sync_preferences(
+                    settings.auto_check_updates,
+                    &settings.skipped_update_version,
+                );
                 self.sync_active_account_state(&settings);
                 if password_changed {
                     self.self_service.notify_credential_updated();
@@ -885,7 +1012,7 @@ impl DaemonCommands {
                 ));
             }
             ShowUi => {
-                (self.show_ui)(false)?;
+                (self.show_ui)(UiOpenTarget::Normal)?;
                 self.self_service
                     .trigger(self_service::FetchTrigger::UiOpen);
             }
@@ -986,15 +1113,16 @@ fn show_or_spawn_ui(
     ui_child: &Arc<Mutex<Option<Child>>>,
     endpoint: &ipc::DaemonEndpoint,
     ipc_server: &ipc::IpcServer,
-    open_account_settings: bool,
+    target: UiOpenTarget,
 ) -> Result<(), String> {
     let mut guard = ui_child.lock().map_err(|_| "无法访问界面进程状态")?;
     if let Some(child) = guard.as_mut() {
         match child.try_wait() {
             Ok(None) => {
-                // 界面进程仍在运行：可选通知切到账号设置页，并直接前置恢复窗口
-                if open_account_settings {
-                    ipc_server.broadcast_open_account_settings();
+                match target {
+                    UiOpenTarget::AccountSettings => ipc_server.broadcast_open_account_settings(),
+                    UiOpenTarget::UpdateModal => ipc_server.broadcast_open_update_modal(),
+                    UiOpenTarget::Normal | UiOpenTarget::AfterUpdateToast => {}
                 }
                 bring_pid_window_to_front(child.id());
                 return Ok(());
@@ -1014,9 +1142,18 @@ fn show_or_spawn_ui(
         "--ipc-token",
         &endpoint.token,
     ]);
-    if open_account_settings {
-        cmd.env("GXNU_VIEW", "settings")
-            .env("GXNU_SETTINGS_TAB", "account");
+    match target {
+        UiOpenTarget::AccountSettings => {
+            cmd.env("GXNU_VIEW", "settings")
+                .env("GXNU_SETTINGS_TAB", "account");
+        }
+        UiOpenTarget::UpdateModal => {
+            cmd.env("GXNU_OPEN_UPDATE", "1");
+        }
+        UiOpenTarget::AfterUpdateToast => {
+            cmd.env("GXNU_JUST_UPDATED", "1");
+        }
+        UiOpenTarget::Normal => {}
     }
     let child = cmd.spawn().map_err(|e| format!("打开主界面失败：{e}"))?;
     *guard = Some(child);

@@ -367,6 +367,82 @@ pub struct SelfServiceState {
     pub data: Option<SelfServiceData>,
 }
 
+/// GitHub Release 自动更新状态枚举。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum UpdateStatus {
+    #[default]
+    Idle,
+    Checking,
+    UpToDate,
+    Available,
+    Downloading,
+    Applying,
+    Error,
+}
+
+/// GitHub Release 远端新版本元数据。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReleaseInfo {
+    /// 去掉前导 `v` 的规范化版本号（如 `"0.2.3"` 或 `"0.2.2.3"`）。
+    pub version: String,
+    /// Git 标签名（如 `"v0.2.3"`）。
+    pub tag: String,
+    /// Release 附件文件名（如 `"gxnu-campus-net-helper-v0.2.3.exe"`）。
+    pub asset_name: String,
+    /// `.exe` 附件直链下载地址。
+    pub download_url: String,
+    /// 浏览器可查看的 Release 详情页地址。
+    pub html_url: String,
+    /// 可选 SHA-256 十六进制摘要（来自 `latest.json` 或 GitHub Asset `digest`）。
+    #[serde(default)]
+    pub sha256: Option<String>,
+    /// 可选附件字节大小。
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub published_at: String,
+    /// Release 更新说明正文。
+    #[serde(default)]
+    pub notes: String,
+}
+
+/// 守护进程与界面同步的自动更新整体状态。
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UpdateState {
+    pub status: UpdateStatus,
+    #[serde(default)]
+    pub current_version: String,
+    #[serde(default)]
+    pub release: Option<ReleaseInfo>,
+    #[serde(default)]
+    pub downloaded_bytes: u64,
+    #[serde(default)]
+    pub total_bytes: Option<u64>,
+    #[serde(default)]
+    pub last_checked_unix: Option<i64>,
+    #[serde(default)]
+    pub message: String,
+}
+
+impl UpdateState {
+    /// 是否存在未被用户手动跳过的新版本（或正在下载更新中）。
+    pub fn has_visible_update(&self, skipped_version: &str) -> bool {
+        match self.status {
+            UpdateStatus::Downloading | UpdateStatus::Applying => true,
+            UpdateStatus::Available => self
+                .release
+                .as_ref()
+                .is_some_and(|r| r.version != skipped_version.trim()),
+            _ => false,
+        }
+    }
+
+    pub fn progress_ratio(&self) -> Option<f32> {
+        let total = self.total_bytes.filter(|&t| t > 0)?;
+        Some((self.downloaded_bytes as f64 / total as f64).clamp(0.0, 1.0) as f32)
+    }
+}
+
 impl MonitorSnapshot {
     pub fn new(
         state: MonitorState,
@@ -511,6 +587,10 @@ fn normalize_carrier(raw: &str) -> String {
     }
 }
 
+fn default_auto_check_updates() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -529,6 +609,12 @@ pub struct Settings {
     pub notify_quiet_minutes: i64,
     /// 活跃账号的可选月流量提醒上限（GB）；`0` 表示不限制。
     pub monthly_quota_gb: i64,
+    /// 是否在联网状态下定期后台静默检查 GitHub Release 新版本（默认开启）。
+    #[serde(default = "default_auto_check_updates")]
+    pub auto_check_updates: bool,
+    /// 用户主动选择「跳过此版本」的版本号；为空表示不跳过任何版本。
+    #[serde(default)]
+    pub skipped_update_version: String,
     /// 多账号配置列表（为空且旧版 `student_id` 非空时自动平滑迁移）。
     #[serde(default)]
     pub accounts: Vec<AccountProfile>,
@@ -552,6 +638,8 @@ impl Default for Settings {
             notify_wechat: false,
             notify_quiet_minutes: 3,
             monthly_quota_gb: 0,
+            auto_check_updates: true,
+            skipped_update_version: String::new(),
             accounts: Vec::new(),
             active_account_id: String::new(),
         }
@@ -622,6 +710,12 @@ impl Settings {
             notify_wechat: self.notify_wechat,
             notify_quiet_minutes: self.notify_quiet_minutes.clamp(1, 60),
             monthly_quota_gb,
+            auto_check_updates: self.auto_check_updates,
+            skipped_update_version: self
+                .skipped_update_version
+                .trim()
+                .trim_start_matches(['v', 'V'])
+                .to_string(),
             accounts,
             active_account_id,
         }

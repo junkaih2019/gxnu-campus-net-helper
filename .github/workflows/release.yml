@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.2.3 or v0.2.2.3)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Build Windows Release (.exe + latest.json)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry & build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Resolve version & tag
+        id: meta
+        shell: pwsh
+        run: |
+          $tag = if ("${{ inputs.tag }}" -ne "") { "${{ inputs.tag }}" } else { "${{ github.ref_name }}" }
+          $ver = $tag.TrimStart('v', 'V')
+          $asset = "gxnu-campus-net-helper-v$ver.exe"
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          "asset=$asset" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Run unit tests
+        shell: pwsh
+        env:
+          GXNU_APP_VERSION: ${{ steps.meta.outputs.version }}
+        run: cargo test --locked
+
+      - name: Build release binary
+        shell: pwsh
+        env:
+          GXNU_APP_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          cargo build --locked --release
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item -Force "target/release/gxnu-guard.exe" "dist/${{ steps.meta.outputs.asset }}"
+
+      - name: Generate SHA256SUMS & latest.json manifest
+        shell: pwsh
+        env:
+          REPO: ${{ github.repository }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          VERSION: ${{ steps.meta.outputs.version }}
+          ASSET: ${{ steps.meta.outputs.asset }}
+        run: |
+          $exePath = "dist/$env:ASSET"
+          $hash = (Get-FileHash -Path $exePath -Algorithm SHA256).Hash.ToLowerInvariant()
+          $size = (Get-Item $exePath).Length
+          "$hash  $env:ASSET" | Set-Content -Encoding utf8 "dist/SHA256SUMS.txt"
+
+          $notes = ""
+          if (Test-Path "CHANGELOG.md") {
+            $raw = Get-Content -Raw -Encoding UTF8 "CHANGELOG.md"
+            if ($raw -match "(?ms)^##\s+v?$([regex]::Escape($env:VERSION))\b[^\r\n]*\r?\n(.*?)(?=^---\s*$|^##\s+|\z)") {
+              $notes = $Matches[1].Trim()
+            }
+          }
+          if ([string]::IsNullOrWhiteSpace($notes)) {
+            $notes = "GXNU 校园网守护助手 v$env:VERSION 正式版更新。"
+          }
+
+          $manifest = [ordered]@{
+            version      = $env:VERSION
+            tag          = $env:TAG
+            asset_name   = $env:ASSET
+            download_url = "https://github.com/$env:REPO/releases/download/$env:TAG/$env:ASSET"
+            html_url     = "https://github.com/$env:REPO/releases/tag/$env:TAG"
+            sha256       = $hash
+            size         = $size
+            published_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            notes        = $notes
+          }
+          $manifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 "dist/latest.json"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: "GXNU Campus Net Helper ${{ steps.meta.outputs.tag }}"
+          generate_release_notes: true
+          files: |
+            dist/${{ steps.meta.outputs.asset }}
+            dist/latest.json
+            dist/SHA256SUMS.txt

@@ -8,6 +8,14 @@ use std::process::Command;
 fn main() {
     println!("cargo:rerun-if-changed=assets/app.rc");
     println!("cargo:rerun-if-changed=assets/app.ico");
+    println!("cargo:rerun-if-env-changed=GXNU_APP_VERSION");
+
+    let raw_ver = env::var("GXNU_APP_VERSION")
+        .ok()
+        .map(|s| s.trim().trim_start_matches(['v', 'V']).to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string());
+    println!("cargo:rustc-env=GXNU_BUILD_VERSION={raw_ver}");
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
@@ -24,13 +32,18 @@ fn main() {
     let obj_path = out_dir.join("app_icon.o");
 
     let app_name = env!("CARGO_PKG_DESCRIPTION");
-    let version = env!("CARGO_PKG_VERSION");
-    let version_tuple = format!(
-        "{},{},{},0",
-        env!("CARGO_PKG_VERSION_MAJOR"),
-        env!("CARGO_PKG_VERSION_MINOR"),
-        env!("CARGO_PKG_VERSION_PATCH")
-    );
+    let version = raw_ver.as_str();
+    let mut nums = raw_ver
+        .split(['-', '+'])
+        .next()
+        .unwrap_or(&raw_ver)
+        .split('.')
+        .map(|seg| seg.parse::<u16>().unwrap_or(0));
+    let v0 = nums.next().unwrap_or(0);
+    let v1 = nums.next().unwrap_or(0);
+    let v2 = nums.next().unwrap_or(0);
+    let v3 = nums.next().unwrap_or(0);
+    let version_tuple = format!("{v0},{v1},{v2},{v3}");
     let header = format!(
         r#"#define APP_NAME "{app_name}"
 #define APP_FILENAME "{app_name}.exe"

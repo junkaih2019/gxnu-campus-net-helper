@@ -26,7 +26,10 @@ use crate::config::SettingsStore;
 use crate::credentials;
 use crate::ipc::{IpcClient, SnapshotEnvelope, UiToDaemon};
 use crate::metrics_store::{TelemetryPoint, TimeRange};
-use crate::models::{MonitorSnapshot, MonitorState, SelfServiceState, Settings, TrafficSummary};
+use crate::models::{
+    MonitorSnapshot, MonitorState, SelfServiceState, Settings, TrafficSummary, UpdateState,
+    UpdateStatus,
+};
 use crate::startup;
 
 use charts::TrafficViewMode;
@@ -238,6 +241,9 @@ pub struct GuardApp {
     campus_vpn_ack_for_draft: bool,
     kicking_ips: HashSet<String>,
     local_kick_confirm_ip: Option<String>,
+    update_state: UpdateState,
+    update_modal_open: bool,
+    pending_manual_update_check: bool,
     last_check_seq: u64,
     last_check_unix: Option<i64>,
     online_since_unix: Option<i64>,
@@ -334,6 +340,8 @@ impl GuardApp {
             egui::TextureOptions::LINEAR,
         );
 
+        let open_update_from_env = std::env::var_os("GXNU_OPEN_UPDATE").is_some();
+        let just_updated_from_env = std::env::var_os("GXNU_JUST_UPDATED").is_some();
         let initial_traffic_view = TrafficViewMode::default_for_carrier(&deps.settings.carrier);
         let mut app = Self {
             store: deps.store,
@@ -364,6 +372,12 @@ impl GuardApp {
             campus_vpn_ack_for_draft: false,
             kicking_ips: HashSet::new(),
             local_kick_confirm_ip: None,
+            update_state: UpdateState {
+                current_version: crate::VERSION.to_string(),
+                ..Default::default()
+            },
+            update_modal_open: open_update_from_env,
+            pending_manual_update_check: false,
             last_check_seq: 0,
             last_check_unix: None,
             online_since_unix: None,
@@ -379,6 +393,9 @@ impl GuardApp {
             #[cfg(debug_assertions)]
             qa_shot_frames: 0,
         };
+        if just_updated_from_env {
+            app.show_toast(format!("已成功原位更新至 v{}", crate::VERSION), false);
+        }
         if !app.needs_setup {
             app.request(UiToDaemon::RefreshSelfService { force: false }, None);
         }
@@ -962,6 +979,28 @@ impl GuardApp {
             }
         }
 
+        while let Ok(upd) = self.ipc.update_states.try_recv() {
+            if self.pending_manual_update_check && upd.status != UpdateStatus::Checking {
+                self.pending_manual_update_check = false;
+                match upd.status {
+                    UpdateStatus::Available => {
+                        self.update_modal_open = true;
+                    }
+                    UpdateStatus::UpToDate => {
+                        self.show_toast(format!("当前已是最新版本（v{}）", crate::VERSION), false);
+                    }
+                    UpdateStatus::Error => {
+                        self.show_toast(format!("检查更新失败：{}", upd.message), true);
+                    }
+                    _ => {}
+                }
+            }
+            self.update_state = upd;
+        }
+        if self.ipc.open_update_modal.swap(false, Ordering::AcqRel) {
+            self.update_modal_open = true;
+        }
+
         if self.ipc.open_account_settings.swap(false, Ordering::AcqRel) {
             self.settings = self.store.load();
             self.refresh_account_creds();
@@ -981,6 +1020,11 @@ impl GuardApp {
             self.last_check_unix = env.last_check_unix;
             self.traffic = env.traffic;
             self.self_service = env.self_service;
+            if env.update.status != UpdateStatus::Idle
+                || self.update_state.status == UpdateStatus::Idle
+            {
+                self.update_state = env.update;
+            }
             if !env.active_account_id.is_empty()
                 && env.active_account_id != self.settings.active_account_id
             {
@@ -1048,12 +1092,15 @@ impl GuardApp {
             Stroke::new(1.0_f32, p.border),
         );
 
+        let has_upd = self
+            .update_state
+            .has_visible_update(&self.settings.skipped_update_version);
         let left_skip = if self.view == AppView::Settings {
             110.0
         } else {
             0.0
         };
-        let controls_w = 186.0;
+        let controls_w = if has_upd { 306.0 } else { 186.0 };
         let drag_rect = Rect::from_min_max(
             Pos2::new(bar_rect.left() + left_skip, bar_rect.top()),
             Pos2::new(
@@ -1101,7 +1148,7 @@ impl GuardApp {
                     p.text,
                 );
                 let ver_g = ui.painter().layout_no_wrap(
-                    format!("v{}", env!("CARGO_PKG_VERSION")),
+                    format!("v{}", crate::VERSION),
                     egui::FontId::proportional(10.5),
                     p.text_muted,
                 );
@@ -1120,7 +1167,7 @@ impl GuardApp {
                     .galley(Pos2::new(ver_x, ver_y), ver_g, p.text_muted);
             }
 
-            // 右侧窗口控制区：设置入口 + 主题 + 最小化 + 关闭
+            // 右侧窗口控制区：更新提醒胶囊 + 设置入口 + 主题 + 最小化 + 关闭
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 0.0;
 
@@ -1184,6 +1231,33 @@ impl GuardApp {
                     } else {
                         AppView::Settings
                     };
+                }
+
+                if has_upd {
+                    ui.add_space(6.0);
+                    let pill_lbl = match self.update_state.status {
+                        UpdateStatus::Downloading => {
+                            let pct = self
+                                .update_state
+                                .progress_ratio()
+                                .map(|r| format!(" {}%", (r * 100.0).round() as i32))
+                                .unwrap_or_default();
+                            format!("更新中{pct}")
+                        }
+                        UpdateStatus::Applying => "正在重启…".to_string(),
+                        _ => {
+                            let ver = self
+                                .update_state
+                                .release
+                                .as_ref()
+                                .map(|r| r.version.as_str())
+                                .unwrap_or("");
+                            format!("新版本 v{ver}")
+                        }
+                    };
+                    if draw_titlebar_update_pill(ui, p, &pill_lbl).clicked() {
+                        self.update_modal_open = true;
+                    }
                 }
             });
         });
@@ -1853,6 +1927,272 @@ impl GuardApp {
         }
     }
 
+    fn draw_update_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        if !self.update_modal_open {
+            return;
+        }
+        let Some(rel) = self.update_state.release.clone() else {
+            self.update_modal_open = false;
+            return;
+        };
+
+        let busy = matches!(
+            self.update_state.status,
+            UpdateStatus::Downloading | UpdateStatus::Applying
+        );
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("auto_update_modal_scrim"))
+            .fixed_pos(screen.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(screen.size(), Sense::click());
+                let alpha = if p.mode == ThemeMode::Dark { 145 } else { 105 };
+                ui.painter().rect_filled(
+                    rect,
+                    CornerRadius::ZERO,
+                    egui::Color32::from_black_alpha(alpha),
+                );
+            });
+
+        let mut do_install = false;
+        let mut do_close = false;
+        let mut do_skip = false;
+        let mut do_open_web = false;
+        if !busy {
+            ctx.input(|i| {
+                if i.key_pressed(egui::Key::Escape) {
+                    do_close = true;
+                }
+            });
+        }
+
+        egui::Area::new(egui::Id::new("auto_update_modal_dialog"))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                let card_w = 432.0_f32.min((screen.width() - 36.0).max(296.0));
+                egui::Frame::new()
+                    .fill(p.card)
+                    .stroke(Stroke::new(1.2_f32, p.accent_border))
+                    .corner_radius(CornerRadius::same(12))
+                    .shadow(egui::Shadow {
+                        offset: [0, 8],
+                        blur: 24,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha(95),
+                    })
+                    .inner_margin(egui::Margin::symmetric(18, 16))
+                    .show(ui, |ui| {
+                        ui.set_width(card_w);
+                        ui.spacing_mut().item_spacing.y = 10.0;
+
+                        // 标题栏
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 9.0;
+                            let (badge_r, _) =
+                                ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                            ui.painter().rect(
+                                badge_r,
+                                CornerRadius::same(8),
+                                p.accent_soft,
+                                Stroke::new(1.0_f32, p.accent_border),
+                                StrokeKind::Inside,
+                            );
+                            icons::paint(
+                                ui.painter(),
+                                badge_r.shrink(6.0),
+                                Icon::Download,
+                                p.accent,
+                            );
+                            ui.label(bold_text(
+                                format!("发现新版本 v{}", rel.version),
+                                14.5,
+                                p.text,
+                            ));
+                            badge(
+                                ui,
+                                p.text_muted,
+                                p.subtle,
+                                p.border,
+                                &format!("当前 v{}", crate::VERSION),
+                            );
+                        });
+
+                        // 更新说明框
+                        let notes_txt = if rel.notes.trim().is_empty() {
+                            "包含功能体验优化与稳定性修复，可前往 GitHub Release 查看完整变更。"
+                        } else {
+                            rel.notes.trim()
+                        };
+                        egui::Frame::new()
+                            .fill(p.subtle)
+                            .stroke(Stroke::new(1.0_f32, p.divider))
+                            .corner_radius(CornerRadius::same(8))
+                            .inner_margin(egui::Margin::symmetric(12, 9))
+                            .show(ui, |ui| {
+                                ui.set_width(card_w - 24.0);
+                                egui::ScrollArea::vertical()
+                                    .id_salt("update_release_notes_scroll")
+                                    .max_height(145.0)
+                                    .auto_shrink([false, true])
+                                    .show(ui, |ui| {
+                                        ui.set_width(card_w - 28.0);
+                                        ui.add(
+                                            egui::Label::new(body_text(
+                                                notes_txt,
+                                                11.5,
+                                                p.text_secondary,
+                                            ))
+                                            .wrap(),
+                                        );
+                                    });
+                            });
+
+                        // 原位覆盖路径说明
+                        let exe_hint = std::env::current_exe()
+                            .ok()
+                            .map(|path| format!("将原位覆盖更新：{}", path.display()))
+                            .unwrap_or_else(|| {
+                                "将原位覆盖当前程序并自动重启（保留全部账号与自启配置）".into()
+                            });
+                        ui.add(
+                            egui::Label::new(body_text(exe_hint, 10.5, p.text_muted)).truncate(),
+                        );
+
+                        // 下载进度条 / 错误提示框
+                        if busy {
+                            let ratio = self.update_state.progress_ratio().unwrap_or(0.0);
+                            let bar_w = card_w;
+                            let (bar_r, _) =
+                                ui.allocate_exact_size(Vec2::new(bar_w, 7.0), Sense::hover());
+                            ui.painter()
+                                .rect_filled(bar_r, CornerRadius::same(4), p.subtle);
+                            let fill_w = (bar_w * ratio).max(if ratio > 0.0 { 8.0 } else { 0.0 });
+                            if fill_w > 0.0 {
+                                let fill_r = Rect::from_min_size(bar_r.min, Vec2::new(fill_w, 7.0));
+                                ui.painter()
+                                    .rect_filled(fill_r, CornerRadius::same(4), p.accent);
+                            }
+                            let dl_mb = self.update_state.downloaded_bytes as f64 / 1_048_576.0;
+                            let prog_txt = if self.update_state.status == UpdateStatus::Applying {
+                                "校验通过，正在原位替换并重启程序…".to_string()
+                            } else if let Some(tot) =
+                                self.update_state.total_bytes.filter(|&t| t > 0)
+                            {
+                                let tot_mb = tot as f64 / 1_048_576.0;
+                                format!(
+                                    "正在下载 {} · {:.2} / {:.2} MB ({}%)",
+                                    rel.asset_name,
+                                    dl_mb,
+                                    tot_mb,
+                                    (ratio * 100.0).round() as i32
+                                )
+                            } else {
+                                format!("正在下载 {} · 已接收 {:.2} MB…", rel.asset_name, dl_mb)
+                            };
+                            ui.label(body_text(prog_txt, 11.0, p.accent));
+                        } else if self.update_state.status == UpdateStatus::Error
+                            && !self.update_state.message.is_empty()
+                        {
+                            egui::Frame::new()
+                                .fill(p.danger_soft)
+                                .stroke(Stroke::new(1.0_f32, p.danger_border))
+                                .corner_radius(CornerRadius::same(7))
+                                .inner_margin(egui::Margin::symmetric(10, 7))
+                                .show(ui, |ui| {
+                                    ui.set_width(card_w - 22.0);
+                                    ui.add(
+                                        egui::Label::new(body_text(
+                                            &self.update_state.message,
+                                            11.0,
+                                            p.danger,
+                                        ))
+                                        .wrap(),
+                                    );
+                                });
+                        }
+
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            if secondary_button(ui, p, Some(Icon::ExternalLink), "GitHub 页面")
+                                .on_hover_text("在浏览器打开 GitHub Release 页面手动查看或下载")
+                                .clicked()
+                            {
+                                do_open_web = true;
+                            }
+                            if !busy
+                                && rel.version != self.settings.skipped_update_version
+                                && secondary_button(ui, p, None, "跳过此版").clicked()
+                            {
+                                do_skip = true;
+                            }
+
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    ui.spacing_mut().item_spacing.x = 8.0;
+                                    if busy {
+                                        badge(
+                                            ui,
+                                            p.accent,
+                                            p.accent_soft,
+                                            p.accent_border,
+                                            "更新执行中…",
+                                        );
+                                    } else {
+                                        let btn_lbl =
+                                            if self.update_state.status == UpdateStatus::Error {
+                                                "重试自动更新"
+                                            } else {
+                                                "立即下载并更新"
+                                            };
+                                        if primary_button(ui, p, Some(Icon::Download), btn_lbl)
+                                            .clicked()
+                                        {
+                                            do_install = true;
+                                        }
+                                        if secondary_button(ui, p, None, "稍后").clicked() {
+                                            do_close = true;
+                                        }
+                                    }
+                                },
+                            );
+                        });
+                    });
+            });
+
+        if do_open_web {
+            let url = if rel.html_url.is_empty() {
+                crate::updater::GITHUB_RELEASES_PAGE
+            } else {
+                rel.html_url.as_str()
+            };
+            crate::updater::open_browser_url(url);
+        }
+        if do_skip {
+            let mut next = self.settings.clone();
+            next.skipped_update_version = rel.version.clone();
+            if self.store.save_settings(&next).is_ok() {
+                self.settings = next.clone();
+                self.request(
+                    UiToDaemon::ReloadSettings {
+                        start: false,
+                        password_changed: false,
+                        expected: next,
+                    },
+                    None,
+                );
+                self.show_toast(format!("已跳过 v{} 的自动提醒", rel.version), false);
+            }
+            self.update_modal_open = false;
+        } else if do_close {
+            self.update_modal_open = false;
+        } else if do_install {
+            self.request(UiToDaemon::StartUpdate, None);
+        }
+    }
+
     fn draw_toast(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some((message, is_error, at)) = self.toast.as_ref() else {
             return;
@@ -1898,6 +2238,39 @@ impl GuardApp {
                     });
             });
     }
+}
+
+fn draw_titlebar_update_pill(ui: &mut egui::Ui, p: &Palette, label: &str) -> egui::Response {
+    let font = egui::FontId::new(10.8, theme::bold_family());
+    let g = ui.painter().layout_no_wrap(label.to_string(), font, p.ok);
+    let w = g.size().x + 28.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(w, 23.0), Sense::click());
+    let resp = resp
+        .on_hover_cursor(CursorIcon::PointingHand)
+        .on_hover_text("发现 GitHub Release 新版本，点击查看更新内容并一键覆盖安装");
+    let (bg, bd, fg) = if resp.hovered() {
+        (p.ok, Stroke::NONE, egui::Color32::WHITE)
+    } else {
+        (p.ok_soft, Stroke::new(1.0_f32, p.ok_border), p.ok)
+    };
+    ui.painter()
+        .rect(rect, CornerRadius::same(11), bg, bd, StrokeKind::Inside);
+    let ic_r = Rect::from_center_size(
+        Pos2::new(rect.left() + 11.5, rect.center().y),
+        Vec2::splat(11.0),
+    );
+    icons::paint(ui.painter(), ic_r, Icon::Download, fg);
+    let g_draw = ui.painter().layout_no_wrap(
+        label.to_string(),
+        egui::FontId::new(10.8, theme::bold_family()),
+        fg,
+    );
+    ui.painter().galley(
+        Pos2::new(rect.left() + 20.0, rect.center().y - g_draw.size().y * 0.5),
+        g_draw,
+        fg,
+    );
+    resp
 }
 
 fn prompt_account(snapshot: &MonitorSnapshot, opened: &mut bool) -> bool {
@@ -1957,6 +2330,10 @@ impl eframe::App for GuardApp {
             || !self.kicking_ips.is_empty()
             || self.preverify_job.is_some()
             || self.toast.is_some()
+            || matches!(
+                self.update_state.status,
+                UpdateStatus::Checking | UpdateStatus::Downloading | UpdateStatus::Applying
+            )
             || matches!(
                 self.state(),
                 Some(MonitorState::Checking)
@@ -2114,6 +2491,7 @@ impl eframe::App for GuardApp {
                             &self.store.app_dir,
                             &self.log_path,
                             &self.account_creds,
+                            &self.update_state,
                             self.needs_setup,
                             saving,
                             verifying_account,
@@ -2170,11 +2548,20 @@ impl eframe::App for GuardApp {
                         None,
                     );
                 }
+                if actions.check_update {
+                    self.pending_manual_update_check = true;
+                    self.show_toast("正在连接 GitHub 检查新版本…", false);
+                    self.request(UiToDaemon::CheckUpdate { manual: true }, None);
+                }
+                if actions.open_update_modal {
+                    self.update_modal_open = true;
+                }
             }
         }
 
         self.draw_campus_vpn_modal(ctx, &p);
         self.draw_local_kick_modal(ctx, &p);
+        self.draw_update_modal(ctx, &p);
         self.draw_toast(ctx, &p);
 
         // 无边框窗口 1px 外描边

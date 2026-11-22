@@ -1798,6 +1798,7 @@ mod tests {
             active_account_label: Arc::new(Mutex::new("未配置账号".into())),
             active_carrier: Arc::new(Mutex::new("2".into())),
             active_account_key: Arc::new(Mutex::new(crate::traffic::account_key_of(""))),
+            skipped_update_ver: Arc::new(Mutex::new(String::new())),
             traffic_tracker: Arc::new(Mutex::new(crate::traffic::TrafficTracker::new(dir))),
             latest_traffic: Arc::new(Mutex::new(crate::models::TrafficSummary::default())),
             self_service: Arc::new(crate::self_service::SelfServiceManager::new(
@@ -1806,6 +1807,14 @@ mod tests {
                 "2".into(),
                 Arc::new(|_, _| None),
                 Arc::new(|_| {}),
+            )),
+            updater: Arc::new(crate::updater::UpdateManager::new(
+                dir.into(),
+                false,
+                String::new(),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                Arc::new(|_| {}),
+                Arc::new(|| {}),
             )),
             show_ui: Box::new(move |_| {
                 shows.fetch_add(1, Ordering::SeqCst);

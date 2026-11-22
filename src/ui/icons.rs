@@ -41,6 +41,7 @@ pub enum Icon {
     Monitor,
     Plus,
     Trash,
+    Download,
 }
 
 /// 在给定矩形内按比例居中绘制矢量图标。
@@ -422,6 +423,19 @@ pub fn paint(painter: &egui::Painter, rect: Rect, icon: Icon, color: Color32) {
             painter.add(egui::Shape::line(body, st));
             painter.line_segment([pt(-0.16, -0.12), pt(-0.13, 0.38)], st);
             painter.line_segment([pt(0.16, -0.12), pt(0.13, 0.38)], st);
+        }
+        Icon::Download => {
+            // 向下箭头 + 底部承接托盘
+            painter.line_segment([pt(0.0, -0.68), pt(0.0, 0.24)], st);
+            painter.line_segment([pt(-0.34, -0.10), pt(0.0, 0.26)], st);
+            painter.line_segment([pt(0.34, -0.10), pt(0.0, 0.26)], st);
+            let tray = vec![
+                pt(-0.62, 0.24),
+                pt(-0.62, 0.62),
+                pt(0.62, 0.62),
+                pt(0.62, 0.24),
+            ];
+            painter.add(egui::Shape::line(tray, st));
         }
     }
 }

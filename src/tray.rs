@@ -12,6 +12,7 @@ pub enum TrayAction {
     OpenMenu,
     Show,
     OpenAccountSettings,
+    OpenUpdate,
     SwitchAccount(String),
     KickDevice { ip: String, is_local: bool },
     Start,

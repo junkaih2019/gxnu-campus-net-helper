@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::models::{MonitorSnapshot, SelfServiceState, Settings, TrafficSummary};
+use crate::models::{MonitorSnapshot, SelfServiceState, Settings, TrafficSummary, UpdateState};
 
 const ENDPOINT_FILE: &str = "daemon.json";
 
@@ -35,6 +35,8 @@ pub struct SnapshotEnvelope {
     pub active_account_id: String,
     #[serde(default)]
     pub self_service: SelfServiceState,
+    #[serde(default)]
+    pub update: UpdateState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,7 +55,9 @@ pub enum DaemonToUi {
         is_local: bool,
         result: Result<(), String>,
     },
+    UpdateState(Box<UpdateState>),
     OpenAccountSettings,
+    OpenUpdateModal,
     Shutdown,
 }
 
@@ -71,6 +75,10 @@ pub enum UiToDaemon {
         ip: String,
         is_local: bool,
     },
+    CheckUpdate {
+        manual: bool,
+    },
+    StartUpdate,
     ReloadSettings {
         start: bool,
         password_changed: bool,
@@ -256,6 +264,20 @@ impl IpcServer {
             });
     }
 
+    pub fn broadcast_update_state(&self, state: UpdateState) {
+        self.subscribers
+            .lock()
+            .unwrap()
+            .broadcast(DaemonToUi::UpdateState(Box::new(state)));
+    }
+
+    pub fn broadcast_open_update_modal(&self) {
+        self.subscribers
+            .lock()
+            .unwrap()
+            .broadcast(DaemonToUi::OpenUpdateModal);
+    }
+
     pub fn broadcast_shutdown(&self) {
         let mut hub = self.subscribers.lock().unwrap();
         if hub.closed {
@@ -359,9 +381,11 @@ pub struct IpcClient {
     next_id: u64,
     pub replies: Receiver<(u64, Result<(), String>)>,
     pub kick_results: Receiver<(String, bool, Result<(), String>)>,
+    pub update_states: Receiver<UpdateState>,
     pub daemon_closed: Arc<AtomicBool>,
     pub connection_lost: Arc<AtomicBool>,
     pub open_account_settings: Arc<AtomicBool>,
+    pub open_update_modal: Arc<AtomicBool>,
 }
 
 impl IpcClient {
@@ -391,12 +415,15 @@ impl IpcClient {
         let (log_tx, log_rx) = mpsc::channel::<String>();
         let daemon_closed = Arc::new(AtomicBool::new(false));
         let open_account_settings = Arc::new(AtomicBool::new(false));
+        let open_update_modal = Arc::new(AtomicBool::new(false));
         let (reply_tx, replies) = mpsc::channel();
         let (kick_tx, kick_results) = mpsc::channel();
+        let (upd_tx, update_states) = mpsc::channel();
         let connection_lost = Arc::new(AtomicBool::new(false));
         let lost_ref = Arc::clone(&connection_lost);
         let closed_ref = Arc::clone(&daemon_closed);
         let open_acct_ref = Arc::clone(&open_account_settings);
+        let open_upd_ref = Arc::clone(&open_update_modal);
 
         std::thread::Builder::new()
             .name("ipc-ui-reader".to_string())
@@ -429,8 +456,14 @@ impl IpcClient {
                                     } => {
                                         let _ = kick_tx.send((ip, is_local, result));
                                     }
+                                    DaemonToUi::UpdateState(st) => {
+                                        let _ = upd_tx.send(*st);
+                                    }
                                     DaemonToUi::OpenAccountSettings => {
                                         open_acct_ref.store(true, Ordering::Release);
+                                    }
+                                    DaemonToUi::OpenUpdateModal => {
+                                        open_upd_ref.store(true, Ordering::Release);
                                     }
                                     DaemonToUi::Shutdown => {
                                         closed_ref.store(true, Ordering::SeqCst);
@@ -450,9 +483,11 @@ impl IpcClient {
                 next_id: 1,
                 replies,
                 kick_results,
+                update_states,
                 daemon_closed,
                 connection_lost,
                 open_account_settings,
+                open_update_modal,
             },
             snap_rx,
             log_rx,
@@ -564,6 +599,7 @@ mod tests {
             traffic: TrafficSummary::default(),
             active_account_id: String::new(),
             self_service: SelfServiceState::default(),
+            update: UpdateState::default(),
         });
         let ep = server.endpoint();
         let (mut client, snapshots, logs) = IpcClient::connect(ep.port, &ep.token).unwrap();

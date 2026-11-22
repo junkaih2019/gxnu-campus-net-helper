@@ -8,7 +8,7 @@ use std::path::Path;
 
 use eframe::egui::{self, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
-use crate::models::{AccountProfile, Settings};
+use crate::models::{AccountProfile, Settings, UpdateState, UpdateStatus};
 use crate::ui::icons::{self, Icon};
 use crate::ui::theme::{
     body_text, bold_text, carrier_label, clamp_ui_zoom, with_alpha, Palette, ThemeMode, UiPrefs,
@@ -64,6 +64,7 @@ pub struct SettingsForm {
     pub confirm_failures: i64,
     pub auto_start_monitoring: bool,
     pub auto_boot: bool,
+    pub auto_check_updates: bool,
     pub notify_toast: bool,
     pub notify_wechat: bool,
     pub notify_quiet_minutes: i64,
@@ -104,6 +105,7 @@ impl SettingsForm {
             confirm_failures: settings.confirm_failures,
             auto_start_monitoring: settings.auto_start_monitoring,
             auto_boot: settings.auto_boot,
+            auto_check_updates: settings.auto_check_updates,
             notify_toast: settings.notify_toast,
             notify_wechat: settings.notify_wechat,
             notify_quiet_minutes: settings.notify_quiet_minutes,
@@ -148,6 +150,7 @@ impl SettingsForm {
             confirm_failures: self.confirm_failures,
             auto_start_monitoring: self.auto_start_monitoring,
             auto_boot: self.auto_boot,
+            auto_check_updates: self.auto_check_updates,
             notify_toast: self.notify_toast,
             notify_wechat: self.notify_wechat,
             notify_quiet_minutes: self.notify_quiet_minutes,
@@ -175,6 +178,7 @@ impl SettingsForm {
             || current.confirm_failures != saved.confirm_failures
             || current.auto_start_monitoring != saved.auto_start_monitoring
             || current.auto_boot != saved.auto_boot
+            || current.auto_check_updates != saved.auto_check_updates
             || current.notify_toast != saved.notify_toast
             || current.notify_quiet_minutes != saved.notify_quiet_minutes
     }
@@ -217,6 +221,8 @@ pub struct SettingsActions {
     pub reset: bool,
     pub ui_prefs_changed: bool,
     pub set_window_size: Option<[f32; 2]>,
+    pub check_update: bool,
+    pub open_update_modal: bool,
 }
 
 /// 成熟版 Windows 11 Fluent 设置中心视图（左侧分组导航 + 右侧分组卡片 + 底部常驻保存栏）。
@@ -230,6 +236,7 @@ pub fn draw_settings_view(
     app_dir: &Path,
     log_path: &Path,
     account_creds: &HashMap<String, bool>,
+    update_state: &UpdateState,
     needs_setup: bool,
     saving: bool,
     verifying_account: bool,
@@ -343,14 +350,30 @@ pub fn draw_settings_view(
                                     ))
                                     .truncate(),
                                 );
-                                ui.add(
-                                    egui::Label::new(body_text(
-                                        format!("v{}", env!("CARGO_PKG_VERSION")),
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 5.0;
+                                    ui.label(body_text(
+                                        format!("v{}", crate::VERSION),
                                         10.0,
                                         p.text_muted,
-                                    ))
-                                    .truncate(),
-                                );
+                                    ));
+                                    if update_state
+                                        .has_visible_update(&saved.skipped_update_version)
+                                        && ui
+                                            .add(
+                                                egui::Label::new(bold_text(
+                                                    "↑ 有新版",
+                                                    9.8,
+                                                    p.accent,
+                                                ))
+                                                .sense(Sense::click()),
+                                            )
+                                            .on_hover_cursor(CursorIcon::PointingHand)
+                                            .clicked()
+                                    {
+                                        actions.open_update_modal = true;
+                                    }
+                                });
                             },
                         );
                     });
@@ -407,7 +430,13 @@ pub fn draw_settings_view(
                                                 verifying_account,
                                                 &mut actions,
                                             ),
-                                            SettingsTab::Monitor => draw_monitor_page(ui, p, form),
+                                            SettingsTab::Monitor => draw_monitor_page(
+                                                ui,
+                                                p,
+                                                form,
+                                                update_state,
+                                                &mut actions,
+                                            ),
                                             SettingsTab::Display => {
                                                 draw_display_page(ui, p, ui_prefs, &mut actions)
                                             }
@@ -1158,12 +1187,18 @@ fn draw_carrier_row(ui: &mut egui::Ui, p: &Palette, carrier: &mut usize) -> bool
     changed
 }
 
-fn draw_monitor_page(ui: &mut egui::Ui, p: &Palette, form: &mut SettingsForm) {
+fn draw_monitor_page(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    form: &mut SettingsForm,
+    update_state: &UpdateState,
+    actions: &mut SettingsActions,
+) {
     page_header(
         ui,
         p,
         "监控与自启",
-        "自定义网络巡检周期、防抖复核策略以及 Windows 登录自启行为。",
+        "自定义网络巡检周期、防抖复核策略、Windows 登录自启与版本自动更新。",
     );
 
     group_card(ui, p, |ui| {
@@ -1233,6 +1268,117 @@ fn draw_monitor_page(ui: &mut egui::Ui, p: &Palette, form: &mut SettingsForm) {
             &mut form.auto_start_monitoring,
             true,
             None,
+        );
+    });
+
+    ui.add_space(10.0);
+
+    group_card(ui, p, |ui| {
+        fluent_toggle_row(
+            ui,
+            p,
+            "自动检查新版本",
+            "联网状态下每 12 小时静默检查 GitHub Release 新版本，仅温和提醒绝不擅自重启断网",
+            &mut form.auto_check_updates,
+            true,
+            None,
+        );
+        row_divider(ui, p);
+
+        let row_w = ui.available_width();
+        ui.allocate_ui_with_layout(
+            Vec2::new(row_w, 40.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                let left_w = (row_w - 116.0).max(150.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(left_w, 40.0),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        ui.label(bold_text(
+                            format!("当前版本 v{}", crate::VERSION),
+                            12.5,
+                            p.text,
+                        ));
+                        let (sub_txt, sub_col) = match update_state.status {
+                            UpdateStatus::Checking => {
+                                ("正在连接 GitHub 检查新版本…".to_string(), p.accent)
+                            }
+                            UpdateStatus::Downloading => {
+                                let pct = update_state
+                                    .progress_ratio()
+                                    .map(|r| format!(" ({}%)", (r * 100.0).round() as i32))
+                                    .unwrap_or_default();
+                                (format!("正在下载更新包{pct}…"), p.accent)
+                            }
+                            UpdateStatus::Applying => ("正在替换安装并重启…".to_string(), p.ok),
+                            UpdateStatus::Available => {
+                                let ver = update_state
+                                    .release
+                                    .as_ref()
+                                    .map(|r| r.version.as_str())
+                                    .unwrap_or("");
+                                (format!("发现新版本 v{ver}，点击右侧即可原位覆盖升级"), p.ok)
+                            }
+                            UpdateStatus::Error if !update_state.message.is_empty() => {
+                                (update_state.message.clone(), p.warn)
+                            }
+                            UpdateStatus::UpToDate => {
+                                let checked_str = update_state
+                                    .last_checked_unix
+                                    .and_then(|ts| {
+                                        chrono::DateTime::from_timestamp(ts, 0).map(|dt| {
+                                            dt.with_timezone(&chrono::Local)
+                                                .format(" · 上次检查 %H:%M")
+                                                .to_string()
+                                        })
+                                    })
+                                    .unwrap_or_default();
+                                (format!("当前已是最新版本{checked_str}"), p.text_muted)
+                            }
+                            _ => (
+                                "点击右侧可立即前往 GitHub Release 检查是否有新版本".to_string(),
+                                p.text_muted,
+                            ),
+                        };
+                        ui.add(egui::Label::new(body_text(sub_txt, 10.8, sub_col)).truncate());
+                    },
+                );
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    match update_state.status {
+                        UpdateStatus::Available | UpdateStatus::Downloading => {
+                            let lbl = if update_state.status == UpdateStatus::Downloading {
+                                "查看进度"
+                            } else {
+                                "查看新版本"
+                            };
+                            if draw_compact_action_btn(ui, p, Some(Icon::Download), lbl, true)
+                                .clicked()
+                            {
+                                actions.open_update_modal = true;
+                            }
+                        }
+                        UpdateStatus::Checking | UpdateStatus::Applying => {
+                            badge(ui, p.accent, p.accent_soft, p.accent_border, "处理中…");
+                        }
+                        _ => {
+                            if draw_compact_action_btn(
+                                ui,
+                                p,
+                                Some(Icon::Refresh),
+                                "检查更新",
+                                false,
+                            )
+                            .clicked()
+                            {
+                                actions.check_update = true;
+                            }
+                        }
+                    }
+                });
+            },
         );
     });
 }
