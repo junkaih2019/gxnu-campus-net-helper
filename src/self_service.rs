@@ -842,10 +842,12 @@ fn iter_html_tags(html: &str) -> Vec<HtmlTag<'_>> {
 
 #[derive(Debug, Clone)]
 pub enum FetchTrigger {
-    /// 打开主窗口或切换账号时的常规同步（遵守 5 分钟缓存 TTL 与 30 分钟验证码冷却）。
+    /// 打开主窗口时的常规同步（遵守 5 分钟缓存 TTL 与 30 分钟验证码冷却）。
     UiOpen,
     /// 用户主动点击刷新按钮（遵守 15 秒最小防抖；验证码冷却期满 60 秒后允许手动重试）。
     Manual,
+    /// 主动切换账号/出口或新会话刚认证上线后的即时刷新（绕过 5 分钟旧会话缓存，同步最新在线设备与流量）。
+    SessionEstablished,
     /// `AUTH_EXPIRED` 自动重连成功后的异步归因复核（绕过 5 分钟 TTL，不拖慢重连）。
     PostReconnect {
         dropped_at_unix: i64,
@@ -959,6 +961,12 @@ impl SelfServiceManager {
         guard.last_attempt_mono = None;
         guard.captcha_until_unix = None;
         guard.last_captcha_at_unix = None;
+    }
+
+    /// 主动发起切号前调用：清除上一次打开窗口时的 15s 防抖时间戳，确保切号重连成功后可立即重拉新会话状态。
+    pub fn notify_account_switching(&self) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.last_attempt_mono = None;
     }
 
     /// 按触发策略决定是否发起异步同步；返回给调用方的提示文案（手动刷新被节流时返回 Ok，不报错）。
@@ -1137,7 +1145,7 @@ fn build_trigger_diagnosis(
         .unwrap_or_else(|| format!("{count}"));
 
     match trigger {
-        FetchTrigger::UiOpen | FetchTrigger::Manual => None,
+        FetchTrigger::UiOpen | FetchTrigger::Manual | FetchTrigger::SessionEstablished => None,
         FetchTrigger::PostReconnect {
             dropped_at_unix,
             local_campus_ip,

@@ -409,7 +409,7 @@ fn run_daemon(
                         Some(models::MonitorState::Verifying)
                             | Some(models::MonitorState::Authenticating)
                     ) {
-                        Some(self_service::FetchTrigger::UiOpen)
+                        Some(self_service::FetchTrigger::SessionEstablished)
                     } else {
                         None
                     }
@@ -766,6 +766,7 @@ impl DaemonCommands {
                 }
                 let label = settings.active_display_name();
                 self.sync_active_account_state(&settings);
+                self.self_service.notify_account_switching();
                 self.control.switch_account(settings)?;
                 logging::info(&format!(
                     "[ACCOUNT_SWITCH] 守护进程开始切换至账号「{label}」"
