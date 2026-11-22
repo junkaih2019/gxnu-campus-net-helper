@@ -83,7 +83,7 @@
 
 ## 🚀 快速开始
 
-1. **下载运行**：前往 [Releases](https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest) 下载最新单文件 **`gxnu-campus-net-helper-v0.2.4.exe`**，放入**固定文件夹**后直接双击运行（免安装、免解压）。
+1. **下载运行**：前往 [Releases](https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest) 下载最新单文件 **`gxnu-campus-net-helper-v0.2.5.exe`**，放入**固定文件夹**后直接双击运行（免安装、免解压）。
    > 💡 首次运行若弹出 Windows SmartScreen 提示，点击 **更多信息 → 仍要运行** 即可（个人开源单文件未附商业代码签名，可通过随附 `SHA256SUMS.txt` 校验完整性）。
 2. **添加账号**：首次启动会自动打开 **设置 → 账号管理**，在左侧填入校园网学号与密码，右侧点选出口（`校园网 / 电信 / 联通 / 移动 / 广电`，选运营商时可勾选同时生成「校园网」快捷切换项），点击 **验证并添加账号** 即可开始守护；后续为同一学号补充其他出口无需重复输入账密。
 3. **日常使用**：
