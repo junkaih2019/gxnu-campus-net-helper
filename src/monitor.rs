@@ -1792,6 +1792,7 @@ mod tests {
             notifier: Arc::new(Mutex::new(crate::notify::ToastNotifier::new(false))),
             active_account_id: Arc::new(Mutex::new(String::new())),
             active_account_label: Arc::new(Mutex::new("未配置账号".into())),
+            active_carrier: Arc::new(Mutex::new("2".into())),
             active_account_key: Arc::new(Mutex::new(crate::traffic::account_key_of(""))),
             traffic_tracker: Arc::new(Mutex::new(crate::traffic::TrafficTracker::new(dir))),
             latest_traffic: Arc::new(Mutex::new(crate::models::TrafficSummary::default())),

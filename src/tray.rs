@@ -1,6 +1,6 @@
 //! 系统托盘图标管理：
 //! - 使用柔和圆角矩形 Wi-Fi 状态图标，随监控状态实时刷新
-//! - 左键单击/双击直接唤起主窗口，右键弹出自定义 Windows 11 Fluent 现代菜单（见 `tray_menu.rs`）
+//! - 左键单击弹出竖版快捷浮窗（`tray_flyout.rs`），左键双击唤起完整主窗口，右键弹出快捷菜单（`tray_menu.rs`）
 
 use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, TrayIconEvent};
 
@@ -8,6 +8,7 @@ use crate::models::{MonitorSnapshot, MonitorState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
+    ToggleFlyout,
     OpenMenu,
     Show,
     Start,
@@ -52,7 +53,8 @@ impl TrayUi {
     }
 
     /// 后台零轮询监听托盘图标点击：
-    /// - 左键单击/双击：直接唤起主窗口
+    /// - 左键单击：弹出/收起竖版快捷浮窗
+    /// - 左键双击：直接唤起完整主窗口
     /// - 右键松开：弹出自定义 Windows 11 Fluent 现代菜单
     pub fn start_event_listener<F>(&self, on_action: F)
     where
@@ -68,8 +70,10 @@ impl TrayUi {
                             button: MouseButton::Left,
                             button_state: MouseButtonState::Up,
                             ..
+                        } => {
+                            on_action(TrayAction::ToggleFlyout);
                         }
-                        | TrayIconEvent::DoubleClick {
+                        TrayIconEvent::DoubleClick {
                             button: MouseButton::Left,
                             ..
                         } => {

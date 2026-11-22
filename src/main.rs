@@ -28,6 +28,7 @@ mod single_instance;
 mod startup;
 mod traffic;
 mod tray;
+mod tray_flyout;
 mod tray_menu;
 mod ui;
 
@@ -52,6 +53,7 @@ const APP_NAME: &str = env!("CARGO_PKG_DESCRIPTION");
 const WM_TRAY_REFRESH: u32 = 0x8000 + 1;
 const WM_DAEMON_QUIT: u32 = 0x8000 + 2;
 const WM_TRAY_SHOW_MENU: u32 = 0x8000 + 3;
+const WM_TRAY_TOGGLE_FLYOUT: u32 = 0x8000 + 4;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -214,6 +216,7 @@ fn run_daemon(
     let traffic_tracker = Arc::new(Mutex::new(traffic::TrafficTracker::new(&store.app_dir)));
     let active_account_id = Arc::new(Mutex::new(settings.active_account_id.clone()));
     let active_account_label = Arc::new(Mutex::new(settings.active_display_name()));
+    let active_carrier = Arc::new(Mutex::new(settings.carrier.clone()));
     let active_account_key = Arc::new(Mutex::new(traffic::account_key_of(&settings.student_id)));
     let latest_traffic = Arc::new(Mutex::new(traffic_tracker.lock().unwrap().summary(
         &active_account_key.lock().unwrap(),
@@ -262,6 +265,7 @@ fn run_daemon(
                 if let Ok(mut g) = shared_ss.lock() {
                     *g = state.clone();
                 }
+                post_thread_msg(main_tid, WM_TRAY_REFRESH);
                 if let Some(snap) = latest_snap.lock().ok().and_then(|g| g.clone()) {
                     ipc.broadcast_snapshot(ipc::SnapshotEnvelope {
                         snapshot: snap,
@@ -512,6 +516,7 @@ fn run_daemon(
     let diagnostics = diagnostics::NetworkDiagnostics::new()
         .with_campus_status(campus_status::CampusStatusProbe::new());
     let authenticator = authenticator::CampusAuthenticator::new();
+    let metrics_for_flyout = Arc::clone(&metrics_store);
     let mut monitor = monitor::NetworkMonitor::new(
         diagnostics,
         authenticator,
@@ -532,6 +537,7 @@ fn run_daemon(
         notifier,
         active_account_id: Arc::clone(&active_account_id),
         active_account_label: Arc::clone(&active_account_label),
+        active_carrier: Arc::clone(&active_carrier),
         active_account_key: Arc::clone(&active_account_key),
         traffic_tracker: Arc::clone(&traffic_tracker),
         latest_traffic: Arc::clone(&latest_traffic),
@@ -559,6 +565,9 @@ fn run_daemon(
     let tray_commands = Arc::clone(&commands);
     let dispatch_tray_action = Arc::new(move |action: tray::TrayAction| {
         let command = match action {
+            tray::TrayAction::ToggleFlyout => {
+                return post_thread_msg(main_tid, WM_TRAY_TOGGLE_FLYOUT)
+            }
             tray::TrayAction::Show => ipc::UiToDaemon::ShowUi,
             tray::TrayAction::Start => ipc::UiToDaemon::Start,
             tray::TrayAction::Pause => ipc::UiToDaemon::Pause,
@@ -577,7 +586,7 @@ fn run_daemon(
 
     let menu_cb = Arc::clone(&dispatch_tray_action);
     let mut fluent_menu = match tray_menu::FluentTrayMenu::new(
-        app_dir,
+        app_dir.clone(),
         Arc::clone(&latest_snapshot),
         Arc::clone(&active_account_label),
         move |action| menu_cb(action),
@@ -585,6 +594,27 @@ fn run_daemon(
         Ok(menu) => Some(menu),
         Err(err) => {
             logging::error(&format!("[TRAY_MENU_ERROR] {err}"));
+            None
+        }
+    };
+
+    let flyout_cb = Arc::clone(&dispatch_tray_action);
+    let mut fluent_flyout = match tray_flyout::FluentTrayFlyout::new(
+        tray_flyout::FlyoutDataSources {
+            app_dir,
+            latest_snapshot: Arc::clone(&latest_snapshot),
+            online_since_unix: Arc::clone(&online_since_unix),
+            latest_traffic: Arc::clone(&latest_traffic),
+            latest_self_service: Arc::clone(&latest_self_service),
+            active_account_label: Arc::clone(&active_account_label),
+            active_carrier: Arc::clone(&active_carrier),
+            metrics_store: metrics_for_flyout,
+        },
+        move |action| flyout_cb(action),
+    ) {
+        Ok(flyout) => Some(flyout),
+        Err(err) => {
+            logging::error(&format!("[TRAY_FLYOUT_ERROR] {err}"));
             None
         }
     };
@@ -603,12 +633,14 @@ fn run_daemon(
 
     trim_working_set_win32();
 
-    // 零 CPU 原生 Win32 消息循环（仅在托盘点击、菜单交互或状态变化时被内核唤醒）
+    // 零 CPU 原生 Win32 消息循环（仅在托盘点击、浮窗/菜单交互或状态变化时被内核唤醒）
     run_win32_tray_loop(
         &mut tray,
         fluent_menu.as_mut(),
+        fluent_flyout.as_mut(),
         &latest_snapshot,
         &monitor_ctrl,
+        &self_service_mgr,
     );
 
     // ── 干净退出流程 ───────────────────────────────────────────────
@@ -620,6 +652,10 @@ fn run_daemon(
     }
     logging::info("[APP_EXIT] 正在退出");
     ipc_server.broadcast_shutdown();
+    if let Some(flyout) = fluent_flyout.as_mut() {
+        flyout.hide();
+    }
+    drop(fluent_flyout);
     if let Some(menu) = fluent_menu.as_mut() {
         menu.hide();
     }
@@ -639,6 +675,7 @@ struct DaemonCommands {
     notifier: Arc<Mutex<notify::ToastNotifier>>,
     active_account_id: Arc<Mutex<String>>,
     active_account_label: Arc<Mutex<String>>,
+    active_carrier: Arc<Mutex<String>>,
     active_account_key: Arc<Mutex<String>>,
     traffic_tracker: Arc<Mutex<traffic::TrafficTracker>>,
     latest_traffic: Arc<Mutex<models::TrafficSummary>>,
@@ -655,6 +692,7 @@ impl DaemonCommands {
             .unwrap_or(settings.active_account_id.as_str());
         *self.active_account_id.lock().unwrap() = settings.active_account_id.clone();
         *self.active_account_label.lock().unwrap() = settings.active_display_name();
+        *self.active_carrier.lock().unwrap() = settings.carrier.clone();
         *self.active_account_key.lock().unwrap() = new_key.clone();
         let refreshed = self
             .traffic_tracker
@@ -872,8 +910,10 @@ fn stop_ui_child(ui_child: &Arc<Mutex<Option<Child>>>) {
 fn run_win32_tray_loop(
     tray: &mut tray::TrayUi,
     mut fluent_menu: Option<&mut tray_menu::FluentTrayMenu>,
+    mut fluent_flyout: Option<&mut tray_flyout::FluentTrayFlyout>,
     latest_snapshot: &Arc<Mutex<Option<models::MonitorSnapshot>>>,
     control: &monitor::MonitorControl,
+    self_service_mgr: &Arc<self_service::SelfServiceManager>,
 ) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         DispatchMessageW, GetMessageW, TranslateMessage, MSG,
@@ -890,9 +930,24 @@ fn run_win32_tray_loop(
                 if let Some(snap) = latest_snapshot.lock().ok().and_then(|g| g.clone()) {
                     tray.apply(&snap);
                 }
+                if let Some(flyout) = fluent_flyout.as_deref_mut() {
+                    flyout.refresh_if_visible();
+                }
             } else if msg.message == WM_TRAY_SHOW_MENU {
+                if let Some(flyout) = fluent_flyout.as_deref_mut() {
+                    flyout.hide();
+                }
                 if let Some(menu) = fluent_menu.as_deref_mut() {
                     menu.show_at_cursor();
+                }
+            } else if msg.message == WM_TRAY_TOGGLE_FLYOUT {
+                if let Some(menu) = fluent_menu.as_deref_mut() {
+                    menu.hide();
+                }
+                if let Some(flyout) = fluent_flyout.as_deref_mut() {
+                    if flyout.toggle_at_cursor() {
+                        self_service_mgr.trigger(self_service::FetchTrigger::UiOpen);
+                    }
                 }
             } else if msg.message == WM_DAEMON_QUIT {
                 break;
