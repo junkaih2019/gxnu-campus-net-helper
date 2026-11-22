@@ -347,6 +347,28 @@ pub fn translate_drcom_message(raw: &str) -> String {
         .to_string()
 }
 
+/// 判断门户拒绝说明是否属于明确的「账号/密码/运营商配置错误」（用于保存账号前精准拦截，
+/// 避免把并发已满、刚下线冷却、流量用尽或服务器繁忙误拦为账密错误）。
+pub fn is_definite_credential_error(message: &str) -> bool {
+    let m = message.trim();
+    if m.is_empty() {
+        return false;
+    }
+    [
+        "密码错误",
+        "账号不存在",
+        "学号或密码错误",
+        "用户名或密码错误",
+        "账号或密码错误",
+        "宽带账号或密码错误",
+        "未绑定该运营商宽带",
+        "统一身份认证校验失败",
+        "身份验证未通过",
+    ]
+    .iter()
+    .any(|kw| m.contains(kw))
+}
+
 /// 返回 `(success, message, code)`。
 fn portal_reply(text: &str) -> Option<(bool, String, String)> {
     if text.trim().eq_ignore_ascii_case("success") {
@@ -436,6 +458,28 @@ mod tests {
         assert!(translate_drcom_message("bind userid error").contains("未绑定该运营商宽带"));
         assert!(translate_drcom_message("Oppp error: TOO MANY CONNECTIONS").contains("并发上限"));
         assert!(translate_drcom_message("can not use static ip").contains("DHCP"));
+
+        assert!(is_definite_credential_error(&translate_drcom_message(
+            "userid error1"
+        )));
+        assert!(is_definite_credential_error(&translate_drcom_message(
+            "userid error2"
+        )));
+        assert!(is_definite_credential_error(&translate_drcom_message(
+            "Oppp error: 1"
+        )));
+        assert!(is_definite_credential_error(&translate_drcom_message(
+            "bind userid error"
+        )));
+        assert!(!is_definite_credential_error(&translate_drcom_message(
+            "Authentication Fail ErrCode=85"
+        )));
+        assert!(!is_definite_credential_error(&translate_drcom_message(
+            "Oppp error: User dial-in so soon"
+        )));
+        assert!(!is_definite_credential_error(&translate_drcom_message(
+            "Authentication Fail ErrCode=04"
+        )));
     }
 
     #[test]

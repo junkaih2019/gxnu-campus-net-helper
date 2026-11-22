@@ -56,6 +56,8 @@ pub struct SettingsForm {
     pub password: String,
     pub show_password: bool,
     pub carrier: usize,
+    /// 最近一次保存前验密被拒的中文说明；存在时在账号卡片内展示醒目红框与「仍要强制保存」兜底入口。
+    pub verify_error: Option<String>,
     pub check_interval: i64,
     pub heartbeat_minutes: i64,
     pub offline_interval: i64,
@@ -95,6 +97,7 @@ impl SettingsForm {
             password: String::new(),
             show_password: false,
             carrier,
+            verify_error: None,
             check_interval: settings.check_interval,
             heartbeat_minutes: (settings.heartbeat_interval / 60).clamp(1, 1440),
             offline_interval: settings.offline_interval,
@@ -121,6 +124,7 @@ impl SettingsForm {
         self.password.clear();
         self.show_password = false;
         self.carrier = profile.carrier.parse::<usize>().unwrap_or(2).min(3);
+        self.verify_error = None;
         self.monthly_quota_gb = profile.monthly_quota_gb;
     }
 
@@ -131,6 +135,7 @@ impl SettingsForm {
         self.password.clear();
         self.show_password = false;
         self.carrier = 2;
+        self.verify_error = None;
         self.monthly_quota_gb = 0;
     }
 
@@ -204,6 +209,7 @@ pub struct SettingsActions {
     pub test_toast: bool,
     pub save: bool,
     pub save_profile: bool,
+    pub force_save_profile: bool,
     pub switch_account: Option<String>,
     pub delete_account: Option<String>,
     pub reset: bool,
@@ -224,6 +230,7 @@ pub fn draw_settings_view(
     account_creds: &HashMap<String, bool>,
     needs_setup: bool,
     saving: bool,
+    verifying_account: bool,
     total_height: f32,
 ) -> SettingsActions {
     let mut actions = SettingsActions::default();
@@ -395,6 +402,7 @@ pub fn draw_settings_view(
                                                 form,
                                                 saved,
                                                 account_creds,
+                                                verifying_account,
                                                 &mut actions,
                                             ),
                                             SettingsTab::Monitor => draw_monitor_page(ui, p, form),
@@ -431,7 +439,11 @@ pub fn draw_settings_view(
                             egui::Layout::left_to_right(egui::Align::Center),
                             |ui| {
                                 ui.spacing_mut().item_spacing.x = 6.0;
-                                let (dot_c, status_str) = if dirty {
+                                let (dot_c, status_str) = if verifying_account {
+                                    (p.accent, "正在核验账号密码…")
+                                } else if form.verify_error.is_some() {
+                                    (p.danger, "账号密码未通过校验")
+                                } else if dirty {
                                     (p.warn, "有未保存修改")
                                 } else {
                                     (p.ok, "配置已生效")
@@ -457,8 +469,15 @@ pub fn draw_settings_view(
                                     |ui| {
                                         ui.spacing_mut().item_spacing.x = 8.0;
                                         let save_resp = ui
-                                            .add_enabled_ui(!saving, |ui| {
-                                                if needs_setup {
+                                            .add_enabled_ui(!saving && !verifying_account, |ui| {
+                                                if verifying_account {
+                                                    primary_button(
+                                                        ui,
+                                                        p,
+                                                        Some(Icon::Refresh),
+                                                        "正在验证…",
+                                                    )
+                                                } else if needs_setup {
                                                     primary_button(
                                                         ui,
                                                         p,
@@ -474,6 +493,7 @@ pub fn draw_settings_view(
                                             actions.save = true;
                                         }
                                         if dirty
+                                            && !verifying_account
                                             && secondary_button(ui, p, None, "还原修改").clicked()
                                         {
                                             actions.reset = true;
@@ -515,6 +535,7 @@ fn draw_account_page(
     form: &mut SettingsForm,
     saved: &Settings,
     account_creds: &HashMap<String, bool>,
+    verifying_account: bool,
     actions: &mut SettingsActions,
 ) {
     page_header(
@@ -761,6 +782,56 @@ fn draw_account_page(
         ui.label(body_text("运营商出口", 11.5, p.text_secondary));
         draw_carrier_row(ui, p, &mut form.carrier);
 
+        // 若上次点击保存时当场验密未通过，展示醒目红色原因卡片与「仍要强制保存」兜底按钮
+        if let Some(err_msg) = form.verify_error.clone() {
+            ui.add_space(4.0);
+            egui::Frame::new()
+                .fill(p.danger_soft)
+                .stroke(Stroke::new(1.0_f32, p.danger_border))
+                .corner_radius(CornerRadius::same(RADIUS_SM))
+                .inner_margin(egui::Margin::symmetric(12, 9))
+                .show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 8.0;
+                        let (ir, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+                        icons::paint(ui.painter(), ir, Icon::Close, p.danger);
+                        let text_w = (ui.available_width() - 96.0).max(140.0);
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(text_w, 32.0),
+                            egui::Layout::top_down(egui::Align::LEFT),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.y = 2.0;
+                                ui.add(
+                                    egui::Label::new(bold_text(
+                                        format!("登录校验未通过：{err_msg}"),
+                                        11.5,
+                                        p.danger,
+                                    ))
+                                    .wrap(),
+                                );
+                                ui.label(body_text(
+                                    "请核对上方学号、密码（点密码框右侧眼睛可查看）与运营商后重新点击保存",
+                                    10.5,
+                                    p.text_secondary,
+                                ));
+                            },
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if !verifying_account
+                                && draw_compact_action_btn(ui, p, None, "仍要强制保存", false)
+                                    .on_hover_text(
+                                        "若确认运营商宽带密码与自助服务密码不同，可跳过预检强制保存",
+                                    )
+                                    .clicked()
+                            {
+                                actions.force_save_profile = true;
+                            }
+                        });
+                    });
+                });
+        }
+
         row_divider(ui, p);
 
         // 卡片底部操作行：左安全隔离说明 + 右保存账号按钮
@@ -769,21 +840,27 @@ fn draw_account_page(
             egui::Layout::left_to_right(egui::Align::Center),
             |ui| {
                 ui.label(body_text(
-                    "密码按账号 ID 隔离加密存储（GXNUCampusLogin/v5），绝不明文写入配置或日志",
+                    "保存时将自动无损核验学号与密码；密码按账号 ID 独立加密存储，绝不明文落盘",
                     10.5,
                     p.text_muted,
                 ));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let btn_label = if is_new {
-                        "添加并保存账号"
+                    let btn_label = if verifying_account {
+                        "正在核验账号…"
+                    } else if is_new {
+                        "验证并添加账号"
                     } else {
-                        "保存此账号"
+                        "验证并保存账号"
                     };
-                    let clicked = if is_new || draft_dirty {
-                        primary_button(ui, p, Some(Icon::Check), btn_label).clicked()
-                    } else {
-                        secondary_button(ui, p, Some(Icon::Check), btn_label).clicked()
-                    };
+                    let clicked = ui
+                        .add_enabled_ui(!verifying_account, |ui| {
+                            if is_new || draft_dirty {
+                                primary_button(ui, p, Some(Icon::Check), btn_label).clicked()
+                            } else {
+                                secondary_button(ui, p, Some(Icon::Check), btn_label).clicked()
+                            }
+                        })
+                        .inner;
                     if clicked {
                         actions.save_profile = true;
                     }

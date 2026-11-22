@@ -102,6 +102,96 @@ fn needs_account_setup(configured: &str, stored: Option<&str>) -> bool {
     !stored.is_some_and(|id| !id.is_empty() && (configured.is_empty() || id == configured))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PreverifyOutcome {
+    /// 门户或自助服务当场核验通过。
+    Verified,
+    /// 非校园内网、触发图形验证码或并发已满等非账密错误：允许直接落盘保存并附带温和提示。
+    SkippedWithNote(String),
+    /// 明确的学号不存在、密码错误或未绑定所选运营商：拦截保存并停留在设置页提示重改。
+    Rejected(String),
+}
+
+struct AccountPreverifyJob {
+    rx: Receiver<PreverifyOutcome>,
+    also_save_global: bool,
+}
+
+/// 保存账号前的零断网风险当场验密：
+/// - 若将设为活跃账号且当前校园网明确离线：直接请求 `yc.gxnu.edu.cn` 实测登录（验对顺带联网）；
+/// - 若当前校园网已在线（绝不调 `logout` 踢断好端端的网！）或仅添加备用账号：改用 `172.16.4.2/Self/` 独立会话无损验密；
+/// - 仅对明确的账密/运营商错误拦截，离校/超时/验证码/并发满额均平滑放行。
+fn preverify_account_credentials(
+    student_id: &str,
+    password: &str,
+    carrier: &str,
+    make_active: bool,
+    fallback_local_ip: &str,
+) -> PreverifyOutcome {
+    if make_active {
+        if let Some(status) = crate::campus_status::CampusStatusProbe::new().check_detail() {
+            if !status.online {
+                let auth_ip = status.portal_ip.as_deref().unwrap_or(fallback_local_ip);
+                let auth = crate::authenticator::CampusAuthenticator::new()
+                    .authenticate(student_id, password, carrier, auth_ip);
+                return classify_portal_auth_for_preverify(
+                    auth.success,
+                    auth.reason,
+                    &auth.message,
+                );
+            }
+        }
+    }
+
+    let cred = credentials::StoredCredential {
+        username: student_id.to_string(),
+        password: password.to_string(),
+    };
+    classify_self_service_for_preverify(crate::self_service::verify_credentials_only(&cred))
+}
+
+fn classify_portal_auth_for_preverify(
+    success: bool,
+    reason: crate::models::DisconnectReason,
+    message: &str,
+) -> PreverifyOutcome {
+    if success {
+        return PreverifyOutcome::Verified;
+    }
+    if reason == crate::models::DisconnectReason::LoginRejected
+        && crate::authenticator::is_definite_credential_error(message)
+    {
+        PreverifyOutcome::Rejected(message.to_string())
+    } else {
+        PreverifyOutcome::SkippedWithNote(message.to_string())
+    }
+}
+
+fn classify_self_service_for_preverify(
+    res: Result<(), crate::self_service::PortalError>,
+) -> PreverifyOutcome {
+    use crate::self_service::PortalError;
+    match res {
+        Ok(()) => PreverifyOutcome::Verified,
+        Err(PortalError::AuthFailed(msg)) => {
+            if msg.contains("先修改初始密码") {
+                PreverifyOutcome::SkippedWithNote(msg)
+            } else {
+                PreverifyOutcome::Rejected(msg)
+            }
+        }
+        Err(PortalError::CaptchaRequired) => {
+            PreverifyOutcome::SkippedWithNote("自助服务当前需图形验证码，已跳过预检直接保存".into())
+        }
+        Err(PortalError::UnsupportedPassword) => {
+            PreverifyOutcome::SkippedWithNote("密码含特殊字符，已跳过自助服务预检并保存".into())
+        }
+        Err(PortalError::Unreachable(_)) | Err(PortalError::ParseError(_)) => {
+            PreverifyOutcome::SkippedWithNote("当前不在校园内网，暂未联网核验密码".into())
+        }
+    }
+}
+
 pub struct GuardApp {
     store: SettingsStore,
     settings: Settings,
@@ -126,6 +216,7 @@ pub struct GuardApp {
     time_range: TimeRange,
     traffic_view_mode: TrafficViewMode,
     traffic_view_user_override: bool,
+    preverify_job: Option<AccountPreverifyJob>,
     last_check_seq: u64,
     last_check_unix: Option<i64>,
     online_since_unix: Option<i64>,
@@ -247,6 +338,7 @@ impl GuardApp {
             time_range: TimeRange::H24,
             traffic_view_mode: initial_traffic_view,
             traffic_view_user_override: false,
+            preverify_job: None,
             last_check_seq: 0,
             last_check_unix: None,
             online_since_unix: None,
@@ -413,9 +505,9 @@ impl GuardApp {
         }
     }
 
-    fn save(&mut self) {
+    fn save(&mut self, ctx: &egui::Context) {
         if self.form.is_account_draft_dirty(&self.settings) || self.needs_setup {
-            self.save_account_profile(true);
+            self.begin_save_account_profile(true, false, ctx);
         } else {
             self.save_global_settings();
         }
@@ -446,7 +538,120 @@ impl GuardApp {
         self.request(command, startup_error);
     }
 
-    fn save_account_profile(&mut self, also_save_global: bool) {
+    fn begin_save_account_profile(
+        &mut self,
+        also_save_global: bool,
+        force_skip_verify: bool,
+        ctx: &egui::Context,
+    ) {
+        if self.preverify_job.is_some() {
+            return;
+        }
+        let student_id = self.form.student_id.trim().to_string();
+        if student_id.is_empty() {
+            self.show_toast("请输入校园网学号", true);
+            return;
+        }
+        let is_new = self.form.editing_account_id.is_none();
+        let account_id = self.form.editing_account_id.clone().unwrap_or_else(|| {
+            if self.settings.accounts.is_empty() {
+                "default".to_string()
+            } else {
+                credentials::generate_account_id()
+            }
+        });
+        let previous = self.settings.find_account(&account_id).cloned();
+        let previous_student_id = previous
+            .as_ref()
+            .map(|a| a.student_id.clone())
+            .unwrap_or_default();
+        let previous_carrier = previous
+            .as_ref()
+            .map(|a| a.carrier.clone())
+            .unwrap_or_default();
+        let lookup_sid = if previous_student_id.is_empty() {
+            student_id.as_str()
+        } else {
+            previous_student_id.as_str()
+        };
+
+        let stored = match credentials::load_for_account(&account_id, lookup_sid) {
+            Ok(s) => s,
+            Err(err) => {
+                self.show_toast(format!("读取凭据失败：{err}"), true);
+                return;
+            }
+        };
+        let has_matching = stored
+            .as_ref()
+            .is_some_and(|c| c.matches_account(&student_id));
+        if (self.needs_setup || is_new) && self.form.password.is_empty() && !has_matching {
+            self.show_toast("请输入该账号的校园网密码", true);
+            return;
+        }
+        if self.form.password.is_empty()
+            && !has_matching
+            && (student_id != previous_student_id || stored.is_some())
+        {
+            self.show_toast("更换学号时请同时输入该账号的密码", true);
+            return;
+        }
+
+        let carrier_str = self.form.carrier.to_string();
+        let identity_or_pwd_changed = self.needs_setup
+            || is_new
+            || !self.form.password.is_empty()
+            || student_id != previous_student_id
+            || carrier_str != previous_carrier;
+
+        if force_skip_verify || !identity_or_pwd_changed {
+            self.commit_account_profile(also_save_global, None);
+            return;
+        }
+
+        let effective_password = if !self.form.password.is_empty() {
+            self.form.password.clone()
+        } else if let Some(c) = stored.filter(|c| c.matches_account(&student_id)) {
+            c.password
+        } else {
+            self.commit_account_profile(also_save_global, None);
+            return;
+        };
+
+        let make_active = self.settings.accounts.is_empty()
+            || self.needs_setup
+            || account_id == self.settings.active_account_id;
+        let fallback_ip = self
+            .latest
+            .as_ref()
+            .map(|s| s.metrics.effective_campus_ip().to_string())
+            .unwrap_or_default();
+
+        self.form.verify_error = None;
+        self.show_toast("正在核验校园网账号与密码…", false);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repaint_ctx = ctx.clone();
+        let _ = std::thread::Builder::new()
+            .name("account-preverify".to_string())
+            .spawn(move || {
+                let outcome = preverify_account_credentials(
+                    &student_id,
+                    &effective_password,
+                    &carrier_str,
+                    make_active,
+                    &fallback_ip,
+                );
+                let _ = tx.send(outcome);
+                repaint_ctx.request_repaint();
+            });
+        self.preverify_job = Some(AccountPreverifyJob {
+            rx,
+            also_save_global,
+        });
+    }
+
+    fn commit_account_profile(&mut self, also_save_global: bool, verify_note: Option<String>) {
         let student_id = self.form.student_id.trim().to_string();
         if student_id.is_empty() {
             self.show_toast("请输入校园网学号", true);
@@ -517,6 +722,7 @@ impl GuardApp {
         let saved_new_password = !self.form.password.is_empty();
         self.form.password.clear();
         self.form.show_password = false;
+        self.form.verify_error = None;
         self.form.editing_account_id = Some(account_id.clone());
 
         let startup_error = if also_save_global && next.auto_boot != self.settings.auto_boot {
@@ -544,14 +750,12 @@ impl GuardApp {
                 self.needs_setup = false;
             }
         }
-        self.show_toast(
-            if is_new {
-                format!("已添加账号「{display_name}」，等待守护确认")
-            } else {
-                format!("已保存账号「{display_name}」")
-            },
-            false,
-        );
+        let toast_msg = match verify_note {
+            Some(note) => format!("已保存账号「{display_name}」（{note}）"),
+            None if is_new => format!("账号核验通过，已添加「{display_name}」"),
+            None => format!("账号核验通过，已保存「{display_name}」"),
+        };
+        self.show_toast(toast_msg, false);
         self.request(command, startup_error);
     }
 
@@ -639,6 +843,33 @@ impl GuardApp {
     }
 
     fn drain_channels(&mut self) {
+        if let Some(job) = &self.preverify_job {
+            match job.rx.try_recv() {
+                Ok(outcome) => {
+                    let also_global = job.also_save_global;
+                    self.preverify_job = None;
+                    match outcome {
+                        PreverifyOutcome::Verified => {
+                            self.commit_account_profile(also_global, None);
+                        }
+                        PreverifyOutcome::SkippedWithNote(note) => {
+                            self.commit_account_profile(also_global, Some(note));
+                        }
+                        PreverifyOutcome::Rejected(err_msg) => {
+                            self.form.verify_error = Some(err_msg.clone());
+                            self.show_toast(format!("登录校验未通过：{err_msg}"), true);
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    let also_global = job.also_save_global;
+                    self.preverify_job = None;
+                    self.commit_account_profile(also_global, None);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
         while let Ok((id, result)) = self.ipc.replies.try_recv() {
             if let Some(pending) = self.pending.remove(&id) {
                 self.finish_command(pending, result);
@@ -1296,7 +1527,12 @@ impl GuardApp {
         let Some((message, is_error, at)) = self.toast.as_ref() else {
             return;
         };
-        if at.elapsed() > Duration::from_secs(3) {
+        let ttl = if *is_error {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(3)
+        };
+        if at.elapsed() > ttl {
             self.toast = None;
             return;
         }
@@ -1388,6 +1624,7 @@ impl eframe::App for GuardApp {
         self.trimmed_while_idle = false;
 
         let fast_refresh = !self.pending.is_empty()
+            || self.preverify_job.is_some()
             || self.toast.is_some()
             || matches!(
                 self.state(),
@@ -1516,6 +1753,7 @@ impl eframe::App for GuardApp {
                     .pending
                     .values()
                     .any(|p| matches!(p.command, UiToDaemon::ReloadSettings { .. }));
+                let verifying_account = self.preverify_job.is_some();
                 let mut actions = settings_page::SettingsActions::default();
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(p.bg))
@@ -1532,6 +1770,7 @@ impl eframe::App for GuardApp {
                             &self.account_creds,
                             self.needs_setup,
                             saving,
+                            verifying_account,
                             total_h,
                         );
                     });
@@ -1553,7 +1792,10 @@ impl eframe::App for GuardApp {
                     self.show_toast(format!("窗口已调整为 {} × {}", w as i32, h as i32), false);
                 }
                 if actions.save_profile {
-                    self.save_account_profile(self.needs_setup);
+                    self.begin_save_account_profile(self.needs_setup, false, ctx);
+                }
+                if actions.force_save_profile {
+                    self.begin_save_account_profile(self.needs_setup, true, ctx);
                 }
                 if let Some(id) = actions.switch_account {
                     self.switch_account_to(&id);
@@ -1562,7 +1804,7 @@ impl eframe::App for GuardApp {
                     self.delete_account_profile(&id);
                 }
                 if actions.save {
-                    self.save();
+                    self.save(ctx);
                 }
                 if actions.reset {
                     self.form.reset_from(&self.settings);
@@ -1882,5 +2124,60 @@ mod workflow_tests {
         merge_sample(&mut history, &point);
         assert_eq!(history.len(), 2);
         assert_eq!(history[0].ms, 42);
+    }
+
+    #[test]
+    fn preverify_blocks_definite_credential_errors_and_allows_environmental_limits() {
+        use crate::self_service::PortalError;
+
+        assert_eq!(
+            classify_portal_auth_for_preverify(true, DisconnectReason::AuthExpired, "认证成功"),
+            PreverifyOutcome::Verified
+        );
+        assert_eq!(
+            classify_portal_auth_for_preverify(
+                false,
+                DisconnectReason::LoginRejected,
+                "密码错误，请在设置中重新核对并保存密码"
+            ),
+            PreverifyOutcome::Rejected("密码错误，请在设置中重新核对并保存密码".into())
+        );
+        // 并发已满或网关超时不阻塞保存
+        assert!(matches!(
+            classify_portal_auth_for_preverify(
+                false,
+                DisconnectReason::LoginRejected,
+                "在线设备数量已达上限（该账号正在其他终端登录）"
+            ),
+            PreverifyOutcome::SkippedWithNote(_)
+        ));
+        assert!(matches!(
+            classify_portal_auth_for_preverify(
+                false,
+                DisconnectReason::PortalUnavailable,
+                "认证服务器请求失败：Timeout"
+            ),
+            PreverifyOutcome::SkippedWithNote(_)
+        ));
+
+        // 自助服务：账密错误拦截，验证码/离校不可达/初始密码改密提示放行
+        assert_eq!(
+            classify_self_service_for_preverify(Ok(())),
+            PreverifyOutcome::Verified
+        );
+        assert!(matches!(
+            classify_self_service_for_preverify(Err(PortalError::AuthFailed(
+                "自助服务登录失败：账号或密码错误".into()
+            ))),
+            PreverifyOutcome::Rejected(_)
+        ));
+        assert!(matches!(
+            classify_self_service_for_preverify(Err(PortalError::CaptchaRequired)),
+            PreverifyOutcome::SkippedWithNote(_)
+        ));
+        assert!(matches!(
+            classify_self_service_for_preverify(Err(PortalError::Unreachable("连接超时".into()))),
+            PreverifyOutcome::SkippedWithNote(_)
+        ));
     }
 }

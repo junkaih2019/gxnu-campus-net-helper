@@ -73,6 +73,13 @@ impl std::fmt::Display for PortalError {
     }
 }
 
+/// 仅执行轻量只读登录握手校验（不拉取设备与账单明细，也不留存会话），
+/// 用于用户保存新账号密码时的零断网当场验密。
+pub fn verify_credentials_only(credential: &StoredCredential) -> Result<(), PortalError> {
+    let agent = http::no_redirect_agent(5);
+    login_handshake_only(&agent, credential)
+}
+
 /// 使用独立直连内存会话执行一次只读自助服务查询（完成后自动释放 Cookie 与连接）。
 pub fn fetch_snapshot(credential: &StoredCredential) -> Result<SelfServiceData, PortalError> {
     let agent = http::no_redirect_agent(8);
@@ -111,6 +118,11 @@ pub fn fetch_snapshot(credential: &StoredCredential) -> Result<SelfServiceData, 
 }
 
 fn login(agent: &Agent, credential: &StoredCredential) -> Result<String, PortalError> {
+    login_handshake_only(agent, credential)?;
+    get_page(agent, DASHBOARD, "读取账户首页")
+}
+
+fn login_handshake_only(agent: &Agent, credential: &StoredCredential) -> Result<(), PortalError> {
     let response = checked_response("打开自助服务", agent.get(ENTRY).call())?;
     require_entry_redirect(&response, DASHBOARD, "打开自助服务")?;
     let response = checked_response("打开账户首页", agent.get(DASHBOARD).call())?;
@@ -168,8 +180,7 @@ fn login(agent: &Agent, credential: &StoredCredential) -> Result<String, PortalE
         let body = response.into_string().unwrap_or_default();
         return Err(classify_verify_failure_page(&body));
     }
-    verify_login_redirect(agent, &response)?;
-    get_page(agent, DASHBOARD, "读取账户首页")
+    verify_login_redirect(agent, &response)
 }
 
 /// 轻量严格解析登录表单：校验 `action`、确认 `#randomDiv` 隐藏、提取隐藏 `checkcode` 与 `var md5 = true;`。
