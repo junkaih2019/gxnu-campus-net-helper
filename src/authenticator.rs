@@ -221,7 +221,7 @@ fn describe(payload: &serde_json::Value, success: bool) -> String {
         if let Some(text) = payload.get(key).and_then(|value| value.as_str()) {
             let trimmed = text.trim();
             if !trimmed.is_empty() && !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
-                return trimmed.to_string();
+                return translate_drcom_message(trimmed);
             }
         }
     }
@@ -232,8 +232,119 @@ fn describe(payload: &serde_json::Value, success: bool) -> String {
     if code.is_empty() {
         "认证服务器未返回说明".to_string()
     } else {
-        format!("认证服务器返回失败码 {code}")
+        format!("认证未通过（网关返回码 {code}），请核对账号、密码与运营商")
     }
+}
+
+/// 将师大 Dr.COM 认证门户（`yc.gxnu.edu.cn/a78.js` `RadiusErrorAry`）返回的内部英文错误码
+/// 翻译为通俗易懂的中文提示，方便用户一眼定位是密码错、运营商选错还是并发占线。
+pub fn translate_drcom_message(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+
+    // 1. 精确或前缀匹配师大 Dr.COM 核心英文码表
+    if lower == "userid error1" {
+        return "账号不存在，请核对学号或所选运营商是否正确".to_string();
+    }
+    if lower == "userid error2" || lower == "userid error3" {
+        return "密码错误，请在设置中重新核对并保存密码".to_string();
+    }
+    if matches!(
+        lower.as_str(),
+        "auth error99" | "auth error198" | "auth error199"
+    ) {
+        return "学号或密码错误，请在设置中重新核对".to_string();
+    }
+    if lower == "auth error4" || lower.contains("errcode=04") {
+        return "上网时长或校园网套餐流量已用尽".to_string();
+    }
+    if lower == "auth error5" || lower.contains("errcode=05") {
+        return "校园网账号已停机（可能欠费或报停）".to_string();
+    }
+    if lower == "auth error9" || lower.contains("errcode=09") {
+        return "套餐时长或流量已超支".to_string();
+    }
+    if lower.contains("errcode=11") {
+        return "当前账号不允许登录校园网".to_string();
+    }
+    if lower.contains("errcode=80") {
+        return "接入认证服务器不存在".to_string();
+    }
+    if lower.contains("errcode=81") || lower.contains("ldap") {
+        return "统一身份认证校验失败，请核对密码".to_string();
+    }
+    if lower.contains("errcode=85")
+        || lower == "set_onlinet error"
+        || lower == "in use"
+        || lower == "wuxian olno"
+    {
+        return "在线设备数量已达上限（该账号正在其他终端登录）".to_string();
+    }
+    if lower.contains("errcode=86") || lower == "err(11)" {
+        return "设备 IP 或 MAC 绑定校验失败".to_string();
+    }
+    if lower.contains("errcode=88") {
+        return "校园网 IP 地址冲突，请尝试重连 Wi-Fi 或插拔网线".to_string();
+    }
+    if lower.contains("errcode=94") {
+        return "学校认证服务器繁忙，稍后将自动重试".to_string();
+    }
+    if lower == "auth error80" || lower == "port err" {
+        return "当前时段不允许上网".to_string();
+    }
+    if lower == "auth error258"
+        || matches!(
+            lower.as_str(),
+            "err(2)" | "err(3)" | "err(7)" | "err(10)" | "err(17)"
+        )
+        || lower.contains("err(6)")
+        || lower.contains("vlanid")
+    {
+        return "当前账号不允许在此区域或网段登录".to_string();
+    }
+    if lower == "can not use static ip" {
+        return "不允许使用固定静态 IP，请将网卡改为自动获取（DHCP）".to_string();
+    }
+    if lower == "no errcode" {
+        return "校园网网关认证未通过，稍后将自动重试".to_string();
+    }
+
+    // 2. 运营商 PPPoE 代拨返回码（Oppp error 系列）
+    if lower == "oppp error: 1" || lower == "oppp error: 18" {
+        return "运营商宽带账号或密码错误，请核对宽带密码或运营商选项".to_string();
+    }
+    if lower == "oppp error: 5"
+        || lower == "oppp error: 21"
+        || lower.contains("oppp error: userid inuse")
+        || lower.contains("oppp error: too many connections")
+    {
+        return "运营商宽带账号已在其他设备在线（超出并发上限）".to_string();
+    }
+    if lower == "oppp error: 26" || lower == "oppp error: 29" {
+        return "运营商宽带账号已绑定其他端口或位置".to_string();
+    }
+    if lower.contains("oppp error: can't find user") || lower == "bind userid error" {
+        return "未绑定该运营商宽带，请检查运营商是否选错（电信/联通/移动/校园用户）".to_string();
+    }
+    if lower.contains("oppp error: timeout") {
+        return "运营商宽带状态异常（可能欠费停机或运营商响应超时）".to_string();
+    }
+    if lower.contains("oppp error: user dial-in so soon") {
+        return "运营商宽带刚下线，稍等几秒后自动重连".to_string();
+    }
+    if lower == "auth error" {
+        return "身份验证未通过，请核对学号、密码与运营商".to_string();
+    }
+
+    // 已经是中文或其他说明时保持原样（顺手清洗 HTML 换行标签）
+    trimmed
+        .replace("<br/>", "；")
+        .replace("<br>", "；")
+        .trim()
+        .to_string()
 }
 
 /// 返回 `(success, message, code)`。
@@ -302,19 +413,36 @@ mod tests {
     }
 
     #[test]
-    fn numeric_code_prefers_msga_text() {
+    fn numeric_code_prefers_msga_text_and_translates_to_plain_chinese() {
         let (success, message, code) =
             parse_portal_reply(r#"dr1004({"result":0,"wopt":0,"msg":1,"msga":"userid error1"});"#);
         assert!(!success);
-        assert!(message.contains("userid error1"));
+        assert!(message.contains("账号不存在"));
+        assert!(message.contains("运营商"));
         assert_eq!(code, "1");
+
+        let (success2, message2, code2) =
+            parse_portal_reply(r#"dr1004({"result":0,"wopt":0,"msg":1,"msga":"userid error2"});"#);
+        assert!(!success2);
+        assert!(message2.contains("密码错误"));
+        assert_eq!(code2, "1");
+    }
+
+    #[test]
+    fn translates_common_drcom_and_carrier_errors_to_plain_chinese() {
+        assert!(translate_drcom_message("userid error3").contains("密码错误"));
+        assert!(translate_drcom_message("Authentication Fail ErrCode=85").contains("上限"));
+        assert!(translate_drcom_message("Oppp error: 1").contains("运营商宽带账号或密码错误"));
+        assert!(translate_drcom_message("bind userid error").contains("未绑定该运营商宽带"));
+        assert!(translate_drcom_message("Oppp error: TOO MANY CONNECTIONS").contains("并发上限"));
+        assert!(translate_drcom_message("can not use static ip").contains("DHCP"));
     }
 
     #[test]
     fn numeric_code_without_text_is_readable() {
         let (success, message, code) = parse_portal_reply(r#"dr1004({"result":0,"msg":1});"#);
         assert!(!success);
-        assert!(message.contains("失败码 1"));
+        assert!(message.contains("返回码 1"));
         assert_eq!(code, "1");
     }
 

@@ -784,16 +784,13 @@ fn rewrite_health_check(raw_msg: &str) -> (LogLevel, String, Option<String>) {
 
 fn strip_portal_code(raw: &str) -> String {
     let mut s = raw.trim().to_string();
-    for suffix in [
-        "；门户返回码=-",
-        "; 门户返回码=-",
-        "；门户返回码=",
-        "; 门户返回码=",
-    ] {
+    for suffix in ["；门户返回码=", "; 门户返回码="] {
         if let Some(pos) = s.find(suffix) {
+            let head = s[..pos].trim();
             let after = s[pos + suffix.len()..].trim();
-            if after.is_empty() || after == "-" {
+            if after.is_empty() || after == "-" || !head.is_empty() {
                 s.truncate(pos);
+                break;
             }
         }
     }
@@ -806,6 +803,13 @@ fn polish_fragment(raw: &str, prefix: &str) -> String {
 
 fn polish_generic(raw: &str) -> String {
     let mut text = raw.trim().to_string();
+    // 兼容历史日志中遗留的英文错误码与旧版自助服务重定向提示
+    if text.contains("验证登录结果未跳转到预期页面（HTTP 302）") {
+        text = text.replace(
+            "验证登录结果未跳转到预期页面（HTTP 302）",
+            "自助服务登录失败：学号或密码错误，请在设置中核对密码",
+        );
+    }
     for code in [
         "CREDENTIALS_MISSING",
         "GATEWAY_UNREACHABLE",
@@ -828,13 +832,13 @@ fn polish_generic(raw: &str) -> String {
     text = text.replace("门户返回码=", "返回码 ");
     text = text.replace("IP=", "IP ");
     text = text.replace("网关=", "网关 ");
-    let parts: Vec<&str> = text
+    let parts: Vec<String> = text
         .split([';', '；'])
-        .map(str::trim)
+        .map(|seg| crate::authenticator::translate_drcom_message(seg.trim()))
         .filter(|s| !s.is_empty())
         .collect();
     if parts.is_empty() {
-        raw.trim().to_string()
+        crate::authenticator::translate_drcom_message(raw.trim())
     } else {
         parts.join(" · ")
     }

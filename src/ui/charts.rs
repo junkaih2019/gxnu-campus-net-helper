@@ -221,10 +221,15 @@ fn draw_account_traffic_card(
                             p.warn_border,
                             "请先在设置中保存学号与密码",
                         ),
+                        (SelfServiceStatus::AuthFailed, false) => (
+                            "登录未过",
+                            p.warn,
+                            p.warn_soft,
+                            p.warn_border,
+                            self_service.message.as_str(),
+                        ),
                         (
-                            SelfServiceStatus::Unreachable
-                            | SelfServiceStatus::AuthFailed
-                            | SelfServiceStatus::UnsupportedPassword,
+                            SelfServiceStatus::Unreachable | SelfServiceStatus::UnsupportedPassword,
                             false,
                         ) => (
                             "未同步",

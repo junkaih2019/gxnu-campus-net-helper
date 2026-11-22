@@ -112,9 +112,9 @@ pub fn fetch_snapshot(credential: &StoredCredential) -> Result<SelfServiceData, 
 
 fn login(agent: &Agent, credential: &StoredCredential) -> Result<String, PortalError> {
     let response = checked_response("打开自助服务", agent.get(ENTRY).call())?;
-    require_redirect(&response, DASHBOARD, "打开自助服务")?;
+    require_entry_redirect(&response, DASHBOARD, "打开自助服务")?;
     let response = checked_response("打开账户首页", agent.get(DASHBOARD).call())?;
-    require_redirect(&response, LOGIN, "打开账户首页")?;
+    require_entry_redirect(&response, LOGIN, "打开账户首页")?;
 
     let page = get_page(agent, LOGIN, "打开登录表单")?;
     let checkcode = parse_login_page(&page)?;
@@ -126,11 +126,19 @@ fn login(agent: &Agent, credential: &StoredCredential) -> Result<String, PortalE
     )?;
     if image.status() != 200 {
         return Err(PortalError::Unreachable(format!(
-            "登录表单资源返回 HTTP {}",
+            "自助服务验证码会话初始化失败（HTTP {}）",
             image.status()
         )));
     }
     drop(image);
+
+    // 兼容用户误在学号栏附带 `@ctc` / `@unicom` 等运营商后缀的情况：自助服务仅识别纯学号
+    let clean_account = credential
+        .username
+        .split('@')
+        .next()
+        .unwrap_or(&credential.username)
+        .trim();
 
     // 门户旧版 MD5 脚本将 UTF-16 码元按低 8 位装入消息块。
     let password_bytes = credential
@@ -151,17 +159,16 @@ fn login(agent: &Agent, credential: &StoredCredential) -> Result<String, PortalE
                 ("foo", ""),
                 ("bar", ""),
                 ("checkcode", &checkcode),
-                ("account", &credential.username),
+                ("account", clean_account),
                 ("password", &digest),
                 ("code", ""),
             ]),
     )?;
     if matches!(response.status(), 200) {
-        return Err(PortalError::AuthFailed(
-            "自助服务登录未通过（可能密码错误或触发验证码）".into(),
-        ));
+        let body = response.into_string().unwrap_or_default();
+        return Err(classify_verify_failure_page(&body));
     }
-    require_redirect(&response, DASHBOARD, "验证登录结果")?;
+    verify_login_redirect(agent, &response)?;
     get_page(agent, DASHBOARD, "读取账户首页")
 }
 
@@ -495,21 +502,131 @@ fn matches_destination(base: &str, destination: &str, expected: &str) -> bool {
     })
 }
 
-fn require_redirect(response: &Response, expected: &str, stage: &str) -> Result<(), PortalError> {
+fn require_entry_redirect(
+    response: &Response,
+    expected: &str,
+    stage: &str,
+) -> Result<(), PortalError> {
     let destination = response.header("Location").unwrap_or_default();
     if !matches!(response.status(), 302 | 303)
         || !matches_destination(response.get_url(), destination, expected)
     {
-        return Err(PortalError::AuthFailed(format!(
-            "{stage}未跳转到预期页面（HTTP {}）",
-            response.status()
+        return Err(PortalError::Unreachable(format!(
+            "{stage}被重定向到非预期地址，请确认已连入师大校园内网且未开全局代理"
         )));
     }
     Ok(())
 }
 
+/// 校验 `POST /Self/login/verify` 后的重定向目标，将跳回登录页、强制改密页等场景直接翻译为大白话中文。
+fn verify_login_redirect(agent: &Agent, response: &Response) -> Result<(), PortalError> {
+    let status = response.status();
+    let destination = response.header("Location").unwrap_or_default();
+    if matches!(status, 302 | 303)
+        && matches_destination(response.get_url(), destination, DASHBOARD)
+    {
+        return Ok(());
+    }
+
+    if matches!(status, 302 | 303) {
+        // 1. 服务端在学号/密码错误或触发验证码时，会 302 跳回 `/Self/login/...` 并在页面内写入 `#errorTip`
+        if is_login_page_destination(response.get_url(), destination) {
+            if let Ok(login_url) = Url::parse(response.get_url()).and_then(|u| u.join(destination))
+            {
+                if let Ok(login_html) = get_page(agent, login_url.as_str(), "读取登录失败原因")
+                {
+                    return Err(classify_verify_failure_page(&login_html));
+                }
+            }
+            return Err(PortalError::AuthFailed(
+                "自助服务登录失败：学号或密码错误，请在设置中核对密码".into(),
+            ));
+        }
+
+        // 2. 初始弱密码或新开户账号可能被 302 引导至修改密码页
+        let lower_dest = destination.to_ascii_lowercase();
+        if ["password", "pwd", "modify", "change", "reset", "init"]
+            .iter()
+            .any(|kw| lower_dest.contains(kw))
+        {
+            return Err(PortalError::AuthFailed(
+                "自助服务要求先修改初始密码，请用浏览器打开 172.16.4.2/Self 登录后完成改密".into(),
+            ));
+        }
+    }
+
+    Err(PortalError::AuthFailed(
+        "自助服务登录未通过：学号或密码可能不正确，请在设置中核对".into(),
+    ))
+}
+
+fn is_login_page_destination(base: &str, destination: &str) -> bool {
+    Url::parse(base)
+        .and_then(|url| url.join(destination))
+        .is_ok_and(|url| {
+            let clean_path = url.path().split(';').next().unwrap_or("");
+            clean_path.eq_ignore_ascii_case("/Self/login")
+                || clean_path.eq_ignore_ascii_case("/Self/login/")
+        })
+}
+
+/// 从跳回的登录页 HTML 中识别是否触发图形验证码，或提取 `#errorTip` 中的服务端中文报错。
+fn classify_verify_failure_page(html: &str) -> PortalError {
+    for tag in iter_html_tags(html) {
+        if tag
+            .attr("id")
+            .is_some_and(|id| id.eq_ignore_ascii_case("randomDiv"))
+        {
+            let hidden = tag
+                .attr("class")
+                .is_some_and(|cls| cls.split_ascii_whitespace().any(|tok| tok == "hide"));
+            if !hidden {
+                return PortalError::CaptchaRequired;
+            }
+        }
+    }
+
+    if let Some(tip) = extract_login_error_tip(html) {
+        let lower = tip.to_ascii_lowercase();
+        if tip.contains("验证码") || lower.contains("captcha") || lower.contains("checkcode") {
+            return PortalError::CaptchaRequired;
+        }
+        return PortalError::AuthFailed(translate_self_service_tip(&tip));
+    }
+
+    PortalError::AuthFailed("自助服务登录失败：学号或密码错误，请在设置中核对密码".into())
+}
+
+/// 提取 `/Self/login/` 底部 `$(html).appendTo("#errorTip"); } })('...');` 中的提示文本。
+fn extract_login_error_tip(html: &str) -> Option<String> {
+    let marker_pos = html.find("#errorTip")?;
+    let tail = &html[marker_pos..];
+    let iife_pos = tail.find("})(")?;
+    let rest = tail[iife_pos + 3..].trim_start();
+    let quote = rest.chars().next().filter(|&c| c == '\'' || c == '"')?;
+    let content = &rest[quote.len_utf8()..];
+    let end = content.find(quote)?;
+    let tip = content[..end].trim();
+    if tip.is_empty() {
+        None
+    } else {
+        Some(tip.to_string())
+    }
+}
+
+fn translate_self_service_tip(tip: &str) -> String {
+    let cleaned = tip.trim();
+    if cleaned.contains("密码") || cleaned.contains("账号") || cleaned.contains("不存在") {
+        format!("自助服务登录失败：{cleaned}（请在设置中核对学号与密码）")
+    } else if cleaned.contains("锁定") {
+        format!("自助服务账号暂时锁定：{cleaned}，请稍后再试")
+    } else {
+        format!("自助服务登录失败：{cleaned}")
+    }
+}
+
 fn account_fingerprint(student_id: &str) -> String {
-    let trimmed = student_id.trim();
+    let trimmed = student_id.split('@').next().unwrap_or(student_id).trim();
     if trimmed.is_empty() {
         return String::new();
     }
@@ -816,12 +933,21 @@ impl SelfServiceManager {
         };
         if student_changed {
             guard.public = SelfServiceState::default();
+            guard.last_attempt_mono = None;
             guard.captcha_until_unix = None;
             guard.last_captcha_at_unix = None;
             let state = guard.public.clone();
             drop(guard);
             (self.broadcast)(state);
         }
+    }
+
+    /// 用户在设置中重新修改并保存了当前账号密码时调用：清除 15s 防抖与旧报错，允许立即重新同步。
+    pub fn notify_credential_updated(&self) {
+        let mut guard = self.inner.lock().unwrap();
+        guard.last_attempt_mono = None;
+        guard.captcha_until_unix = None;
+        guard.last_captcha_at_unix = None;
     }
 
     /// 按触发策略决定是否发起异步同步；返回给调用方的提示文案（手动刷新被节流时返回 Ok，不报错）。
@@ -960,9 +1086,14 @@ fn run_single_fetch(
                 }
                 guard.public.status = status;
                 guard.public.message = msg.clone();
-                let log_msg = if matches!(trigger, FetchTrigger::Manual)
-                    || err == PortalError::CaptchaRequired
-                {
+                let should_log_warn = matches!(trigger, FetchTrigger::Manual)
+                    || matches!(
+                        err,
+                        PortalError::CaptchaRequired
+                            | PortalError::AuthFailed(_)
+                            | PortalError::UnsupportedPassword
+                    );
+                let log_msg = if should_log_warn {
                     Some((true, format!("[SELF_SERVICE] {msg}")))
                 } else {
                     None
@@ -1104,6 +1235,36 @@ mod tests {
             parse_login_page(&captcha_html),
             Err(PortalError::CaptchaRequired)
         );
+    }
+
+    #[test]
+    fn verify_failure_page_translates_redirect_back_to_login_and_error_tip() {
+        let wrong_pwd_html = r##"
+        <html><body>
+          <div id="errorTip"></div>
+          <div id="randomDiv" class="form-group hide"></div>
+          <script>
+            (function (tip) {
+              if (tip) { $(tip).appendTo("#errorTip"); }
+            })('账号或密码错误');
+          </script>
+        </body></html>"##;
+        let err = classify_verify_failure_page(wrong_pwd_html);
+        assert_eq!(err.status(), SelfServiceStatus::AuthFailed);
+        assert!(err.summary().contains("账号或密码错误"));
+        assert!(err.summary().contains("核对"));
+
+        let blank_tip_html = wrong_pwd_html.replace("'账号或密码错误'", "''");
+        let err2 = classify_verify_failure_page(&blank_tip_html);
+        assert_eq!(err2.status(), SelfServiceStatus::AuthFailed);
+        assert!(err2.summary().contains("学号或密码错误"));
+
+        assert!(is_login_page_destination(VERIFY, "/Self/login/?302=LI"));
+        assert!(is_login_page_destination(
+            VERIFY,
+            "http://172.16.4.2/Self/login;jsessionid=ABCDEF?302=LI"
+        ));
+        assert!(!is_login_page_destination(VERIFY, "/Self/dashboard"));
     }
 
     #[test]

@@ -797,6 +797,7 @@ fn build_flyout_model(
         let sub = match ss.status {
             SelfServiceStatus::Refreshing => "正在同步自助服务…".to_string(),
             SelfServiceStatus::CaptchaCooldown => "门户需验证码 · 本地参考".to_string(),
+            SelfServiceStatus::AuthFailed => "自助服务密码有误 · 本地参考".to_string(),
             _ => "本机今日（网卡参考）".to_string(),
         };
         (
@@ -895,22 +896,27 @@ fn build_flyout_model(
             "当前账号暂无在线终端会话".to_string(),
         )
     } else {
-        let hint = if !campus_ip.is_empty() {
+        let is_auth_err = ss.status == SelfServiceStatus::AuthFailed;
+        let hint = if is_auth_err && !ss.message.is_empty() {
+            truncate_chars(&ss.message, 25)
+        } else if !campus_ip.is_empty() {
             format!("本机 {campus_ip} · 等待自助服务同步")
         } else if !ss.message.is_empty() {
             truncate_chars(&ss.message, 24)
         } else {
             "连入校园网后自动同步在线终端".to_string()
         };
-        (
-            "未同步".to_string(),
-            p.neutral,
-            p.neutral_soft,
-            p.neutral_border,
-            Vec::new(),
-            0,
-            hint,
-        )
+        let (badge_txt, fg, bg, bd) = if is_auth_err {
+            ("登录未过".to_string(), p.warn, p.warn_soft, p.warn_border)
+        } else {
+            (
+                "未同步".to_string(),
+                p.neutral,
+                p.neutral_soft,
+                p.neutral_border,
+            )
+        };
+        (badge_txt, fg, bg, bd, Vec::new(), 0, hint)
     };
 
     // ── Section 3: 连接稳定性（36 枚竖向细胶囊） ─────────────────────

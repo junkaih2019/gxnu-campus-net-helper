@@ -741,6 +741,9 @@ impl DaemonCommands {
                 }
                 let enabled = settings.notify_toast;
                 self.sync_active_account_state(&settings);
+                if password_changed {
+                    self.self_service.notify_credential_updated();
+                }
                 self.control.update_settings(settings, password_changed)?;
                 self.notifier.lock().unwrap().set_enabled(enabled);
                 if start {
