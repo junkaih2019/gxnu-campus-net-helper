@@ -398,25 +398,38 @@ pub fn draw_settings_view(
                 ui.spacing_mut().item_spacing.y = 0.0;
                 let pane_rect = ui.max_rect();
 
+                const PANE_PAD: i8 = 16;
+                const PANE_PAD_F: f32 = 16.0;
+                const TOP_PAD: i8 = 14;
+                const TOP_PAD_F: f32 = 14.0;
+                let target_bottom_y = if show_floating_bar {
+                    None
+                } else {
+                    Some(pane_rect.bottom() - PANE_PAD_F)
+                };
+
                 egui::Frame::new()
                     .fill(p.bg)
                     .inner_margin(egui::Margin {
-                        left: 18,
-                        right: 18,
-                        top: 14,
-                        bottom: 14,
+                        left: PANE_PAD,
+                        right: PANE_PAD,
+                        top: TOP_PAD,
+                        bottom: PANE_PAD,
                     })
                     .show(ui, |ui| {
-                        let inner_w = (content_w - 36.0).max(260.0);
-                        let inner_h = (total_height - 28.0).max(160.0);
+                        let inner_w = (content_w - PANE_PAD_F * 2.0).floor().max(260.0);
+                        let inner_h = (total_height - TOP_PAD_F - PANE_PAD_F).max(160.0);
                         ui.set_min_size(Vec2::new(inner_w, inner_h));
                         ui.set_max_size(Vec2::new(inner_w, inner_h));
+                        // 悬浮细滚动条，绝不吞占右侧内边距导致卡片右边距窄于左边距/下边距
+                        ui.style_mut().spacing.scroll = egui::style::ScrollStyle::floating();
                         egui::ScrollArea::vertical()
                             .id_salt(("settings_content_scroll", form.tab.index()))
                             .max_height(inner_h)
                             .auto_shrink([false, false])
                             .show(ui, |ui| {
-                                ui.set_width(inner_w);
+                                ui.set_min_width(inner_w);
+                                ui.set_max_width(inner_w);
                                 match form.tab {
                                     SettingsTab::Account => draw_account_page(
                                         ui,
@@ -425,6 +438,7 @@ pub fn draw_settings_view(
                                         saved,
                                         account_creds,
                                         verifying_account,
+                                        target_bottom_y,
                                         &mut actions,
                                     ),
                                     SettingsTab::Monitor => {
@@ -539,17 +553,22 @@ fn page_header(ui: &mut egui::Ui, p: &Palette, title: &str, subtitle: &str) {
 }
 
 fn group_card(ui: &mut egui::Ui, p: &Palette, body: impl FnOnce(&mut egui::Ui)) {
+    let outer_w = ui.available_width().floor();
+    // Frame 总水平边距 = inner_margin (14*2) + stroke (1*2) = 30px，精确锁死卡片外宽防止子控件撑偏右边线
+    let inner_w = (outer_w - 30.0).max(180.0);
     egui::Frame::new()
         .fill(p.card)
         .stroke(Stroke::new(1.0_f32, p.border))
         .corner_radius(CornerRadius::same(RADIUS_MD))
         .inner_margin(egui::Margin::symmetric(14, 10))
         .show(ui, |ui| {
-            ui.set_width(ui.available_width());
+            ui.set_min_width(inner_w);
+            ui.set_max_width(inner_w);
             body(ui);
         });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_account_page(
     ui: &mut egui::Ui,
     p: &Palette,
@@ -557,13 +576,14 @@ fn draw_account_page(
     saved: &Settings,
     account_creds: &HashMap<String, bool>,
     verifying_account: bool,
+    target_bottom_y: Option<f32>,
     actions: &mut SettingsActions,
 ) {
     page_header(
         ui,
         p,
         "账号管理",
-        "支持保存多个校园网账号并自定义备注名，主页顶栏可一键下线并切换账号；各账号密码独立加密保存于 Windows 凭据管理器。",
+        "支持保存多个校园网账号与备注名，主页及托盘浮窗可一键切号；各账号密码独立加密存储于 Windows 凭据管理器。",
     );
 
     // 1. 已保存账号目录卡
@@ -665,13 +685,14 @@ fn draw_account_page(
 
         let full_w = ui.available_width();
         let col_gap = 12.0_f32;
-        let col_w = ((full_w - col_gap) * 0.5).floor().max(140.0);
+        let left_col_w = ((full_w - col_gap) * 0.5).floor().max(120.0);
+        let right_col_w = (full_w - col_gap - left_col_w).max(120.0);
 
         // 第一行：校园网学号（左，与下方登录密码上下对齐） | 备注名称（右）
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = col_gap;
             ui.allocate_ui_with_layout(
-                Vec2::new(col_w, 52.0),
+                Vec2::new(left_col_w, 52.0),
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
                     ui.label(body_text("校园网学号", 11.5, p.text_secondary));
@@ -679,7 +700,7 @@ fn draw_account_page(
                     styled_text_box(
                         ui,
                         p,
-                        col_w,
+                        left_col_w,
                         &mut form.student_id,
                         "输入校园网学号",
                         false,
@@ -689,7 +710,7 @@ fn draw_account_page(
             );
 
             ui.allocate_ui_with_layout(
-                Vec2::new(col_w, 52.0),
+                Vec2::new(right_col_w, 52.0),
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
                     ui.label(body_text(
@@ -701,7 +722,7 @@ fn draw_account_page(
                     styled_text_box(
                         ui,
                         p,
-                        col_w,
+                        right_col_w,
                         &mut form.remark,
                         "如：宿舍联通、实验室电信",
                         false,
@@ -717,7 +738,7 @@ fn draw_account_page(
         ui.horizontal_top(|ui| {
             ui.spacing_mut().item_spacing.x = col_gap;
             ui.allocate_ui_with_layout(
-                Vec2::new(col_w, 52.0),
+                Vec2::new(left_col_w, 52.0),
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
                     ui.label(body_text("登录密码", 11.5, p.text_secondary));
@@ -737,12 +758,20 @@ fn draw_account_page(
                     } else {
                         None
                     };
-                    styled_text_box(ui, p, col_w, &mut form.password, hint, mask_password, eye);
+                    styled_text_box(
+                        ui,
+                        p,
+                        left_col_w,
+                        &mut form.password,
+                        hint,
+                        mask_password,
+                        eye,
+                    );
                 },
             );
 
             ui.allocate_ui_with_layout(
-                Vec2::new(col_w, 52.0),
+                Vec2::new(right_col_w, 52.0),
                 egui::Layout::top_down(egui::Align::LEFT),
                 |ui| {
                     ui.label(body_text("凭据安全存储", 11.5, p.text_secondary));
@@ -770,7 +799,7 @@ fn draw_account_page(
                         )
                     };
                     let (box_rect, _) =
-                        ui.allocate_exact_size(Vec2::new(col_w, 30.0), Sense::hover());
+                        ui.allocate_exact_size(Vec2::new(right_col_w, 30.0), Sense::hover());
                     ui.painter().rect(
                         box_rect,
                         CornerRadius::same(RADIUS_SM),
@@ -861,6 +890,15 @@ fn draw_account_page(
                         });
                     });
                 });
+        }
+
+        // 当页面无需滚动且底部剩余少量余量时，将底部操作行自然贴底，使卡片下边距与左右边距严格等宽
+        if let Some(target_y) = target_bottom_y {
+            let tail_h = 62.0_f32;
+            let extra = target_y - (ui.cursor().top() + tail_h);
+            if (0.5..=80.0).contains(&extra) {
+                ui.add_space(extra);
+            }
         }
 
         row_divider(ui, p);
@@ -1167,13 +1205,18 @@ fn draw_carrier_row(ui: &mut egui::Ui, p: &Palette, carrier: &mut usize) -> bool
     let mut changed = false;
     let labels = ["校园网", "中国电信", "中国联通", "中国移动"];
     let gap = 8.0_f32;
-    let btn_w = ((ui.available_width() - gap * 3.0) * 0.25)
-        .floor()
-        .max(74.0);
+    let total_w = ui.available_width();
+    let usable_w = (total_w - gap * 3.0).max(296.0);
+    let base_w = (usable_w * 0.25).floor();
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = gap;
         for (idx, label) in labels.iter().enumerate() {
             let active = *carrier == idx;
+            let btn_w = if idx == 3 {
+                (usable_w - base_w * 3.0).max(base_w)
+            } else {
+                base_w
+            };
             let (rect, resp) = ui.allocate_exact_size(Vec2::new(btn_w, 30.0), Sense::click());
             let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
             let (fill, stroke, fg) = if active {
@@ -1799,49 +1842,51 @@ fn styled_text_box(
     password: bool,
     eye_toggle: Option<&mut bool>,
 ) {
-    let inner_w = (width - 18.0).max(100.0);
-    egui::Frame::new()
-        .fill(p.input_bg)
-        .stroke(Stroke::new(1.0_f32, p.border))
-        .corner_radius(CornerRadius::same(RADIUS_SM))
-        .inner_margin(egui::Margin::symmetric(9, 4))
-        .show(ui, |ui| {
-            ui.allocate_ui_with_layout(
-                Vec2::new(inner_w, 22.0),
-                egui::Layout::left_to_right(egui::Align::Center),
-                |ui| {
-                    let edit_w = if eye_toggle.is_some() {
-                        (inner_w - 26.0).max(70.0)
-                    } else {
-                        inner_w
-                    };
-                    ui.add_sized(
-                        [edit_w, 20.0],
-                        egui::TextEdit::singleline(value)
-                            .password(password)
-                            .hint_text(egui::RichText::new(hint).color(p.text_muted))
-                            .vertical_align(egui::Align::Center)
-                            .frame(false),
-                    );
-                    if let Some(show) = eye_toggle {
-                        let (rect, resp) =
-                            ui.allocate_exact_size(Vec2::splat(20.0), Sense::click());
-                        let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-                        let color = if resp.hovered() { p.text } else { p.text_muted };
-                        let icon = if *show { Icon::EyeOff } else { Icon::Eye };
-                        icons::paint(ui.painter(), rect.shrink(2.0), icon, color);
-                        if resp.clicked() {
-                            *show = !*show;
-                        }
-                        resp.on_hover_text(if *show {
-                            "隐藏密码"
-                        } else {
-                            "显示密码"
-                        });
-                    }
-                },
-            );
+    let (box_rect, _) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::hover());
+    ui.painter().rect(
+        box_rect,
+        CornerRadius::same(RADIUS_SM),
+        p.input_bg,
+        Stroke::new(1.0_f32, p.border),
+        StrokeKind::Inside,
+    );
+
+    let inner_rect = box_rect.shrink2(Vec2::new(9.0, 4.0));
+    let mut child = ui.new_child(
+        egui::UiBuilder::new()
+            .max_rect(inner_rect)
+            .layout(egui::Layout::left_to_right(egui::Align::Center)),
+    );
+    child.spacing_mut().item_spacing.x = 4.0;
+    let edit_w = if eye_toggle.is_some() {
+        (inner_rect.width() - 24.0).max(60.0)
+    } else {
+        inner_rect.width()
+    };
+    child.add_sized(
+        [edit_w, 20.0],
+        egui::TextEdit::singleline(value)
+            .password(password)
+            .hint_text(egui::RichText::new(hint).color(p.text_muted))
+            .vertical_align(egui::Align::Center)
+            .margin(egui::Margin::ZERO)
+            .frame(false),
+    );
+    if let Some(show) = eye_toggle {
+        let (rect, resp) = child.allocate_exact_size(Vec2::splat(20.0), Sense::click());
+        let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+        let color = if resp.hovered() { p.text } else { p.text_muted };
+        let icon = if *show { Icon::EyeOff } else { Icon::Eye };
+        icons::paint(child.painter(), rect.shrink(2.0), icon, color);
+        if resp.clicked() {
+            *show = !*show;
+        }
+        resp.on_hover_text(if *show {
+            "隐藏密码"
+        } else {
+            "显示密码"
         });
+    }
 }
 
 fn row_divider(ui: &mut egui::Ui, p: &Palette) {
