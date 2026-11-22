@@ -4,6 +4,8 @@
 //! - 右上角轻量等高搜索框（纯 Painter 24px 高度 + 零内边距中线锁定，图标与文字严格水平对齐）
 //! - 严格单行限宽截断；超长或含折叠详情时鼠标悬停弹出结构化小卡片
 
+use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -12,14 +14,95 @@ use eframe::egui::{
 };
 
 use crate::ui::icons::{self, Icon};
-use crate::ui::theme::{body_text, bold_text, parse_log_line, reason_label, with_alpha, Palette};
+use crate::ui::theme::{body_text, bold_text, reason_label, with_alpha, Palette};
 use crate::ui::widgets::{badge, card_padded, icon_button, section_heading, segmented_control};
 
+const MAX_LOG_LINES: usize = 4000;
+
+pub(super) struct LogLines {
+    rows: VecDeque<String>,
+    revision: u64,
+}
+
+impl From<Vec<String>> for LogLines {
+    fn from(mut rows: Vec<String>) -> Self {
+        if rows.len() > MAX_LOG_LINES {
+            rows = rows.split_off(rows.len() - MAX_LOG_LINES);
+        }
+        Self {
+            rows: rows.into(),
+            revision: 0,
+        }
+    }
+}
+
+impl LogLines {
+    pub(super) fn push(&mut self, row: String) {
+        if self.rows.len() == MAX_LOG_LINES {
+            self.rows.pop_front();
+        }
+        self.rows.push_back(row);
+        self.revision = self.revision.wrapping_add(1);
+    }
+}
+
 #[derive(Default)]
-pub struct LogsState {
+pub(super) struct LogsState {
     /// 0 = 全部，1 = INFO，2 = WARN，3 = ERR
-    pub view_filter: usize,
-    pub search: String,
+    view_filter: usize,
+    search: String,
+    cached_revision: Option<u64>,
+    cached_filter: usize,
+    cached_search: String,
+    entries: Vec<HumanLogLine>,
+    filtered: Vec<usize>,
+    count_label: String,
+    #[cfg(test)]
+    parse_passes: usize,
+    #[cfg(test)]
+    filter_passes: usize,
+}
+
+impl LogsState {
+    fn refresh(&mut self, lines: &LogLines) {
+        let search = self.search.trim();
+        if self.cached_revision != Some(lines.revision) {
+            build_visible_logs(&lines.rows, &mut self.entries);
+            self.cached_revision = Some(lines.revision);
+            #[cfg(test)]
+            {
+                self.parse_passes += 1;
+            }
+        } else if self.cached_filter == self.view_filter && self.cached_search == search {
+            return;
+        }
+
+        self.cached_filter = self.view_filter;
+        search.clone_into(&mut self.cached_search);
+        let query = search.to_lowercase();
+        let mut scratch = String::new();
+        self.filtered.clear();
+        for (index, entry) in self.entries.iter().enumerate() {
+            let level_ok = match self.view_filter {
+                1 => entry.level == LogLevel::Info,
+                2 => entry.level == LogLevel::Warn,
+                3 => entry.level == LogLevel::Err,
+                _ => true,
+            };
+            if level_ok && entry.matches_query(&lines.rows[entry.raw_index], &query, &mut scratch) {
+                self.filtered.push(index);
+            }
+        }
+        self.count_label = if self.filtered.len() == self.entries.len() {
+            format!("{} 条", self.entries.len())
+        } else {
+            format!("{}/{}", self.filtered.len(), self.entries.len())
+        };
+        #[cfg(test)]
+        {
+            self.filter_passes += 1;
+        }
+    }
 }
 
 /// 严格 1 对 1 的三层日志等级（1 种颜色 = 1 个英文标签 = 顶部 1 个筛选项）。
@@ -51,51 +134,63 @@ impl LogLevel {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, PartialEq, Eq)]
 struct HumanLogLine {
-    full_stamp: String,
-    time_short: String,
+    // 仅在对应 revision 内有效，时间戳也直接取自这条原文。
+    raw_index: usize,
+    has_stamp: bool,
     level: LogLevel,
-    summary: String,
+    summary: Cow<'static, str>,
     /// 若正文折叠了 IP/网关/路径等次要参数，放入此处供鼠标悬停小卡片查看。
-    detail: Option<String>,
-    raw: String,
+    detail: Option<Box<str>>,
 }
 
-pub fn draw_card(
+impl HumanLogLine {
+    fn timestamps<'a>(&self, raw: &'a str) -> (&'a str, &'a str) {
+        if !self.has_stamp {
+            return ("", "");
+        }
+        let full = &raw[..19];
+        let short = if raw.len() >= 20 { &full[11..] } else { "" };
+        (full, short)
+    }
+
+    fn matches_query(&self, raw: &str, query: &str, scratch: &mut String) -> bool {
+        query.is_empty()
+            || contains_query(&self.summary, query, scratch)
+            || contains_query(self.level.label(), query, scratch)
+            || self
+                .detail
+                .as_deref()
+                .is_some_and(|s| contains_query(s, query, scratch))
+            || contains_query(raw, query, scratch)
+    }
+}
+
+fn contains_query(text: &str, query: &str, scratch: &mut String) -> bool {
+    // 常见中英文日志只有 ASCII 需要转小写，一次筛选复用同一缓冲区。
+    // 若含有需转换的其他字符，交给标准库处理上下文映射（例如希腊词尾 Σ）。
+    if text
+        .chars()
+        .any(|c| !c.is_ascii() && c.to_lowercase().ne([c]))
+    {
+        return text.to_lowercase().contains(query);
+    }
+    scratch.clear();
+    scratch.push_str(text);
+    scratch.make_ascii_lowercase();
+    scratch.contains(query)
+}
+
+pub(super) fn draw_card(
     ui: &mut egui::Ui,
     p: &Palette,
-    lines: &[String],
+    lines: &LogLines,
     state: &mut LogsState,
     log_path: &Path,
     target_height: f32,
 ) {
-    let entries = build_visible_logs(lines);
-    let query = state.search.trim().to_lowercase();
-    let filtered: Vec<&HumanLogLine> = entries
-        .iter()
-        .filter(|entry| {
-            let level_ok = match state.view_filter {
-                1 => entry.level == LogLevel::Info,
-                2 => entry.level == LogLevel::Warn,
-                3 => entry.level == LogLevel::Err,
-                _ => true,
-            };
-            if !level_ok {
-                return false;
-            }
-            if query.is_empty() {
-                return true;
-            }
-            entry.summary.to_lowercase().contains(&query)
-                || entry.level.label().to_lowercase().contains(&query)
-                || entry
-                    .detail
-                    .as_deref()
-                    .is_some_and(|d| d.to_lowercase().contains(&query))
-                || entry.raw.to_lowercase().contains(&query)
-        })
-        .collect();
+    state.refresh(lines);
 
     // 精确扣除所有内外边距与 1px 描边（外卡 12×2+2=26，工具栏 26，间距 7，内框 6×2+2=14）
     let inner_h = (target_height - 26.0).max(96.0);
@@ -121,12 +216,7 @@ pub fn draw_card(
                     26.0,
                 );
 
-                let count_label = if filtered.len() == entries.len() {
-                    format!("{} 条", entries.len())
-                } else {
-                    format!("{}/{}", filtered.len(), entries.len())
-                };
-                badge(ui, p.text_secondary, p.subtle, p.border, &count_label);
+                badge(ui, p.text_secondary, p.subtle, p.border, &state.count_label);
 
                 let tabs = ["全部", "INFO", "WARN", "ERR"];
                 segmented_control(ui, p, "inline_log_view", &mut state.view_filter, &tabs);
@@ -170,7 +260,7 @@ pub fn draw_card(
                 ui.set_min_size(Vec2::new(inner_w, scroll_h));
                 ui.set_max_size(Vec2::new(inner_w, scroll_h));
 
-                if filtered.is_empty() {
+                if state.filtered.is_empty() {
                     let empty_hint = match state.view_filter {
                         3 => "当前没有 ERR 故障记录",
                         2 => "当前没有 WARN 波动记录",
@@ -189,11 +279,20 @@ pub fn draw_card(
                     .max_height(scroll_h)
                     .auto_shrink([false, false])
                     .stick_to_bottom(true)
-                    .show_rows(ui, row_height, filtered.len(), |ui, range| {
+                    .show_rows(ui, row_height, state.filtered.len(), |ui, range| {
                         ui.spacing_mut().item_spacing.y = 0.0;
                         let row_w = (inner_w - 8.0).max(160.0);
                         for index in range {
-                            paint_log_row(ui, p, filtered[index], index, row_height, row_w);
+                            let entry = &state.entries[state.filtered[index]];
+                            paint_log_row(
+                                ui,
+                                p,
+                                entry,
+                                &lines.rows[entry.raw_index],
+                                index,
+                                row_height,
+                                row_w,
+                            );
                         }
                     });
             });
@@ -306,6 +405,7 @@ fn paint_log_row(
     ui: &mut egui::Ui,
     p: &Palette,
     entry: &HumanLogLine,
+    raw: &str,
     index: usize,
     row_height: f32,
     row_w: f32,
@@ -328,9 +428,9 @@ fn paint_log_row(
     let mut cursor_x = row_rect.left() + 4.0;
 
     // 1. 时间列
-    if !entry.time_short.is_empty() {
-        let tg =
-            painter.layout_no_wrap(entry.time_short.clone(), font_regular.clone(), p.text_muted);
+    let (stamp, time_short) = entry.timestamps(raw);
+    if !time_short.is_empty() {
+        let tg = painter.layout_no_wrap(time_short.to_owned(), font_regular.clone(), p.text_muted);
         painter.galley(
             Pos2::new(cursor_x, cy - tg.size().y * 0.5),
             tg,
@@ -380,15 +480,21 @@ fn paint_log_row(
     );
 
     if resp.clicked() {
-        ui.ctx().copy_text(entry.raw.clone());
+        ui.ctx().copy_text(raw.to_owned());
     }
 
     if hovered && (truncated || entry.detail.is_some()) {
-        show_log_detail_tooltip(ui, p, ui.id().with(("log_row_detail", index)), entry);
+        show_log_detail_tooltip(ui, p, ui.id().with(("log_row_detail", index)), entry, stamp);
     }
 }
 
-fn show_log_detail_tooltip(ui: &egui::Ui, p: &Palette, id: egui::Id, entry: &HumanLogLine) {
+fn show_log_detail_tooltip(
+    ui: &egui::Ui,
+    p: &Palette,
+    id: egui::Id,
+    entry: &HumanLogLine,
+    stamp: &str,
+) {
     let (st_fg, st_bg, st_bd) = entry.level.colors(p);
     egui::show_tooltip(ui.ctx(), ui.layer_id(), id, |ui| {
         ui.set_min_width(260.0);
@@ -401,11 +507,6 @@ fn show_log_detail_tooltip(ui: &egui::Ui, p: &Palette, id: egui::Id, entry: &Hum
             |ui| {
                 badge(ui, st_fg, st_bg, st_bd, entry.level.label());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let stamp = if entry.full_stamp.is_empty() {
-                        &entry.time_short
-                    } else {
-                        &entry.full_stamp
-                    };
                     ui.label(body_text(stamp, 10.5, p.text_muted));
                 });
             },
@@ -417,9 +518,9 @@ fn show_log_detail_tooltip(ui: &egui::Ui, p: &Palette, id: egui::Id, entry: &Hum
             Stroke::new(1.0_f32, p.divider),
         );
 
-        ui.add(egui::Label::new(bold_text(&entry.summary, 11.8, p.text)).wrap());
+        ui.add(egui::Label::new(bold_text(entry.summary.as_ref(), 11.8, p.text)).wrap());
 
-        if let Some(detail) = &entry.detail {
+        if let Some(detail) = entry.detail.as_deref() {
             ui.add(egui::Label::new(body_text(detail, 10.8, p.text_secondary)).wrap());
         }
 
@@ -469,10 +570,10 @@ fn fit_single_line(
 }
 
 /// 将原始日志列表转换为去噪、合并且按真实语义分级的可视化日志流。
-fn build_visible_logs(lines: &[String]) -> Vec<HumanLogLine> {
-    let mut out: Vec<HumanLogLine> = Vec::with_capacity(lines.len());
-    for line in lines {
-        let Some(entry) = format_human_log(line) else {
+fn build_visible_logs(lines: &VecDeque<String>, out: &mut Vec<HumanLogLine>) {
+    out.clear();
+    for (index, line) in lines.iter().enumerate() {
+        let Some(entry) = format_human_log(index, line) else {
             continue;
         };
         // 相邻行若在同一秒/相邻时刻表达同一结论（例如 LOGIN_VERIFIED 与紧随其后的 VERIFYING → ONLINE），自动合并去重
@@ -483,19 +584,25 @@ fn build_visible_logs(lines: &[String]) -> Vec<HumanLogLine> {
         }
         out.push(entry);
     }
-    out
 }
+
+type LogMessage = (LogLevel, Cow<'static, str>, Option<Box<str>>);
 
 /// 将单条底层日志映射为用户可读的 `(INFO/WARN/ERR, 中文描述)`；
 /// 返回 `None` 表示该条属于内部握手中间态、弹窗发送回执或高频探测流水，主界面不展示。
-fn format_human_log(line: &str) -> Option<HumanLogLine> {
-    let full_stamp = if line.len() >= 19 && line.as_bytes().get(10) == Some(&b' ') {
-        line[..19].to_string()
+fn format_human_log(raw_index: usize, line: &str) -> Option<HumanLogLine> {
+    let has_stamp = line.as_bytes().get(10) == Some(&b' ') && line.get(..19).is_some();
+    let (level, tag_str, raw_msg) = if let Some(rest) = line.get(20..).filter(|_| has_stamp) {
+        let (level, body) = rest.split_once(' ').unwrap_or(("", rest));
+        let (tag, msg) = body
+            .trim_start()
+            .strip_prefix('[')
+            .and_then(|s| s.split_once(']'))
+            .map_or(("", body), |(tag, msg)| (tag, msg.trim_start()));
+        (level, tag, msg)
     } else {
-        String::new()
+        ("", "", line)
     };
-    let (time_short, level, tag, raw_msg) = parse_log_line(line);
-    let tag_str = tag.as_deref().unwrap_or("");
     let is_warn = level == "WARNING";
     let is_err = level == "ERROR";
 
@@ -518,56 +625,57 @@ fn format_human_log(line: &str) -> Option<HumanLogLine> {
         return None;
     }
 
-    let (lvl, summary, detail) = match tag_str {
-        "STATE_CHANGE" => rewrite_state_change(&raw_msg)?,
-        "HEALTH_CHECK" => rewrite_health_check(&raw_msg),
+    let (lvl, summary, detail): LogMessage = match tag_str {
+        "STATE_CHANGE" => rewrite_state_change(raw_msg)?,
+        "HEALTH_CHECK" => rewrite_health_check(raw_msg),
         "FORCE_CHECK_RESULT" => {
             if is_warn || is_err || raw_msg.contains("异常") {
                 (
                     LogLevel::Warn,
                     format!(
                         "手动检测发现异常：{}",
-                        polish_fragment(&raw_msg, "检测异常：")
-                    ),
+                        polish_fragment(raw_msg, "检测异常：")
+                    )
+                    .into(),
                     None,
                 )
             } else if raw_msg.contains("监控已暂停") {
                 (
                     LogLevel::Info,
-                    "手动检测通过，校园网在线（当前已暂停守护）".to_string(),
+                    "手动检测通过，校园网在线（当前已暂停守护）".into(),
                     None,
                 )
             } else {
-                let ip = extract_kv(&raw_msg, "IP=");
+                let ip = extract_kv(raw_msg, "IP=");
                 (
                     LogLevel::Info,
-                    "手动检测通过，校园网连接正常".to_string(),
-                    ip.map(|v| format!("本机 IP：{v}")),
+                    "手动检测通过，校园网连接正常".into(),
+                    ip.map(|v| format!("本机 IP：{v}").into()),
                 )
             }
         }
         "LOGIN_VERIFIED" => (
             LogLevel::Info,
-            "自动重连成功，校园网已恢复上网".to_string(),
+            "自动重连成功，校园网已恢复上网".into(),
             None,
         ),
         "NETWORK_RECOVERED" => {
-            let ip = extract_kv(&raw_msg, "IP=");
+            let ip = extract_kv(raw_msg, "IP=");
             (
                 LogLevel::Info,
-                "网络连接已恢复正常".to_string(),
-                ip.map(|v| format!("本机 IP：{v}")),
+                "网络连接已恢复正常".into(),
+                ip.map(|v| format!("本机 IP：{v}").into()),
             )
         }
         "AUTH_RETRY_OK" => (
             LogLevel::Info,
-            "重试认证成功，校园网已恢复上网".to_string(),
-            Some(raw_msg.clone()),
+            "重试认证成功，校园网已恢复上网".into(),
+            Some(raw_msg.into()),
         ),
         "AUTH_RETRY" => (
             LogLevel::Warn,
-            "认证被短暂拒绝，稍后将自动重试".to_string(),
-            Some(polish_generic(&raw_msg)),
+            "认证被短暂拒绝，稍后将自动重试".into(),
+            Some(polish_generic(raw_msg).into()),
         ),
         "RETRY_BACKOFF" => {
             let secs = raw_msg
@@ -576,66 +684,66 @@ fn format_human_log(line: &str) -> Option<HumanLogLine> {
                 .filter(|s| s.chars().all(|c| c.is_ascii_digit()))
                 .unwrap_or("稍");
             let msg = if secs == "稍" {
-                "将在稍后自动重试连接".to_string()
+                "将在稍后自动重试连接".into()
             } else {
-                format!("将在 {secs} 秒后自动重试连接")
+                format!("将在 {secs} 秒后自动重试连接").into()
             };
             (LogLevel::Warn, msg, None)
         }
         "LOGIN_NOT_VERIFIED" => (
             LogLevel::Err,
-            "认证提交后公网仍未恢复，将继续排查".to_string(),
-            Some(polish_generic(&raw_msg)),
+            "认证提交后公网仍未恢复，将继续排查".into(),
+            Some(polish_generic(raw_msg).into()),
         ),
         "CREDENTIALS_MISSING" => (
             LogLevel::Err,
-            "尚未保存当前账号密码，无法自动登录".to_string(),
+            "尚未保存当前账号密码，无法自动登录".into(),
             None,
         ),
         "LOGIN_REJECTED" | "PORTAL_REJECTED" | "PORTAL_ERROR" | "PORTAL_UNAVAILABLE" => (
             LogLevel::Err,
-            format!("校园网认证失败：{}", strip_portal_code(&raw_msg)),
+            format!("校园网认证失败：{}", strip_portal_code(raw_msg)).into(),
             None,
         ),
         "ACCOUNT_SWITCH" => {
-            let acct = extract_quoted_name(&raw_msg);
+            let acct = extract_quoted_name(raw_msg);
             let msg = match acct {
-                Some(name) => format!("正在切换账号至「{name}」…"),
-                None => "正在切换校园网账号…".to_string(),
+                Some(name) => format!("正在切换账号至「{name}」…").into(),
+                None => "正在切换校园网账号…".into(),
             };
             (LogLevel::Info, msg, None)
         }
         "ACCOUNT_SWITCHED" => {
-            let acct = extract_quoted_name(&raw_msg);
+            let acct = extract_quoted_name(raw_msg);
             let msg = match acct {
-                Some(name) => format!("已切换至「{name}」并成功联网"),
-                None => "账号切换成功，校园网已连接".to_string(),
+                Some(name) => format!("已切换至「{name}」并成功联网").into(),
+                None => "账号切换成功，校园网已连接".into(),
             };
             (LogLevel::Info, msg, None)
         }
         "SWITCH_ABORTED" | "SWITCH_NOT_VERIFIED" | "SWITCH_FAILED" => {
-            (LogLevel::Err, strip_portal_code(&raw_msg), None)
+            (LogLevel::Err, strip_portal_code(raw_msg).into(), None)
         }
-        "MONITOR_STARTED" => (LogLevel::Info, "已开启后台自动守护".to_string(), None),
-        "MONITOR_PAUSED" => (LogLevel::Info, "已暂停后台自动守护".to_string(), None),
-        "SETTINGS_SAVED" => (LogLevel::Info, "新设置已保存并生效".to_string(), None),
+        "MONITOR_STARTED" => (LogLevel::Info, "已开启后台自动守护".into(), None),
+        "MONITOR_PAUSED" => (LogLevel::Info, "已暂停后台自动守护".into(), None),
+        "SETTINGS_SAVED" => (LogLevel::Info, "新设置已保存并生效".into(), None),
         "APP_STARTED" => {
             let detail = raw_msg
                 .split("日志路径：")
                 .nth(1)
-                .map(|p| format!("日志路径：{}", p.trim()));
+                .map(|p| format!("日志路径：{}", p.trim()).into());
             (
                 LogLevel::Info,
-                format!("守护助手 v{} 已启动", env!("CARGO_PKG_VERSION")),
+                concat!("守护助手 v", env!("CARGO_PKG_VERSION"), " 已启动").into(),
                 detail,
             )
         }
         "APP_READY" => (
             LogLevel::Info,
-            "后台守护已就绪，正在系统托盘静默运行".to_string(),
+            "后台守护已就绪，正在系统托盘静默运行".into(),
             None,
         ),
-        "APP_EXIT" => (LogLevel::Info, "守护助手已退出".to_string(), None),
+        "APP_EXIT" => (LogLevel::Info, "守护助手已退出".into(), None),
         "DIAGNOSTIC" => return None,
         "SELF_SERVICE" => {
             let lvl = if is_err {
@@ -645,33 +753,32 @@ fn format_human_log(line: &str) -> Option<HumanLogLine> {
             } else {
                 LogLevel::Info
             };
-            (lvl, raw_msg.trim().to_string(), None)
+            (lvl, raw_msg.trim().to_owned().into(), None)
         }
         "DIAGNOSTIC_ERROR" => (
             LogLevel::Err,
-            "网络诊断过程发生异常".to_string(),
-            Some(polish_generic(&raw_msg)),
+            "网络诊断过程发生异常".into(),
+            Some(polish_generic(raw_msg).into()),
         ),
         _ if is_err || tag_str.ends_with("_ERROR") || tag_str.ends_with("_FAILED") => {
-            (LogLevel::Err, polish_generic(&raw_msg), None)
+            (LogLevel::Err, polish_generic(raw_msg).into(), None)
         }
-        _ if is_warn => (LogLevel::Warn, polish_generic(&raw_msg), None),
-        _ => (LogLevel::Info, polish_generic(&raw_msg), None),
+        _ if is_warn => (LogLevel::Warn, polish_generic(raw_msg).into(), None),
+        _ => (LogLevel::Info, polish_generic(raw_msg).into(), None),
     };
 
     Some(HumanLogLine {
-        full_stamp,
-        time_short,
+        raw_index,
+        has_stamp,
         level: lvl,
         summary,
         detail,
-        raw: line.to_string(),
     })
 }
 
 /// 过滤掉内部状态机握手中间态（`→ AUTHENTICATING` / `→ VERIFYING` / `→ CHECKING`），
 /// 仅保留对用户有实质意义的「断联/恢复/启停」结果。
-fn rewrite_state_change(raw_msg: &str) -> Option<(LogLevel, String, Option<String>)> {
+fn rewrite_state_change(raw_msg: &str) -> Option<LogMessage> {
     // 内部握手中间态直接静默
     if raw_msg.contains("→ AUTHENTICATING")
         || raw_msg.contains("-> AUTHENTICATING")
@@ -685,7 +792,6 @@ fn rewrite_state_change(raw_msg: &str) -> Option<(LogLevel, String, Option<Strin
 
     let reason_code = extract_kv(raw_msg, "原因=");
     let reason_zh = reason_code
-        .as_deref()
         .filter(|c| !c.is_empty() && *c != "ONLINE")
         .map(reason_label);
 
@@ -695,19 +801,19 @@ fn rewrite_state_change(raw_msg: &str) -> Option<(LogLevel, String, Option<Strin
             return None;
         }
         let summary = if raw_msg.starts_with("PAUSED") {
-            "已开启后台自动守护，当前校园网在线".to_string()
+            "已开启后台自动守护，当前校园网在线".into()
         } else if raw_msg.starts_with("VERIFYING") {
-            "自动重连成功，校园网已恢复上网".to_string()
+            "自动重连成功，校园网已恢复上网".into()
         } else if raw_msg.starts_with("OFFLINE") || raw_msg.starts_with("SUSPECT") {
-            "校园网已恢复正常连接".to_string()
+            "校园网已恢复正常连接".into()
         } else {
-            "检测通过，校园网连接正常".to_string()
+            "检测通过，校园网连接正常".into()
         };
         return Some((LogLevel::Info, summary, None));
     }
 
     if raw_msg.contains("→ OFFLINE") || raw_msg.contains("-> OFFLINE") {
-        let code = reason_code.as_deref().unwrap_or("");
+        let code = reason_code.unwrap_or("");
         let is_err = matches!(
             code,
             "CREDENTIALS_MISSING"
@@ -723,52 +829,52 @@ fn rewrite_state_change(raw_msg: &str) -> Option<(LogLevel, String, Option<Strin
             LogLevel::Warn
         };
         let summary = if code == "AUTH_EXPIRED" {
-            "校园网认证已过期，正在自动重连…".to_string()
+            "校园网认证已过期，正在自动重连…".into()
         } else if code == "CREDENTIALS_MISSING" {
-            "尚未保存账号密码，请前往设置补全".to_string()
+            "尚未保存账号密码，请前往设置补全".into()
         } else if let Some(r) = reason_zh {
             if raw_msg.contains("准备自动登录") {
-                format!("{r}，正在自动重连…")
+                format!("{r}，正在自动重连…").into()
             } else {
-                format!("校园网已断开（{r}）")
+                format!("校园网已断开（{r}）").into()
             }
         } else {
-            "检测到校园网连接中断".to_string()
+            "检测到校园网连接中断".into()
         };
         return Some((level, summary, None));
     }
 
     if raw_msg.contains("→ SUSPECT") || raw_msg.contains("-> SUSPECT") {
         let summary = match reason_zh {
-            Some(r) => format!("网络出现短暂波动（{r}），正在二次复核"),
-            None => "网络出现短暂波动，正在二次复核".to_string(),
+            Some(r) => format!("网络出现短暂波动（{r}），正在二次复核").into(),
+            None => "网络出现短暂波动，正在二次复核".into(),
         };
         return Some((LogLevel::Warn, summary, None));
     }
 
     if raw_msg.contains("→ PAUSED") || raw_msg.contains("-> PAUSED") {
-        return Some((LogLevel::Info, "已暂停后台自动守护".to_string(), None));
+        return Some((LogLevel::Info, "已暂停后台自动守护".into(), None));
     }
 
     None
 }
 
-fn rewrite_health_check(raw_msg: &str) -> (LogLevel, String, Option<String>) {
+fn rewrite_health_check(raw_msg: &str) -> LogMessage {
     let cost = extract_kv(raw_msg, "检测耗时=");
     let ip = extract_kv(raw_msg, "IP=");
     let gw = extract_kv(raw_msg, "网关=");
     let hb = extract_kv(raw_msg, "心跳间隔=");
 
-    let summary = match cost.as_deref() {
-        Some(c) => format!("例行巡检正常（耗时 {c}）"),
-        None => "例行巡检正常，校园网保持在线".to_string(),
+    let summary = match cost {
+        Some(c) => format!("例行巡检正常（耗时 {c}）").into(),
+        None => "例行巡检正常，校园网保持在线".into(),
     };
 
     let mut extras = Vec::new();
-    if let Some(v) = ip.filter(|s| s != "unknown") {
+    if let Some(v) = ip.filter(|s| *s != "unknown") {
         extras.push(format!("本机 IP：{v}"));
     }
-    if let Some(v) = gw.filter(|s| s != "unknown") {
+    if let Some(v) = gw.filter(|s| *s != "unknown") {
         extras.push(format!("网关：{v}"));
     }
     if let Some(v) = hb {
@@ -777,7 +883,7 @@ fn rewrite_health_check(raw_msg: &str) -> (LogLevel, String, Option<String>) {
     let detail = if extras.is_empty() {
         None
     } else {
-        Some(extras.join(" · "))
+        Some(extras.join(" · ").into())
     };
     (LogLevel::Info, summary, detail)
 }
@@ -844,30 +950,22 @@ fn polish_generic(raw: &str) -> String {
     }
 }
 
-fn extract_kv(text: &str, key: &str) -> Option<String> {
+fn extract_kv<'a>(text: &'a str, key: &str) -> Option<&'a str> {
     let start = text.find(key)? + key.len();
     let rest = &text[start..];
     let end = rest
         .find([';', '；', '，', ',', '）', ')'])
         .unwrap_or(rest.len());
     let val = rest[..end].trim();
-    if val.is_empty() {
-        None
-    } else {
-        Some(val.to_string())
-    }
+    (!val.is_empty()).then_some(val)
 }
 
-fn extract_quoted_name(text: &str) -> Option<String> {
+fn extract_quoted_name(text: &str) -> Option<&str> {
     let start = text.find('「')? + '「'.len_utf8();
     let rest = &text[start..];
     let end = rest.find('」')?;
     let name = rest[..end].trim();
-    if name.is_empty() {
-        None
-    } else {
-        Some(name.to_string())
-    }
+    (!name.is_empty()).then_some(name)
 }
 
 #[cfg(test)]
@@ -887,7 +985,8 @@ mod tests {
             "2026-11-22 03:43:11 INFO [NOTIFY_SENT] 网络恢复提醒；最后原因=校园网认证过期".to_string(),
             "2026-11-22 03:43:12 INFO [NOTIFY_SENT] 系统弹窗：网络已恢复（断网 2 秒）".to_string(),
         ];
-        let visible = build_visible_logs(&raw_burst);
+        let mut visible = Vec::new();
+        build_visible_logs(&raw_burst.into(), &mut visible);
         assert_eq!(visible.len(), 2);
         assert_eq!(visible[0].level, LogLevel::Warn);
         assert_eq!(visible[0].level.label(), "WARN");
@@ -900,6 +999,7 @@ mod tests {
     #[test]
     fn maps_errors_and_health_checks_to_exact_three_levels() {
         let rejected = format_human_log(
+            0,
             "2026-11-22 03:18:48 WARNING [LOGIN_REJECTED] 账号密码校验未通过；门户返回码=1",
         )
         .unwrap();
@@ -908,11 +1008,213 @@ mod tests {
         assert!(rejected.summary.contains("校园网认证失败"));
 
         let health = format_human_log(
+            1,
             "2026-11-22 03:17:39 INFO [HEALTH_CHECK] 网络正常；IP=198.18.0.1；网关=198.18.0.2；检测耗时=0.03s；心跳间隔=30分钟",
         )
         .unwrap();
         assert_eq!(health.level, LogLevel::Info);
         assert_eq!(health.summary, "例行巡检正常（耗时 0.03s）");
         assert!(health.detail.as_deref().unwrap().contains("198.18.0.1"));
+    }
+
+    fn assert_matches_full_rebuild(lines: &LogLines, state: &LogsState) {
+        let mut entries: Vec<_> = lines
+            .rows
+            .iter()
+            .enumerate()
+            .filter_map(|(i, line)| format_human_log(i, line))
+            .collect();
+        entries.dedup_by(|a, b| a.level == b.level && a.summary == b.summary);
+        assert_eq!(state.entries, entries);
+
+        let query = state.search.trim().to_lowercase();
+        let level = [
+            None,
+            Some(LogLevel::Info),
+            Some(LogLevel::Warn),
+            Some(LogLevel::Err),
+        ][state.view_filter];
+        let expected: Vec<_> = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| {
+                let fields = [
+                    e.summary.as_ref(),
+                    e.level.label(),
+                    e.detail.as_deref().unwrap_or(""),
+                    &lines.rows[e.raw_index],
+                ];
+                (level.is_none_or(|l| l == e.level)
+                    && fields.iter().any(|s| s.to_lowercase().contains(&query)))
+                .then_some(i)
+            })
+            .collect();
+        assert_eq!(state.filtered, expected);
+    }
+
+    #[test]
+    fn cache_reuses_parsed_rows_across_filters_and_skips_unchanged_frames() {
+        let mut lines = LogLines::from(vec![
+            "2026-11-22 03:00:01 INFO [HEALTH_CHECK] 心跳间隔=30分钟".into(),
+            "2026-11-22 03:00:02 INFO [AUTH_RETRY] 网络波动".into(),
+            "2026-11-22 03:00:03 INFO [CREDENTIALS_MISSING] 凭据待补".into(),
+            "2026-11-22 03:00:04 INFO [SELF_SERVICE] İSTANBUL ΟΣ".into(),
+            "2026-11-22 03:00:05 INFO [NOTIFY_SENT] 隐藏回执".into(),
+        ]);
+        let mut state = LogsState::default();
+        state.refresh(&lines);
+        assert_matches_full_rebuild(&lines, &state);
+        assert_eq!((state.parse_passes, state.filter_passes), (1, 1));
+        assert_eq!(state.count_label, "4 条");
+
+        for (filter, search, indices) in [
+            (0, "  例行巡检 ", &[0][..]),
+            (0, "心跳周期", &[0]),
+            (0, "eRr", &[2]),
+            (0, "[aUtH_rEtRy]", &[1]),
+            (0, "i\u{307}stan", &[3]),
+            (0, "ος", &[3]),
+            (0, "οσ", &[]),
+            (0, "隐藏回执", &[]),
+            (2, "", &[1]),
+            (1, "", &[0, 3]),
+            (3, "", &[2]),
+            (2, "凭据待补", &[]),
+        ] {
+            let last_filter_pass = state.filter_passes;
+            state.view_filter = filter;
+            state.search = search.to_owned();
+            state.refresh(&lines);
+            assert_eq!(state.filtered, indices, "filter={filter}, search={search}");
+            assert_matches_full_rebuild(&lines, &state);
+            for _ in 0..8 {
+                state.refresh(&lines);
+            }
+            assert_eq!(
+                (state.parse_passes, state.filter_passes),
+                (1, last_filter_pass + 1)
+            );
+        }
+
+        let last_filter_pass = state.filter_passes;
+        lines.push("2026-11-22 03:00:06 WARNING [SELF_SERVICE] 凭据待补".into());
+        state.refresh(&lines);
+        assert_matches_full_rebuild(&lines, &state);
+        assert_eq!(state.filtered, [4]);
+        assert_eq!(state.count_label, "1/5");
+        assert_eq!(
+            (state.parse_passes, state.filter_passes),
+            (2, last_filter_pass + 1)
+        );
+    }
+
+    #[test]
+    fn eviction_rebuilds_raw_indices_and_promotes_the_next_duplicate() {
+        let first = "2026-11-22 03:00:01 INFO [LOGIN_VERIFIED] 首条记录";
+        let second = "2026-11-22 03:00:02 INFO [STATE_CHANGE] VERIFYING → ONLINE 保留副本";
+        let mut rows = vec!["已超出启动保留上限".into(), first.into(), second.into()];
+        rows.extend(
+            (2..MAX_LOG_LINES).map(|n| format!("2026-11-22 03:00:03 INFO [SELF_SERVICE] 记录 {n}")),
+        );
+        let mut lines = LogLines::from(rows);
+        let mut state = LogsState {
+            search: "保留副本".into(),
+            ..Default::default()
+        };
+        state.refresh(&lines);
+        assert_matches_full_rebuild(&lines, &state);
+        assert!(state.filtered.is_empty());
+        assert_eq!(lines.rows[state.entries[0].raw_index], first);
+        assert_eq!(state.entries.len(), MAX_LOG_LINES - 1);
+
+        lines.push("2026-11-22 03:00:04 INFO [SELF_SERVICE] 新记录".into());
+        state.refresh(&lines);
+        assert_matches_full_rebuild(&lines, &state);
+        assert_eq!(state.filtered, [0]);
+        assert_eq!(state.entries.len(), MAX_LOG_LINES);
+        let entry = &state.entries[state.filtered[0]];
+        let raw = &lines.rows[entry.raw_index];
+        assert_eq!(raw, second);
+        assert_eq!(entry.timestamps(raw), ("2026-11-22 03:00:02", "03:00:02"));
+        assert_eq!(
+            lines.rows[state.entries.last().unwrap().raw_index],
+            lines.rows[MAX_LOG_LINES - 1]
+        );
+        state.refresh(&lines);
+        assert_eq!((state.parse_passes, state.filter_passes), (2, 2));
+    }
+
+    #[test]
+    fn filtered_card_follows_new_rows_and_uses_their_raw_text_for_hover_and_copy() {
+        fn text_center(output: &egui::FullOutput, text: &str) -> Option<Pos2> {
+            output.shapes.iter().find_map(|clipped| {
+                if let egui::Shape::Text(t) = &clipped.shape {
+                    let center = t.pos + t.galley.size() * 0.5;
+                    if t.galley.text() == text && clipped.clip_rect.contains(center) {
+                        return Some(center);
+                    }
+                }
+                None
+            })
+        }
+
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.families.insert(
+            crate::ui::theme::bold_family(),
+            fonts.families[&egui::FontFamily::Proportional].clone(),
+        );
+        ctx.set_fonts(fonts);
+        let palette = Palette::light();
+        let log_file = tempfile::NamedTempFile::new().unwrap();
+        let show = |lines: &LogLines, state: &mut LogsState, events| {
+            let input = egui::RawInput {
+                screen_rect: Some(Rect::from_min_size(Pos2::ZERO, Vec2::new(640.0, 360.0))),
+                events,
+                ..Default::default()
+            };
+            ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    draw_card(ui, &palette, lines, state, log_file.path(), 180.0);
+                });
+            })
+        };
+        let rows: Vec<_> = (0..40)
+            .map(|i| {
+                let level = if i % 2 == 0 { "INFO" } else { "WARNING" };
+                format!("2026-11-22 12:00:{i:02} {level} [SELF_SERVICE] record {i}")
+            })
+            .collect();
+        let mut lines = LogLines::from(rows);
+        let mut state = LogsState {
+            view_filter: 2,
+            ..Default::default()
+        };
+        show(&lines, &mut state, vec![]);
+        show(&lines, &mut state, vec![]);
+        let target = "2026-11-22 12:01:09 INFO [AUTH_RETRY] retry-ID42";
+        lines.push(target.into());
+        show(&lines, &mut state, vec![]);
+        let out = show(&lines, &mut state, vec![]);
+        let pos = text_center(&out, "12:01:09").expect("新记录应已滚动至可见区域");
+        show(&lines, &mut state, vec![egui::Event::PointerMoved(pos)]);
+        let hover = show(&lines, &mut state, vec![]);
+        assert!(text_center(&hover, "2026-11-22 12:01:09").is_some());
+        assert!(text_center(&hover, "retry-ID42").is_some());
+
+        let click = |pressed| egui::Event::PointerButton {
+            pos,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        show(&lines, &mut state, vec![click(true)]);
+        let clicked = show(&lines, &mut state, vec![click(false)]);
+        assert!(clicked
+            .platform_output
+            .commands
+            .iter()
+            .any(|cmd| matches!(cmd, egui::OutputCommand::CopyText(s) if s == target)));
+        assert_eq!((state.parse_passes, state.filter_passes), (2, 2));
     }
 }

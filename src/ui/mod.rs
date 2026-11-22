@@ -46,7 +46,6 @@ use widgets::{
     secondary_button,
 };
 
-const MAX_LOG_LINES: usize = 4000;
 const MAX_TELEMETRY_POINTS: usize = 5000;
 const TITLEBAR_HEIGHT: f32 = 36.0;
 
@@ -219,7 +218,7 @@ pub struct GuardApp {
     snapshots: Receiver<SnapshotEnvelope>,
     latest: Option<MonitorSnapshot>,
     logs: Receiver<String>,
-    log_lines: Vec<String>,
+    log_lines: logs_page::LogLines,
     log_path: PathBuf,
     ui_prefs: UiPrefs,
     window_size_dirty_since: Option<Instant>,
@@ -310,11 +309,6 @@ impl GuardApp {
             };
         }
 
-        let mut log_lines = deps.initial_logs;
-        if log_lines.len() > MAX_LOG_LINES {
-            log_lines = log_lines.split_off(log_lines.len() - MAX_LOG_LINES);
-        }
-
         let needs_setup = if let Some(active) = deps.settings.active_account() {
             !account_creds.get(&active.id).copied().unwrap_or(false)
         } else {
@@ -358,7 +352,7 @@ impl GuardApp {
             snapshots: deps.snapshots,
             latest: None,
             logs: deps.logs,
-            log_lines,
+            log_lines: deps.initial_logs.into(),
             log_path: deps.log_path,
             ui_prefs,
             window_size_dirty_since: None,
@@ -1227,14 +1221,8 @@ impl GuardApp {
             self.latest = Some(snapshot);
         }
 
-        let mut appended = false;
         while let Ok(line) = self.logs.try_recv() {
             self.log_lines.push(line);
-            appended = true;
-        }
-        if appended && self.log_lines.len() > MAX_LOG_LINES {
-            let drop_count = self.log_lines.len() - MAX_LOG_LINES;
-            self.log_lines.drain(..drop_count);
         }
     }
 

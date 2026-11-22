@@ -2,13 +2,14 @@
 
 use chrono::Local;
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Mutex, OnceLock};
 
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
 const BACKUPS: u32 = 5;
+const TAIL_BLOCK_BYTES: usize = 32 * 1024;
 
 struct Logger {
     path: PathBuf,
@@ -33,15 +34,48 @@ pub fn subscribe() -> Receiver<String> {
 
 /// 读取日志文件最后 `max_lines` 行（用于窗口启动时的历史回填）。
 pub fn read_tail(path: &Path, max_lines: usize) -> Vec<String> {
-    let Ok(text) = fs::read_to_string(path) else {
+    if max_lines == 0 {
         return Vec::new();
-    };
-    let lines: Vec<String> = text.lines().map(|line| line.to_string()).collect();
-    if lines.len() <= max_lines {
-        lines
-    } else {
-        lines[lines.len() - max_lines..].to_vec()
     }
+    File::open(path)
+        .and_then(|mut file| {
+            let end = file.seek(SeekFrom::End(0))?;
+            if end == 0 {
+                return Ok(Vec::new());
+            }
+            let start = tail_start(&mut file, end, max_lines)?;
+            file.seek(SeekFrom::Start(start))?;
+            // 只解码完整行，并以开始读取时的文件末尾为界。
+            BufReader::new(file.take(end - start)).lines().collect()
+        })
+        .unwrap_or_default()
+}
+
+fn tail_start(file: &mut File, end: u64, mut lines_left: usize) -> io::Result<u64> {
+    let mut block = [0; TAIL_BLOCK_BYTES];
+    let mut right = end;
+    while right > 0 {
+        let left = right.saturating_sub(TAIL_BLOCK_BYTES as u64);
+        let chunk = &mut block[..(right - left) as usize];
+        file.seek(SeekFrom::Start(left))?;
+        file.read_exact(chunk)?;
+        // 末尾的 LF 只终止最后一行；再往前的 LF 才界定要保留的行首。
+        let scan = if right == end {
+            chunk.strip_suffix(b"\n").unwrap_or(chunk)
+        } else {
+            chunk
+        };
+        for (i, &byte) in scan.iter().enumerate().rev() {
+            if byte == b'\n' {
+                lines_left -= 1;
+                if lines_left == 0 {
+                    return Ok(left + i as u64 + 1);
+                }
+            }
+        }
+        right = left;
+    }
+    Ok(0)
 }
 
 /// 初始化日志，返回 `app.log` 的绝对路径。
@@ -179,6 +213,55 @@ pub fn reveal_in_explorer(path: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_tail_matches_full_read(path: &Path, text: &str, limits: &[usize]) {
+        fs::write(path, text).unwrap();
+        let full = fs::read_to_string(path).unwrap();
+        let lines: Vec<_> = full.lines().collect();
+        for &limit in limits {
+            assert_eq!(
+                read_tail(path, limit),
+                lines[lines.len().saturating_sub(limit)..],
+                "limit={limit}, file size={}",
+                full.len()
+            );
+        }
+    }
+
+    #[test]
+    fn tail_matches_lines_for_empty_files_and_mixed_terminators() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        for text in [
+            "",
+            "\n",
+            "\r\n",
+            "\n\n",
+            "一行",
+            "一行\r",
+            "\r\n甲\n\n乙\r\n",
+            "\n甲\r\n\r乙",
+        ] {
+            assert_tail_matches_full_read(&path, text, &[0, 1, 2, 3, 4, usize::MAX]);
+        }
+    }
+
+    #[test]
+    fn tail_handles_utf8_lines_and_crlf_split_across_reverse_blocks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        let history = "以往的守护记录\n".repeat(8000);
+        let long_line = "界".repeat(TAIL_BLOCK_BYTES);
+        for ending in ["", "\n", "\r\n"] {
+            let text = format!("{history}{long_line}\r\n末行{ending}");
+            assert!((1..=3).any(|n| !text.is_char_boundary(text.len() - n * TAIL_BLOCK_BYTES)));
+            assert_tail_matches_full_read(&path, &text, &[0, 1, 2, 800, usize::MAX]);
+        }
+        // 从 EOF 回退一块时恰好从 LF 开始，CR 在上一块。
+        let text = format!("首行\r\n{}", "x".repeat(TAIL_BLOCK_BYTES - 1));
+        assert_eq!(text.as_bytes()[text.len() - TAIL_BLOCK_BYTES], b'\n');
+        assert_tail_matches_full_read(&path, &text, &[1, 2, 3]);
+    }
 
     #[test]
     fn rotation_paths_use_numbered_backups() {
