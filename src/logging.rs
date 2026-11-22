@@ -131,6 +131,51 @@ pub fn error(message: &str) {
     log("ERROR", message);
 }
 
+/// 将路径规范化为适合 `explorer.exe` 解析的标准 Win32 路径（剥离 `\\?\` 前缀并统一反斜杠）。
+pub fn normalize_win32_path(path: &Path) -> String {
+    let raw = path.to_string_lossy().replace('/', "\\");
+    if let Some(unc) = raw.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else if let Some(stripped) = raw.strip_prefix(r"\\?\") {
+        stripped.to_string()
+    } else {
+        raw
+    }
+}
+
+/// 构造传给 `explorer.exe` 的原生命令行参数 `/select,"<path>"`（避免被 MSVCRT 整段二次套引号导致跳去「文档」库）。
+pub fn explorer_select_raw_arg(path: &Path) -> String {
+    let clean = normalize_win32_path(path).replace('"', "");
+    format!("/select,\"{clean}\"")
+}
+
+/// 在 Windows 文件资源管理器中打开目录并将光标停留在目标文件（如 `app.log`）上；
+/// 若目标文件尚不存在，则回退打开其所在目录。
+pub fn reveal_in_explorer(path: &Path) {
+    use std::os::windows::process::CommandExt;
+
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        // 若为尚未创建的日志文件，先行创建空文件以便资源管理器精确高亮选中
+        if path.extension().is_some_and(|ext| ext == "log") {
+            let _ = OpenOptions::new().create(true).append(true).open(path);
+        }
+    }
+
+    if path.exists() {
+        let raw_arg = explorer_select_raw_arg(path);
+        let _ = std::process::Command::new("explorer.exe")
+            .raw_arg(raw_arg)
+            .spawn();
+    } else if let Some(parent) = path.parent().filter(|p| p.exists()) {
+        let _ = std::process::Command::new("explorer.exe")
+            .arg(normalize_win32_path(parent))
+            .spawn();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -145,6 +190,15 @@ mod tests {
         assert_eq!(
             path_with_suffix(&base, 5).display().to_string(),
             r"C:\logs\app.log.5"
+        );
+    }
+
+    #[test]
+    fn explorer_select_arg_preserves_spaces_and_strips_verbatim_prefix() {
+        let p = PathBuf::from(r"\\?\C:\Users\Test User\AppData\Local\GXNUCampusLogin/logs/app.log");
+        assert_eq!(
+            explorer_select_raw_arg(&p),
+            r#"/select,"C:\Users\Test User\AppData\Local\GXNUCampusLogin\logs\app.log""#
         );
     }
 }

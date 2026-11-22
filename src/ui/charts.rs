@@ -5,7 +5,9 @@
 use std::f32::consts::{FRAC_PI_2, TAU};
 
 use chrono::{Local, TimeZone, Timelike};
-use eframe::egui::{self, Color32, CornerRadius, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
+use eframe::egui::{
+    self, Color32, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2,
+};
 
 use crate::metrics_store::{
     build_health_track, compute_stats, filter_range, outages_in_range, OutageEvent, TelemetryPoint,
@@ -16,7 +18,7 @@ use crate::models::{
 };
 use crate::ui::icons::Icon;
 use crate::ui::theme::{
-    body_text, bold_text, reason_hint, reason_label, with_alpha, Palette, ThemeMode,
+    body_text, bold_text, lerp_color, reason_hint, reason_label, with_alpha, Palette, ThemeMode,
     DEFAULT_TRAFFIC_SPLIT, RADIUS_MD,
 };
 use crate::ui::widgets::{
@@ -63,6 +65,8 @@ pub struct HomeVisualActions {
     pub refresh_self_service: bool,
     pub traffic_view_changed: bool,
     pub kick_device: Option<(String, bool)>,
+    pub toggle_recent_sessions: bool,
+    pub recent_sessions_anchor: Option<Rect>,
 }
 
 /// Tier 2：账号流量（左） + 在线设备（右）双栏卡片（可左右拖拽调整比例）。
@@ -77,6 +81,7 @@ pub fn draw_self_service_row(
     is_monitor_online: bool,
     login_rejected: bool,
     kicking_ips: &std::collections::HashSet<String>,
+    recent_sessions_open: bool,
     split_ratio: &mut f32,
     target_height: f32,
 ) -> HomeVisualActions {
@@ -128,7 +133,7 @@ pub fn draw_self_service_row(
             Vec2::new(right_w, target_height),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
-                let (refresh, kick) = draw_online_devices_card(
+                let (refresh, kick, toggle_recent, recent_anchor) = draw_online_devices_card(
                     ui,
                     p,
                     self_service,
@@ -136,6 +141,7 @@ pub fn draw_self_service_row(
                     is_monitor_online,
                     login_rejected,
                     kicking_ips,
+                    recent_sessions_open,
                     target_height,
                 );
                 if refresh {
@@ -144,6 +150,10 @@ pub fn draw_self_service_row(
                 if kick.is_some() {
                     actions.kick_device = kick;
                 }
+                if toggle_recent {
+                    actions.toggle_recent_sessions = true;
+                }
+                actions.recent_sessions_anchor = recent_anchor;
             },
         );
     });
@@ -844,10 +854,13 @@ fn draw_online_devices_card(
     is_monitor_online: bool,
     login_rejected: bool,
     kicking_ips: &std::collections::HashSet<String>,
+    recent_sessions_open: bool,
     target_height: f32,
-) -> (bool, Option<(String, bool)>) {
+) -> (bool, Option<(String, bool)>, bool, Option<Rect>) {
     let mut refresh_clicked = false;
     let mut kick_target: Option<(String, bool)> = None;
+    let mut toggle_recent = false;
+    let mut recent_anchor: Option<Rect> = None;
     let now_unix = Local::now().timestamp();
 
     card_padded(ui, p, 12, |ui| {
@@ -1089,19 +1102,43 @@ fn draw_online_devices_card(
         let foot_cy = foot_rect.center().y;
         let mut right_limit = foot_rect.right();
         if !data.recent_sessions.is_empty() {
-            let link_g = ui.painter().layout_no_wrap(
+            let link_probe = ui.painter().layout_no_wrap(
                 "近期记录".to_string(),
                 egui::FontId::proportional(10.0),
                 p.accent,
             );
             let link_rect = Rect::from_min_max(
-                Pos2::new(foot_rect.right() - link_g.size().x - 2.0, foot_rect.top()),
-                foot_rect.max,
+                Pos2::new(
+                    foot_rect.right() - link_probe.size().x - 6.0,
+                    foot_rect.top() - 2.0,
+                ),
+                Pos2::new(foot_rect.right() + 2.0, foot_rect.bottom() + 2.0),
             );
-            let link_resp = ui.interact(
-                link_rect,
-                ui.id().with("recent_sessions_hover"),
-                Sense::hover(),
+            let link_resp = ui
+                .interact(
+                    link_rect,
+                    ui.id().with("recent_sessions_btn"),
+                    Sense::click(),
+                )
+                .on_hover_cursor(CursorIcon::PointingHand);
+            let link_fg = if recent_sessions_open || link_resp.hovered() {
+                p.accent
+            } else {
+                lerp_color(p.text_secondary, p.accent, 0.78)
+            };
+            if recent_sessions_open || link_resp.hovered() {
+                let bg = if recent_sessions_open {
+                    p.accent_soft
+                } else {
+                    with_alpha(p.accent, 22)
+                };
+                ui.painter()
+                    .rect_filled(link_rect, CornerRadius::same(4), bg);
+            }
+            let link_g = ui.painter().layout_no_wrap(
+                "近期记录".to_string(),
+                egui::FontId::proportional(10.0),
+                link_fg,
             );
             ui.painter().galley(
                 Pos2::new(
@@ -1109,11 +1146,16 @@ fn draw_online_devices_card(
                     foot_cy - link_g.size().y * 0.5,
                 ),
                 link_g,
-                p.accent,
+                link_fg,
             );
-            link_resp.on_hover_ui(|ui| {
-                draw_recent_sessions_full_tooltip(ui, p, data);
-            });
+            if link_resp.clicked() {
+                toggle_recent = true;
+            } else if !recent_sessions_open {
+                link_resp.on_hover_ui(|ui| {
+                    draw_recent_sessions_full_tooltip(ui, p, data);
+                });
+            }
+            recent_anchor = Some(link_rect);
             right_limit = link_rect.left() - 8.0;
         }
         let sum_clip = Rect::from_min_max(
@@ -1140,7 +1182,7 @@ fn draw_online_devices_card(
         }
     });
 
-    (refresh_clicked, kick_target)
+    (refresh_clicked, kick_target, toggle_recent, recent_anchor)
 }
 
 fn draw_empty_devices_box(ui: &mut egui::Ui, p: &Palette, width: f32, height: f32) {

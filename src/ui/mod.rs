@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
-use chrono::Local;
+use chrono::{Local, TimeZone};
 use eframe::egui::{
     self, CornerRadius, CursorIcon, Pos2, Rect, ResizeDirection, Sense, Stroke, StrokeKind, Vec2,
     ViewportCommand,
@@ -241,6 +241,9 @@ pub struct GuardApp {
     campus_vpn_ack_for_draft: bool,
     kicking_ips: HashSet<String>,
     local_kick_confirm_ip: Option<String>,
+    recent_sessions_open: bool,
+    recent_sessions_anchor: Option<Rect>,
+    recent_sessions_clicked: bool,
     update_state: UpdateState,
     update_modal_open: bool,
     pending_manual_update_check: bool,
@@ -377,6 +380,9 @@ impl GuardApp {
             campus_vpn_ack_for_draft: false,
             kicking_ips: HashSet::new(),
             local_kick_confirm_ip: None,
+            recent_sessions_open: false,
+            recent_sessions_anchor: None,
+            recent_sessions_clicked: false,
             update_state: UpdateState {
                 current_version: crate::VERSION.to_string(),
                 ..Default::default()
@@ -1686,6 +1692,186 @@ impl GuardApp {
         }
     }
 
+    fn draw_recent_sessions_popover(&mut self, ctx: &egui::Context, p: &Palette) {
+        if self.view != AppView::Home || !self.recent_sessions_open {
+            return;
+        }
+        let Some(anchor) = self.recent_sessions_anchor else {
+            self.recent_sessions_open = false;
+            return;
+        };
+        let Some(data) = &self.self_service.data else {
+            self.recent_sessions_open = false;
+            return;
+        };
+        if data.recent_sessions.is_empty() {
+            self.recent_sessions_open = false;
+            return;
+        }
+
+        let pop_w = 336.0_f32;
+        let est_h = 58.0 + (data.recent_sessions.len() as f32) * 26.0;
+        let screen = ctx.screen_rect();
+        let x = (anchor.right() - pop_w)
+            .min(screen.right() - pop_w - 10.0)
+            .max(screen.left() + 10.0);
+        let y = if anchor.bottom() + 6.0 + est_h <= screen.bottom() - 10.0 {
+            anchor.bottom() + 6.0
+        } else {
+            (anchor.top() - est_h - 6.0).max(screen.top() + 38.0)
+        };
+
+        let shadow = match p.mode {
+            ThemeMode::Light => egui::Shadow {
+                offset: [0, 6],
+                blur: 18,
+                spread: 0,
+                color: with_alpha(egui::Color32::BLACK, 34),
+            },
+            ThemeMode::Dark => egui::Shadow {
+                offset: [0, 8],
+                blur: 22,
+                spread: 0,
+                color: with_alpha(egui::Color32::BLACK, 125),
+            },
+        };
+
+        let mut close_clicked = false;
+        let sessions = data.recent_sessions.clone();
+        let local_ip = self.effective_campus_ip();
+
+        let area_resp = egui::Area::new(egui::Id::new("recent_sessions_popover"))
+            .fixed_pos(Pos2::new(x, y))
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::new()
+                    .fill(p.card)
+                    .stroke(Stroke::new(1.0_f32, p.border_strong))
+                    .corner_radius(CornerRadius::same(10))
+                    .inner_margin(egui::Margin::symmetric(12, 10))
+                    .shadow(shadow)
+                    .show(ui, |ui| {
+                        let inner_w = pop_w - 24.0;
+                        ui.set_width(inner_w);
+                        ui.spacing_mut().item_spacing.y = 5.0;
+
+                        ui.allocate_ui_with_layout(
+                            Vec2::new(inner_w, 22.0),
+                            egui::Layout::left_to_right(egui::Align::Center),
+                            |ui| {
+                                ui.spacing_mut().item_spacing.x = 6.0;
+                                ui.label(bold_text("近期上网记录", 12.0, p.text));
+                                ui.label(body_text(
+                                    format!("最近 {} 条 · 实际流量", sessions.len()),
+                                    10.2,
+                                    p.text_muted,
+                                ));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if widgets::icon_button(
+                                            ui,
+                                            p,
+                                            Icon::Close,
+                                            Vec2::splat(20.0),
+                                            10.5,
+                                            false,
+                                            "关闭",
+                                        )
+                                        .clicked()
+                                        {
+                                            close_clicked = true;
+                                        }
+                                    },
+                                );
+                            },
+                        );
+
+                        let sep = ui.allocate_space(Vec2::new(inner_w, 1.0)).1;
+                        ui.painter().line_segment(
+                            [sep.left_center(), sep.right_center()],
+                            Stroke::new(1.0_f32, p.divider),
+                        );
+
+                        for rec in &sessions {
+                            let start_str = Local
+                                .timestamp_opt(rec.login_unix_ms / 1000, 0)
+                                .single()
+                                .map(|dt| dt.format("%m-%d %H:%M").to_string())
+                                .unwrap_or_else(|| "--:--".to_string());
+                            let end_str = rec
+                                .logout_unix_ms
+                                .and_then(|ms| Local.timestamp_opt(ms / 1000, 0).single())
+                                .map(|dt| dt.format("%H:%M").to_string())
+                                .unwrap_or_else(|| "在线".to_string());
+                            let is_local_ip = !local_ip.is_empty() && rec.ip == local_ip;
+
+                            let (row_rect, _) =
+                                ui.allocate_exact_size(Vec2::new(inner_w, 22.0), Sense::hover());
+                            let cy = row_rect.center().y;
+                            let time_txt = format!("{start_str}–{end_str}");
+                            let tg = ui.painter().layout_no_wrap(
+                                time_txt,
+                                egui::FontId::proportional(10.5),
+                                p.text_secondary,
+                            );
+                            ui.painter().galley(
+                                Pos2::new(row_rect.left(), cy - tg.size().y * 0.5),
+                                tg.clone(),
+                                p.text_secondary,
+                            );
+
+                            let ip_c = if is_local_ip { p.ok } else { p.text };
+                            let ig = ui.painter().layout_no_wrap(
+                                rec.ip.clone(),
+                                egui::FontId::new(10.5, crate::ui::theme::bold_family()),
+                                ip_c,
+                            );
+                            ui.painter().galley(
+                                Pos2::new(
+                                    row_rect.left() + tg.size().x + 8.0,
+                                    cy - ig.size().y * 0.5,
+                                ),
+                                ig,
+                                ip_c,
+                            );
+
+                            let right_txt = format!(
+                                "{} · {}",
+                                charts::format_duration_short(rec.duration_secs),
+                                charts::format_mb_compact(rec.actual_total_mb())
+                            );
+                            let rg = ui.painter().layout_no_wrap(
+                                right_txt,
+                                egui::FontId::proportional(10.5),
+                                p.text_muted,
+                            );
+                            ui.painter().galley(
+                                Pos2::new(row_rect.right() - rg.size().x, cy - rg.size().y * 0.5),
+                                rg,
+                                p.text_muted,
+                            );
+                        }
+                    });
+            });
+
+        if close_clicked {
+            self.recent_sessions_open = false;
+        } else if !self.recent_sessions_clicked {
+            let area_rect = area_resp.response.rect;
+            let dismiss = ctx.input(|i| {
+                i.key_pressed(egui::Key::Escape)
+                    || (i.pointer.primary_pressed()
+                        && i.pointer
+                            .interact_pos()
+                            .is_some_and(|pos| !area_rect.contains(pos) && !anchor.contains(pos)))
+            });
+            if dismiss {
+                self.recent_sessions_open = false;
+            }
+        }
+    }
+
     fn effective_campus_ip(&self) -> String {
         if let Some(snap) = &self.latest {
             let ip = snap.metrics.effective_campus_ip();
@@ -2392,6 +2578,7 @@ impl eframe::App for GuardApp {
                             == Some(crate::models::DisconnectReason::LoginRejected);
 
                         // Tier 2: 账号流量 + 在线设备双卡（可左右拖拽分栏，上下可由底部分隔条调节高度）
+                        self.recent_sessions_clicked = false;
                         let mut ss_h_opt: Option<(f32, f32, f32)> = None;
                         if show_self_service {
                             let avail_h = ui.available_height().max(340.0);
@@ -2419,9 +2606,15 @@ impl eframe::App for GuardApp {
                                 is_online,
                                 login_rejected,
                                 &self.kicking_ips,
+                                self.recent_sessions_open,
                                 &mut self.ui_prefs.home_traffic_split,
                                 ss_h,
                             );
+                            self.recent_sessions_anchor = actions.recent_sessions_anchor;
+                            if actions.toggle_recent_sessions {
+                                self.recent_sessions_clicked = true;
+                                self.recent_sessions_open = !self.recent_sessions_open;
+                            }
                             if actions.split_changed {
                                 self.window_size_dirty_since = Some(Instant::now());
                             }
@@ -2480,6 +2673,7 @@ impl eframe::App for GuardApp {
                         );
                     });
                 self.draw_account_switcher_popover(ctx, &p);
+                self.draw_recent_sessions_popover(ctx, &p);
             }
             AppView::Settings => {
                 let saving = self

@@ -1,6 +1,6 @@
 [package]
 name = "gxnu-guard"
-version = "0.2.2"
+version = "0.2.3"
 edition = "2021"
 description = "GXNU 校园网守护助手"
 repository = "https://github.com/junkaih2019/gxnu-campus-net-helper"

@@ -542,7 +542,7 @@ fn fetch_month_online_log(agent: &Agent) -> Result<OnlineLogBundle, PortalError>
     let month_start = now.format("%Y-%m-01").to_string();
     let today = now.format("%Y-%m-%d").to_string();
     let url = format!(
-        "{ONLINE_LOG_API}?startTime={month_start}&endTime={today}&order=asc&limit=6&offset=0"
+        "{ONLINE_LOG_API}?startTime={month_start}&endTime={today}&order=desc&limit=6&offset=0"
     );
     let response = checked_response(
         "读取上网记录明细",

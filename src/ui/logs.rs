@@ -141,11 +141,11 @@ pub fn draw_card(
                         Vec2::splat(24.0),
                         12.5,
                         false,
-                        "打开原始日志文件 (app.log)",
+                        "在文件管理器中定位 app.log",
                     )
                     .clicked()
                     {
-                        open_path(log_path);
+                        crate::logging::reveal_in_explorer(log_path);
                     }
 
                     // 与左侧状态胶囊同体量（24px 高、96px 宽）且图标文字严格中线对齐的小搜索框
@@ -868,16 +868,6 @@ fn extract_quoted_name(text: &str) -> Option<String> {
     } else {
         Some(name.to_string())
     }
-}
-
-fn open_path(path: &Path) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    let _ = std::process::Command::new("cmd")
-        .args(["/C", "start", "", &path.to_string_lossy()])
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
 }
 
 #[cfg(test)]

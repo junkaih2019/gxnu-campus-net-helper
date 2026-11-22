@@ -33,7 +33,7 @@ mod tray_menu;
 mod ui;
 mod updater;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -690,7 +690,7 @@ fn run_daemon(
             tray::TrayAction::Pause => ipc::UiToDaemon::Pause,
             tray::TrayAction::Check => ipc::UiToDaemon::ForceCheck,
             tray::TrayAction::OpenMenu => return post_thread_msg(main_tid, WM_TRAY_SHOW_MENU),
-            tray::TrayAction::OpenLog => return open_path(&action_log_path),
+            tray::TrayAction::OpenLog => return logging::reveal_in_explorer(&action_log_path),
             tray::TrayAction::Exit => {
                 action_ctrl.signal_stop();
                 return post_thread_msg(main_tid, WM_DAEMON_QUIT);
@@ -1330,16 +1330,6 @@ fn parse_arg(args: &[String], flag: &str) -> Option<String> {
         .position(|a| a == flag)
         .and_then(|idx| args.get(idx + 1))
         .cloned()
-}
-
-fn open_path(path: &Path) {
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-
-    let _ = std::process::Command::new("cmd")
-        .args(["/C", "start", "", &path.to_string_lossy()])
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn();
 }
 
 fn mask_id(student_id: &str) -> String {
