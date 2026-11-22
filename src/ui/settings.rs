@@ -711,15 +711,6 @@ fn draw_account_page(
     ui.add_space(10.0);
 
     // 2. 账号新增 / 编辑表单卡（融合「为当前学号新增出口」极简视图与「左右双栏」对称表单）
-    let is_new = form.editing_account_id.is_none();
-    let editing_saved = form
-        .editing_account_id
-        .as_deref()
-        .and_then(|id| saved.find_account(id));
-    let editing_has_cred = editing_saved.is_some_and(|acc| {
-        account_creds.get(&acc.id).copied().unwrap_or(false)
-            && acc.student_id.trim() == form.student_id.trim()
-    });
     let can_offer_quick_exit = saved.active_account().is_some_and(|acc| {
         let sid = acc.student_id.trim();
         !sid.is_empty()
@@ -727,20 +718,11 @@ fn draw_account_page(
                 .reusable_cred_account_id(sid, |id| account_creds.get(id).copied().unwrap_or(false))
                 .is_some()
     });
-    let quick_exit_active =
-        is_new && can_offer_quick_exit && form.new_account_mode == NewAccountMode::QuickExit;
-    let reusable_peer_cred = is_new
-        && saved
-            .reusable_cred_account_id(&form.student_id, |id| {
-                account_creds.get(id).copied().unwrap_or(false)
-            })
-            .is_some();
-    let draft_dirty = form.is_account_draft_dirty(saved);
 
     group_card(ui, p, |ui| {
         ui.spacing_mut().item_spacing.y = 10.0;
 
-        if is_new {
+        if form.editing_account_id.is_none() {
             // ── 新增卡片顶栏：有可复用学号时提供双模式分段切换，否则显示干净单标题 ──
             ui.allocate_ui_with_layout(
                 Vec2::new(ui.available_width(), 26.0),
@@ -780,22 +762,13 @@ fn draw_account_page(
                     }
                 },
             );
-
-            if quick_exit_active {
-                draw_quick_exit_body(ui, p, form, saved, verifying_account, actions);
-            } else {
-                draw_full_new_account_dual_body(
-                    ui,
-                    p,
-                    form,
-                    saved,
-                    reusable_peer_cred,
-                    verifying_account,
-                    actions,
-                );
-            }
         } else {
-            // ── 编辑已有账号卡片：与新增同源的对称左右双栏（左填学号密码 · 右选出口与备注） ──
+            // ── 编辑已有账号顶栏 ──
+            let editing_saved = form
+                .editing_account_id
+                .as_deref()
+                .and_then(|id| saved.find_account(id));
+            let draft_dirty = form.is_account_draft_dirty(saved);
             let disp_name = editing_saved
                 .map(|acc| saved.account_display_name(acc))
                 .unwrap_or_else(|| "账号".to_string());
@@ -819,7 +792,41 @@ fn draw_account_page(
                     }
                 },
             );
+        }
 
+        // 注意：必须在顶栏交互（分段切换 / 取消 / 还原）之后再读取最新模式与草稿状态，
+        // 避免同帧内刚切到「添加其他学号」清空学号后，又误入旧的 QuickExit 分支把原学号写回！
+        if form.editing_account_id.is_none() {
+            let quick_exit_active =
+                can_offer_quick_exit && form.new_account_mode == NewAccountMode::QuickExit;
+            if quick_exit_active {
+                draw_quick_exit_body(ui, p, form, saved, verifying_account, actions);
+            } else {
+                let reusable_peer_cred = saved
+                    .reusable_cred_account_id(&form.student_id, |id| {
+                        account_creds.get(id).copied().unwrap_or(false)
+                    })
+                    .is_some();
+                draw_full_new_account_dual_body(
+                    ui,
+                    p,
+                    form,
+                    saved,
+                    reusable_peer_cred,
+                    verifying_account,
+                    actions,
+                );
+            }
+        } else {
+            let editing_saved = form
+                .editing_account_id
+                .as_deref()
+                .and_then(|id| saved.find_account(id));
+            let editing_has_cred = editing_saved.is_some_and(|acc| {
+                account_creds.get(&acc.id).copied().unwrap_or(false)
+                    && acc.student_id.trim() == form.student_id.trim()
+            });
+            let draft_dirty = form.is_account_draft_dirty(saved);
             draw_edit_account_dual_body(
                 ui,
                 p,
@@ -1050,6 +1057,7 @@ fn draw_quick_exit_body(
             styled_text_box(
                 ui,
                 p,
+                "quick_exit_remark",
                 220.0,
                 None,
                 &mut form.remark,
@@ -1105,6 +1113,7 @@ fn draw_full_new_account_dual_body(
                 styled_text_box(
                     ui,
                     p,
+                    "new_account_student_id",
                     left_w,
                     Some(Icon::User),
                     &mut form.student_id,
@@ -1135,6 +1144,7 @@ fn draw_full_new_account_dual_body(
                 styled_text_box(
                     ui,
                     p,
+                    "new_account_password",
                     left_w,
                     Some(Icon::Key),
                     &mut form.password,
@@ -1149,6 +1159,7 @@ fn draw_full_new_account_dual_body(
                 styled_text_box(
                     ui,
                     p,
+                    "new_account_remark",
                     left_w,
                     None,
                     &mut form.remark,
@@ -1255,6 +1266,7 @@ fn draw_edit_account_dual_body(
                 styled_text_box(
                     ui,
                     p,
+                    "edit_account_student_id",
                     left_w,
                     Some(Icon::User),
                     &mut form.student_id,
@@ -1284,6 +1296,7 @@ fn draw_edit_account_dual_body(
                 styled_text_box(
                     ui,
                     p,
+                    "edit_account_password",
                     left_w,
                     Some(Icon::Key),
                     &mut form.password,
@@ -1322,6 +1335,7 @@ fn draw_edit_account_dual_body(
                 styled_text_box(
                     ui,
                     p,
+                    "edit_account_remark",
                     right_w,
                     None,
                     &mut form.remark,
@@ -2396,6 +2410,7 @@ fn fluent_toggle_row(
 fn styled_text_box(
     ui: &mut egui::Ui,
     p: &Palette,
+    id_salt: &str,
     width: f32,
     leading_icon: Option<Icon>,
     value: &mut String,
@@ -2427,6 +2442,7 @@ fn styled_text_box(
     let edit_resp = child.add_sized(
         [edit_w, 20.0],
         egui::TextEdit::singleline(value)
+            .id_salt(id_salt)
             .password(password)
             .hint_text(egui::RichText::new(hint).color(p.text_muted))
             .vertical_align(egui::Align::Center)
@@ -2606,5 +2622,86 @@ mod tests {
         assert!(form.also_create_campus_exit);
         assert!(form.request_student_id_focus);
         assert!(!form.is_account_draft_dirty(&saved));
+    }
+
+    #[test]
+    fn switching_to_add_other_student_id_in_ui_never_retains_existing_student_id() {
+        fn find_in_shape(shape: &egui::Shape, needle: &str) -> Option<Pos2> {
+            match shape {
+                egui::Shape::Text(t) if t.galley.text() == needle => {
+                    Some(t.pos + t.galley.size() * 0.5)
+                }
+                egui::Shape::Vec(items) => items.iter().find_map(|s| find_in_shape(s, needle)),
+                _ => None,
+            }
+        }
+        fn find_label_center(shapes: &[egui::epaint::ClippedShape], needle: &str) -> Option<Pos2> {
+            shapes.iter().find_map(|c| find_in_shape(&c.shape, needle))
+        }
+
+        let mut saved = Settings::default();
+        saved.upsert_account(
+            AccountProfile {
+                id: "acc-unicom".into(),
+                remark: "联通宽带".into(),
+                student_id: "2024010615".into(),
+                carrier: "2".into(),
+                monthly_quota_gb: 0,
+            },
+            true,
+        );
+        let mut creds = HashMap::new();
+        creds.insert("acc-unicom".to_string(), true);
+
+        let mut form = SettingsForm::from_settings(&saved);
+        form.start_new_from_existing_with_creds(&saved, |id| {
+            creds.get(id).copied().unwrap_or(false)
+        });
+        assert_eq!(form.new_account_mode, NewAccountMode::QuickExit);
+        assert_eq!(form.student_id, "2024010615");
+
+        let ctx = egui::Context::default();
+        let mut fonts = egui::FontDefinitions::default();
+        let prop = fonts.families[&egui::FontFamily::Proportional].clone();
+        fonts.families.insert(crate::ui::theme::bold_family(), prop);
+        ctx.set_fonts(fonts);
+        let palette = Palette::of(ThemeMode::Dark);
+
+        // 第 1 帧：渲染 QuickExit 视图并从绘制图元中定位「添加其他学号」按钮中心
+        let out1 = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                let mut actions = SettingsActions::default();
+                draw_account_page(ui, &palette, &mut form, &saved, &creds, false, &mut actions);
+            });
+        });
+        let click_pos =
+            find_label_center(&out1.shapes, "添加其他学号").expect("应找到「添加其他学号」分段项");
+
+        // 第 2 帧 + 第 3 帧：真实模拟鼠标按下并抬起点击「添加其他学号」
+        for pressed in [true, false] {
+            let input = egui::RawInput {
+                events: vec![
+                    egui::Event::PointerMoved(click_pos),
+                    egui::Event::PointerButton {
+                        pos: click_pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                ..Default::default()
+            };
+            let _ = ctx.run(input, |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let mut actions = SettingsActions::default();
+                    draw_account_page(ui, &palette, &mut form, &saved, &creds, false, &mut actions);
+                });
+            });
+        }
+
+        // 切到「添加其他学号」后必须清空原有学号，绝不能被同帧残留分支写回
+        assert_eq!(form.new_account_mode, NewAccountMode::FullAccount);
+        assert_eq!(form.student_id, "");
+        assert!(form.also_create_campus_exit);
     }
 }
