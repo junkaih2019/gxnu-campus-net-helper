@@ -789,14 +789,23 @@ fn run_ui_process(args: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    // 确保同时只存在一个界面窗口
-    let _ui_guard = match single_instance::InstanceGuard::acquire(UI_MUTEX_NAME) {
-        Ok((_guard, true)) => {
-            bring_any_ui_window_to_front();
-            return ExitCode::SUCCESS;
+    // 确保同时只存在一个界面窗口（仅 debug 截图模式下跳过单实例锁，避免干扰用户运行中的实例）
+    #[cfg(debug_assertions)]
+    let skip_ui_mutex = std::env::var_os("GXNU_SCREENSHOT_OUT").is_some();
+    #[cfg(not(debug_assertions))]
+    let skip_ui_mutex = false;
+
+    let _ui_guard = if skip_ui_mutex {
+        None
+    } else {
+        match single_instance::InstanceGuard::acquire(UI_MUTEX_NAME) {
+            Ok((_guard, true)) => {
+                bring_any_ui_window_to_front();
+                return ExitCode::SUCCESS;
+            }
+            Ok((guard, false)) => Some(guard),
+            Err(_) => None,
         }
-        Ok((guard, false)) => Some(guard),
-        Err(_) => None,
     };
 
     let store = config::SettingsStore::new();

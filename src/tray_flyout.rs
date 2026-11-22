@@ -2391,8 +2391,8 @@ mod tests {
             reason: Some(DisconnectReason::Online),
             message: "公网连接正常".into(),
             metrics: MonitorMetrics {
-                portal_ip: "172.16.24.195".into(),
-                last_check_ms: 51,
+                portal_ip: "172.16.24.100".into(),
+                last_check_ms: 48,
                 ..Default::default()
             },
         }
@@ -2408,7 +2408,7 @@ mod tests {
 
     fn sample_self_service(now: i64, two_devices: bool) -> SelfServiceState {
         let mut devices = vec![OnlineDevice {
-            ip: "172.16.24.195".into(),
+            ip: "172.16.24.100".into(),
             login_time: "2026-11-22 05:52:00".into(),
             login_unix: Some(now - 6960),
             terminal_type: "PC".into(),
@@ -2434,7 +2434,7 @@ mod tests {
                     campus_remaining_mb: 553_035.5,
                     month_down_mb: 285_804.0,
                     month_up_mb: 80_081.6,
-                    user_group_name: "硕士-计科".into(),
+                    user_group_name: "本科-计科".into(),
                     plan_description: "每月免费30G".into(),
                     month_session_count: Some(236),
                 },
@@ -2506,7 +2506,7 @@ mod tests {
             Some(now - 6960),
             &TrafficSummary::default(),
             &ss,
-            "HJK",
+            "DEMO",
             "2",
             FlyoutTrafficMode::Carrier,
             &pts,
@@ -2523,7 +2523,7 @@ mod tests {
             Some(now - 6960),
             &TrafficSummary::default(),
             &ss,
-            "HJK",
+            "DEMO",
             "0",
             FlyoutTrafficMode::Campus,
             &pts,
@@ -2531,7 +2531,7 @@ mod tests {
         );
         assert_eq!(campus_m.traffic_hero, "540.1 GB");
         assert!(campus_m.traffic_sub.contains("99.9%"));
-        assert!(campus_m.traffic_foot_right.contains("硕士-计科"));
+        assert!(campus_m.traffic_foot_right.contains("本科-计科"));
 
         // Optional GDI visual QA dump when GXNU_FLYOUT_QA_DIR is set
         if let Ok(dir) = std::env::var("GXNU_FLYOUT_QA_DIR") {
@@ -2572,7 +2572,7 @@ mod tests {
             Some(now - 6960),
             &TrafficSummary::default(),
             &ss,
-            "HJK",
+            "DEMO",
             if mode == FlyoutTrafficMode::Campus {
                 "0"
             } else {
@@ -2591,7 +2591,7 @@ mod tests {
                 online_since_unix: Arc::new(Mutex::new(Some(now - 6960))),
                 latest_traffic: Arc::new(Mutex::new(TrafficSummary::default())),
                 latest_self_service: Arc::new(Mutex::new(ss)),
-                active_account_label: Arc::new(Mutex::new("HJK".into())),
+                active_account_label: Arc::new(Mutex::new("DEMO".into())),
                 active_carrier: Arc::new(Mutex::new("2".into())),
                 metrics_store: Arc::new(MetricsStore::new(&tmp_dir)),
             },
