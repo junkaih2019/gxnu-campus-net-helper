@@ -289,6 +289,7 @@ struct FlyoutState {
     hits: Vec<HitBox>,
     model: FlyoutModel,
     telemetry_cache: Vec<TelemetryPoint>,
+    last_shown: Option<Instant>,
     last_deactivated: Option<Instant>,
 }
 
@@ -348,6 +349,7 @@ impl FluentTrayFlyout {
                 hits: Vec::new(),
                 model: placeholder_model,
                 telemetry_cache: Vec::new(),
+                last_shown: None,
                 last_deactivated: None,
             });
             let state_ptr = Box::into_raw(boxed);
@@ -458,6 +460,7 @@ impl FluentTrayFlyout {
         state.width_px = scale(326, dpi);
         state.height_px = compute_height_px(state);
 
+        state.last_shown = Some(Instant::now());
         position_flyout_window(self.hwnd, state, true);
         ShowWindow(self.hwnd, SW_SHOW);
         SetForegroundWindow(self.hwnd);
@@ -1166,15 +1169,24 @@ unsafe extern "system" fn flyout_wnd_proc(
             0
         }
         WM_ACTIVATE => {
-            if (wparam & 0xFFFF) as u32 == WA_INACTIVE {
+            if (wparam & 0xFFFF) as u32 == WA_INACTIVE
+                && state
+                    .last_shown
+                    .is_none_or(|t| t.elapsed() >= Duration::from_millis(120))
+            {
                 state.last_deactivated = Some(Instant::now());
                 ShowWindow(hwnd, SW_HIDE);
             }
             0
         }
         WM_KILLFOCUS => {
-            state.last_deactivated = Some(Instant::now());
-            ShowWindow(hwnd, SW_HIDE);
+            if state
+                .last_shown
+                .is_none_or(|t| t.elapsed() >= Duration::from_millis(120))
+            {
+                state.last_deactivated = Some(Instant::now());
+                ShowWindow(hwnd, SW_HIDE);
+            }
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
@@ -2555,6 +2567,7 @@ mod tests {
             hits: Vec::new(),
             model,
             telemetry_cache: pts,
+            last_shown: None,
             last_deactivated: None,
         };
         state.height_px = compute_height_px(&state);

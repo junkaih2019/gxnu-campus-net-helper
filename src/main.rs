@@ -53,7 +53,8 @@ const APP_NAME: &str = env!("CARGO_PKG_DESCRIPTION");
 const WM_TRAY_REFRESH: u32 = 0x8000 + 1;
 const WM_DAEMON_QUIT: u32 = 0x8000 + 2;
 const WM_TRAY_SHOW_MENU: u32 = 0x8000 + 3;
-const WM_TRAY_TOGGLE_FLYOUT: u32 = 0x8000 + 4;
+// 注：`0x8000 + 4` 已被 `network_events::CHANGED` 占用
+const WM_TRAY_TOGGLE_FLYOUT: u32 = 0x8000 + 5;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
