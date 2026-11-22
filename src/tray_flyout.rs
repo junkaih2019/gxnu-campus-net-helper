@@ -16,13 +16,14 @@ use chrono::{Local, TimeZone};
 use windows_sys::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
-    CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, FillRect,
+    BeginPaint, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, CreateFontW,
+    CreatePen, CreateSolidBrush, DeleteDC, DeleteObject, DrawTextW, Ellipse, EndPaint, FillRect,
     GetMonitorInfoW, InvalidateRect, LineTo, MonitorFromPoint, MoveToEx, RoundRect, SelectObject,
-    SetBkMode, SetTextColor, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET,
-    DEFAULT_PITCH, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE,
-    DT_VCENTER, FW_BOLD, FW_NORMAL, MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_PEN,
-    OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, SRCCOPY, TRANSPARENT,
+    SetBkMode, SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CLEARTYPE_QUALITY,
+    CLIP_DEFAULT_PRECIS, DEFAULT_CHARSET, DEFAULT_PITCH, DIB_RGB_COLORS, DT_CENTER,
+    DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, FW_BOLD, FW_NORMAL,
+    MONITORINFO, MONITOR_DEFAULTTONEAREST, NULL_BRUSH, NULL_PEN, OUT_DEFAULT_PRECIS, PAINTSTRUCT,
+    PS_SOLID, SRCCOPY, TRANSPARENT,
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -52,7 +53,9 @@ const DWMWCP_ROUND: u32 = 2;
 
 const WM_MOUSELEAVE_MSG: u32 = 0x02A3;
 const TME_LEAVE_FLAG: u32 = 0x0000_0002;
+const VK_RETURN: u16 = 0x0D;
 const VK_ESCAPE: u16 = 0x1B;
+const DT_WORDBREAK_FLAG: u32 = 0x0000_0010;
 
 #[repr(C)]
 struct TrackMouseEventStruct {
@@ -66,6 +69,11 @@ struct TrackMouseEventStruct {
 extern "system" {
     fn GetDpiForWindow(hwnd: HWND) -> u32;
     fn TrackMouseEvent(lpeventtrack: *mut TrackMouseEventStruct) -> i32;
+}
+
+#[link(name = "gdi32")]
+extern "system" {
+    fn GdiFlush() -> i32;
 }
 
 /// 浮窗共享只读数据源（直接复用守护进程内存状态，零额外拷贝或轮询）。
@@ -196,8 +204,14 @@ enum FlyoutTrafficMode {
     Campus,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HitTarget {
+    AccountChip,
+    SelectAccount(usize),
+    ManageAccounts,
+    DismissOverlay,
+    ConfirmVpnSwitch,
+    CancelVpnSwitch,
     TrafficCarrier,
     TrafficCampus,
     Range7h,
@@ -206,6 +220,18 @@ enum HitTarget {
     ToggleMonitor,
     OpenMain,
     Exit,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FlyoutAccountItem {
+    id: String,
+    display_name: String,
+    masked_student_id: String,
+    has_remark: bool,
+    carrier: String,
+    carrier_label: &'static str,
+    is_active: bool,
+    has_cred: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -236,9 +262,10 @@ struct FlyoutModel {
     status_title: &'static str,
     status_dot: COLORREF,
     status_soft: COLORREF,
-    status_border: COLORREF,
-    online_badge: String,
-    header_meta: String,
+    has_account: bool,
+    chip_name: String,
+    chip_carrier: &'static str,
+    header_fault_sub: String,
     monitoring_enabled: bool,
 
     // Traffic
@@ -280,11 +307,16 @@ struct FlyoutState {
     palette: FlyoutPalette,
     traffic_mode: FlyoutTrafficMode,
     traffic_user_override: bool,
+    last_account_label: String,
     last_carrier: String,
+    accounts: Vec<FlyoutAccountItem>,
+    account_dropdown_open: bool,
+    vpn_confirm_target: Option<FlyoutAccountItem>,
     range: TimeRange,
     dpi: u32,
     width_px: i32,
     height_px: i32,
+    anchor_x: Option<i32>,
     hovered: Option<HitTarget>,
     tracking_mouse: bool,
     hits: Vec<HitBox>,
@@ -322,6 +354,11 @@ impl FluentTrayFlyout {
             RegisterClassW(&wc);
 
             let palette = FlyoutPalette::load(&sources.app_dir);
+            let init_acct_label = sources
+                .active_account_label
+                .lock()
+                .map(|g| g.clone())
+                .unwrap_or_default();
             let init_carrier = sources
                 .active_carrier
                 .lock()
@@ -340,11 +377,16 @@ impl FluentTrayFlyout {
                 palette,
                 traffic_mode: init_mode,
                 traffic_user_override: false,
+                last_account_label: init_acct_label,
                 last_carrier: init_carrier,
+                accounts: Vec::new(),
+                account_dropdown_open: false,
+                vpn_confirm_target: None,
                 range: TimeRange::H7,
                 dpi: 96,
                 width_px: 326,
-                height_px: 390,
+                height_px: 401,
+                anchor_x: None,
                 hovered: None,
                 tracking_mouse: false,
                 hits: Vec::new(),
@@ -393,7 +435,7 @@ impl FluentTrayFlyout {
         unsafe {
             let state = &mut *self.state_ptr;
             if IsWindowVisible(self.hwnd) != 0 {
-                ShowWindow(self.hwnd, SW_HIDE);
+                hide_flyout_window(self.hwnd, state);
                 return false;
             }
             if state
@@ -416,12 +458,7 @@ impl FluentTrayFlyout {
             }
             let state = &mut *self.state_ptr;
             refresh_flyout_state(state, false);
-            let old_h = state.height_px;
-            let new_h = compute_height_px(state);
-            if new_h != old_h {
-                state.height_px = new_h;
-                position_flyout_window(self.hwnd, state, false);
-            }
+            sync_flyout_height(self.hwnd, state);
             InvalidateRect(self.hwnd, null(), 0);
         }
     }
@@ -429,7 +466,8 @@ impl FluentTrayFlyout {
     pub fn hide(&mut self) {
         unsafe {
             if IsWindowVisible(self.hwnd) != 0 {
-                ShowWindow(self.hwnd, SW_HIDE);
+                let state = &mut *self.state_ptr;
+                hide_flyout_window(self.hwnd, state);
             }
         }
     }
@@ -439,6 +477,8 @@ impl FluentTrayFlyout {
         state.palette = FlyoutPalette::load(&state.sources.app_dir);
         state.hovered = None;
         state.tracking_mouse = false;
+        state.account_dropdown_open = false;
+        state.vpn_confirm_target = None;
         refresh_flyout_state(state, true);
 
         let dark_val: u32 = if state.palette.dark { 1 } else { 0 };
@@ -485,7 +525,22 @@ impl Drop for FluentTrayFlyout {
     }
 }
 
-unsafe fn position_flyout_window(hwnd: HWND, state: &FlyoutState, use_cursor: bool) {
+unsafe fn hide_flyout_window(hwnd: HWND, state: &mut FlyoutState) {
+    state.account_dropdown_open = false;
+    state.vpn_confirm_target = None;
+    state.hovered = None;
+    ShowWindow(hwnd, SW_HIDE);
+}
+
+unsafe fn sync_flyout_height(hwnd: HWND, state: &mut FlyoutState) {
+    let new_h = compute_height_px(state);
+    if new_h != state.height_px {
+        state.height_px = new_h;
+        position_flyout_window(hwnd, state, false);
+    }
+}
+
+unsafe fn position_flyout_window(hwnd: HWND, state: &mut FlyoutState, use_cursor: bool) {
     let mut pt = POINT { x: 0, y: 0 };
     GetCursorPos(&mut pt);
 
@@ -507,11 +562,12 @@ unsafe fn position_flyout_window(hwnd: HWND, state: &FlyoutState, use_cursor: bo
     let win_h = state.height_px;
     let margin = scale(10, state.dpi);
 
-    let (mut x, mut y) = if use_cursor {
-        (pt.x - win_w / 2, work_bottom - win_h - margin)
+    let mut x = if use_cursor {
+        pt.x - win_w / 2
     } else {
-        (work_right - win_w - margin, work_bottom - win_h - margin)
+        state.anchor_x.unwrap_or(work_right - win_w - margin)
     };
+    let mut y = work_bottom - win_h - margin;
     if x + win_w > work_right - margin {
         x = work_right - win_w - margin;
     }
@@ -524,6 +580,7 @@ unsafe fn position_flyout_window(hwnd: HWND, state: &FlyoutState, use_cursor: bo
     if y + win_h > work_bottom - margin {
         y = work_bottom - win_h - margin;
     }
+    state.anchor_x = Some(x);
 
     SetWindowPos(hwnd, HWND_TOPMOST, x, y, win_w, win_h, SWP_NOACTIVATE);
 }
@@ -537,10 +594,46 @@ fn compute_height_px(state: &FlyoutState) -> i32 {
     } else {
         0
     };
-    // top(13) + hdr(38) + sep(17) + traffic(84) + sep(17) + dev_hdr(22) + gap(6) + dev_list + extra
+    // top(13) + hdr(25 or 43) + sep(17) + traffic(84) + sep(17) + dev_hdr(22) + gap(6) + dev_list + extra
     // + sep(17) + stab(56) + footer_top_gap(10) + footer_strip(36)
-    let logical_h = 13 + 38 + 17 + 84 + 17 + 22 + 6 + dev_list_h + extra_h + 17 + 56 + 10 + 36;
+    let hdr_h = if state.model.header_fault_sub.is_empty() {
+        25
+    } else {
+        43
+    };
+    let base_logical_h =
+        13 + hdr_h + 17 + 84 + 17 + 22 + 6 + dev_list_h + extra_h + 17 + 56 + 10 + 36;
+    let logical_h = if state.account_dropdown_open {
+        let n = state.accounts.len() as i32;
+        let rows_h = if n > 0 { n * 38 + (n - 1) * 3 } else { 0 };
+        let drop_card_h = 7 + 22 + 6 + rows_h + 6 + 28 + 7;
+        base_logical_h.max(41 + drop_card_h + 12)
+    } else {
+        base_logical_h
+    };
     scale(logical_h, d)
+}
+
+fn load_flyout_accounts(app_dir: &Path) -> Vec<FlyoutAccountItem> {
+    let store = crate::config::SettingsStore {
+        app_dir: app_dir.to_path_buf(),
+        path: app_dir.join("config.json"),
+    };
+    let settings = store.load();
+    settings
+        .accounts
+        .iter()
+        .map(|acc| FlyoutAccountItem {
+            id: acc.id.clone(),
+            display_name: acc.display_name(),
+            masked_student_id: acc.masked_student_id(),
+            has_remark: !acc.remark.trim().is_empty(),
+            carrier: acc.carrier.clone(),
+            carrier_label: carrier_name(&acc.carrier),
+            is_active: acc.id == settings.active_account_id,
+            has_cred: crate::credentials::has_credential_for(&acc.id, &acc.student_id),
+        })
+        .collect()
 }
 
 fn refresh_flyout_state(state: &mut FlyoutState, reload_telemetry: bool) {
@@ -576,7 +669,9 @@ fn refresh_flyout_state(state: &mut FlyoutState, reload_telemetry: bool) {
         .map(|g| g.clone())
         .unwrap_or_else(|_| "2".to_string());
 
-    if carrier != state.last_carrier {
+    let account_changed = acct_label != state.last_account_label || carrier != state.last_carrier;
+    if account_changed {
+        state.last_account_label = acct_label.clone();
         state.last_carrier = carrier.clone();
         state.traffic_user_override = false;
     }
@@ -588,6 +683,9 @@ fn refresh_flyout_state(state: &mut FlyoutState, reload_telemetry: bool) {
         };
     }
 
+    if reload_telemetry || account_changed {
+        state.accounts = load_flyout_accounts(&state.sources.app_dir);
+    }
     if reload_telemetry || state.telemetry_cache.is_empty() {
         state.telemetry_cache = MetricsStore::history(&state.sources.app_dir);
     }
@@ -610,7 +708,7 @@ fn refresh_flyout_state(state: &mut FlyoutState, reload_telemetry: bool) {
 fn build_flyout_model(
     p: &FlyoutPalette,
     snap: Option<&MonitorSnapshot>,
-    online_since_unix: Option<i64>,
+    _online_since_unix: Option<i64>,
     local_traffic: &TrafficSummary,
     ss: &SelfServiceState,
     acct_label: &str,
@@ -624,16 +722,14 @@ fn build_flyout_model(
     let monitoring_enabled = snap.is_some_and(|s| s.monitoring_enabled);
     let login_rejected = snap.and_then(|s| s.reason) == Some(DisconnectReason::LoginRejected);
 
-    let (status_title, status_dot, status_soft, status_border) = match mon_state {
-        MonitorState::Online => ("校园网已连接", p.ok, p.ok_soft, p.ok_border),
-        MonitorState::Checking => ("正在检测网络", p.accent, p.accent_soft, p.accent_border),
+    let (status_title, status_dot, status_soft) = match mon_state {
+        MonitorState::Online => ("校园网已连接", p.ok, p.ok_soft),
+        MonitorState::Checking => ("正在检测网络", p.accent, p.accent_soft),
         MonitorState::Authenticating | MonitorState::Verifying | MonitorState::Suspect => {
-            ("正在自动恢复", p.warn, p.warn_soft, p.warn_border)
+            ("正在自动恢复", p.warn, p.warn_soft)
         }
-        MonitorState::Offline => ("网络连接异常", p.danger, p.danger_soft, p.danger_border),
-        MonitorState::Paused | MonitorState::Stopped => {
-            ("守护已暂停", p.neutral, p.neutral_soft, p.neutral_border)
-        }
+        MonitorState::Offline => ("网络连接异常", p.danger, p.danger_soft),
+        MonitorState::Paused | MonitorState::Stopped => ("守护已暂停", p.neutral, p.neutral_soft),
     };
 
     let campus_ip = snap
@@ -650,43 +746,33 @@ fn build_flyout_model(
         })
         .unwrap_or_default();
 
-    let online_badge = if mon_state == MonitorState::Online {
-        let portal_since = ss
-            .data
-            .as_ref()
-            .and_then(|d| d.matched_local_since_unix(&campus_ip));
-        if let Some(ts) = portal_since.or(online_since_unix) {
-            format!(
-                "在线 {}",
-                format_uptime_compact((now_unix - ts).max(0) as u64)
-            )
-        } else {
-            String::new()
-        }
+    let acct = acct_label.trim();
+    let has_account = !acct.is_empty() && acct != "未配置账号";
+    let chip_name = if has_account {
+        truncate_chars(acct, 8)
     } else {
-        String::new()
+        "未配置账号".to_string()
+    };
+    let raw_carrier = carrier_name(carrier);
+    let chip_carrier = if has_account && chip_name != raw_carrier {
+        raw_carrier
+    } else {
+        ""
     };
 
-    let mut meta_parts: Vec<String> = Vec::new();
-    let acct = acct_label.trim();
-    if !acct.is_empty() && acct != "未配置账号" {
-        meta_parts.push(truncate_chars(acct, 10));
-    }
-    meta_parts.push(carrier_name(carrier).to_string());
-    if !campus_ip.is_empty() {
-        meta_parts.push(campus_ip.clone());
-    }
-    if let Some(s) = snap {
-        if mon_state == MonitorState::Online && s.metrics.last_check_ms > 0 {
-            meta_parts.push(format_ms(s.metrics.last_check_ms));
-        }
-    }
-    let header_meta = if mon_state == MonitorState::Online || meta_parts.len() >= 2 {
-        meta_parts.join(" · ")
+    // 单行极简顶栏：在线/暂停/检测时保持纯粹单行；仅在断网异常或自动恢复时展开一行故障原因
+    let header_fault_sub = if matches!(
+        mon_state,
+        MonitorState::Offline
+            | MonitorState::Authenticating
+            | MonitorState::Verifying
+            | MonitorState::Suspect
+    ) {
+        snap.map(|s| s.message.trim().to_string())
+            .filter(|m| !m.is_empty() && m != status_title)
+            .unwrap_or_default()
     } else {
-        snap.map(|s| s.message.clone())
-            .filter(|m| !m.is_empty())
-            .unwrap_or_else(|| "后台轻量守护中".to_string())
+        String::new()
     };
 
     // ── Section 1: 账号流量 ──────────────────────────────────────────
@@ -997,9 +1083,10 @@ fn build_flyout_model(
         status_title,
         status_dot,
         status_soft,
-        status_border,
-        online_badge,
-        header_meta,
+        has_account,
+        chip_name,
+        chip_carrier,
+        header_fault_sub,
         monitoring_enabled,
         has_portal_traffic,
         traffic_hero,
@@ -1035,9 +1122,10 @@ fn build_empty_model(p: &FlyoutPalette) -> FlyoutModel {
         status_title: "正在初始化",
         status_dot: p.neutral,
         status_soft: p.neutral_soft,
-        status_border: p.neutral_border,
-        online_badge: String::new(),
-        header_meta: "后台轻量守护中".to_string(),
+        has_account: false,
+        chip_name: "未配置账号".to_string(),
+        chip_carrier: "",
+        header_fault_sub: String::new(),
         monitoring_enabled: true,
         has_portal_traffic: false,
         traffic_hero: "0 MB".to_string(),
@@ -1121,6 +1209,62 @@ unsafe extern "system" fn flyout_wnd_proc(
             let y = ((lparam as i32 >> 16) & 0xFFFF) as i16 as i32;
             if let Some(target) = hit_test(&state.hits, x, y) {
                 match target {
+                    HitTarget::AccountChip => {
+                        if state.accounts.is_empty() {
+                            hide_flyout_window(hwnd, state);
+                            let cb = Arc::clone(&state.on_action);
+                            cb(TrayAction::OpenAccountSettings);
+                        } else {
+                            state.vpn_confirm_target = None;
+                            state.account_dropdown_open = !state.account_dropdown_open;
+                            state.hovered = None;
+                            sync_flyout_height(hwnd, state);
+                            InvalidateRect(hwnd, null(), 0);
+                        }
+                    }
+                    HitTarget::DismissOverlay => {
+                        state.account_dropdown_open = false;
+                        state.hovered = None;
+                        sync_flyout_height(hwnd, state);
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                    HitTarget::ManageAccounts => {
+                        hide_flyout_window(hwnd, state);
+                        let cb = Arc::clone(&state.on_action);
+                        cb(TrayAction::OpenAccountSettings);
+                    }
+                    HitTarget::SelectAccount(idx) => {
+                        if let Some(acc) = state.accounts.get(idx).cloned() {
+                            if acc.is_active {
+                                state.account_dropdown_open = false;
+                                state.hovered = None;
+                                sync_flyout_height(hwnd, state);
+                                InvalidateRect(hwnd, null(), 0);
+                            } else if !acc.has_cred {
+                                hide_flyout_window(hwnd, state);
+                                let cb = Arc::clone(&state.on_action);
+                                cb(TrayAction::OpenAccountSettings);
+                            } else if acc.carrier == "0" {
+                                state.account_dropdown_open = false;
+                                state.vpn_confirm_target = Some(acc);
+                                state.hovered = None;
+                                sync_flyout_height(hwnd, state);
+                                InvalidateRect(hwnd, null(), 0);
+                            } else {
+                                execute_flyout_account_switch(hwnd, state, acc);
+                            }
+                        }
+                    }
+                    HitTarget::CancelVpnSwitch => {
+                        state.vpn_confirm_target = None;
+                        state.hovered = None;
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                    HitTarget::ConfirmVpnSwitch => {
+                        if let Some(acc) = state.vpn_confirm_target.take() {
+                            execute_flyout_account_switch(hwnd, state, acc);
+                        }
+                    }
                     HitTarget::TrafficCarrier => {
                         state.traffic_mode = FlyoutTrafficMode::Carrier;
                         state.traffic_user_override = true;
@@ -1157,12 +1301,12 @@ unsafe extern "system" fn flyout_wnd_proc(
                         cb(action);
                     }
                     HitTarget::OpenMain => {
-                        ShowWindow(hwnd, SW_HIDE);
+                        hide_flyout_window(hwnd, state);
                         let cb = Arc::clone(&state.on_action);
                         cb(TrayAction::Show);
                     }
                     HitTarget::Exit => {
-                        ShowWindow(hwnd, SW_HIDE);
+                        hide_flyout_window(hwnd, state);
                         let cb = Arc::clone(&state.on_action);
                         cb(TrayAction::Exit);
                     }
@@ -1171,12 +1315,28 @@ unsafe extern "system" fn flyout_wnd_proc(
             0
         }
         WM_RBUTTONUP => {
-            ShowWindow(hwnd, SW_HIDE);
+            hide_flyout_window(hwnd, state);
             0
         }
         WM_KEYDOWN => {
-            if (wparam as u16) == VK_ESCAPE {
-                ShowWindow(hwnd, SW_HIDE);
+            let key = wparam as u16;
+            if key == VK_ESCAPE {
+                if state.vpn_confirm_target.is_some() {
+                    state.vpn_confirm_target = None;
+                    state.hovered = None;
+                    InvalidateRect(hwnd, null(), 0);
+                } else if state.account_dropdown_open {
+                    state.account_dropdown_open = false;
+                    state.hovered = None;
+                    sync_flyout_height(hwnd, state);
+                    InvalidateRect(hwnd, null(), 0);
+                } else {
+                    hide_flyout_window(hwnd, state);
+                }
+            } else if key == VK_RETURN {
+                if let Some(acc) = state.vpn_confirm_target.take() {
+                    execute_flyout_account_switch(hwnd, state, acc);
+                }
             }
             0
         }
@@ -1187,7 +1347,7 @@ unsafe extern "system" fn flyout_wnd_proc(
                     .is_none_or(|t| t.elapsed() >= Duration::from_millis(120))
             {
                 state.last_deactivated = Some(Instant::now());
-                ShowWindow(hwnd, SW_HIDE);
+                hide_flyout_window(hwnd, state);
             }
             0
         }
@@ -1197,12 +1357,44 @@ unsafe extern "system" fn flyout_wnd_proc(
                 .is_none_or(|t| t.elapsed() >= Duration::from_millis(120))
             {
                 state.last_deactivated = Some(Instant::now());
-                ShowWindow(hwnd, SW_HIDE);
+                hide_flyout_window(hwnd, state);
             }
             0
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }
+}
+
+unsafe fn execute_flyout_account_switch(
+    hwnd: HWND,
+    state: &mut FlyoutState,
+    acc: FlyoutAccountItem,
+) {
+    state.account_dropdown_open = false;
+    state.vpn_confirm_target = None;
+    state.hovered = None;
+    state.traffic_user_override = false;
+    state.traffic_mode = if acc.carrier == "0" {
+        FlyoutTrafficMode::Campus
+    } else {
+        FlyoutTrafficMode::Carrier
+    };
+    for item in &mut state.accounts {
+        item.is_active = item.id == acc.id;
+    }
+    if let Ok(mut g) = state.sources.active_account_label.lock() {
+        *g = acc.display_name.clone();
+    }
+    if let Ok(mut g) = state.sources.active_carrier.lock() {
+        *g = acc.carrier.clone();
+    }
+    state.last_account_label = acc.display_name;
+    state.last_carrier = acc.carrier;
+    refresh_flyout_state(state, false);
+    sync_flyout_height(hwnd, state);
+    InvalidateRect(hwnd, null(), 0);
+    let cb = Arc::clone(&state.on_action);
+    cb(TrayAction::SwitchAccount(acc.id));
 }
 
 fn hit_test(hits: &[HitBox], x: i32, y: i32) -> Option<HitTarget> {
@@ -1222,20 +1414,39 @@ unsafe fn paint_flyout(hwnd: HWND, state: &mut FlyoutState) {
     let h = state.height_px.max(1);
 
     let mem_dc = CreateCompatibleDC(hdc);
-    let mem_bmp = CreateCompatibleBitmap(hdc, w, h);
-    let old_bmp = SelectObject(mem_dc, mem_bmp);
+    let mut bmi: BITMAPINFO = std::mem::zeroed();
+    bmi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h; // top-down BGRA
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
 
-    draw_flyout_contents(mem_dc, state, w, h);
-
-    BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
-    SelectObject(mem_dc, old_bmp);
-    DeleteObject(mem_bmp);
+    let mut bits: *mut c_void = null_mut();
+    let dib = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+    if !dib.is_null() && !bits.is_null() {
+        let old_bmp = SelectObject(mem_dc, dib);
+        let byte_len = (w * h * 4) as usize;
+        let pixels = std::slice::from_raw_parts_mut(bits as *mut u8, byte_len);
+        draw_flyout_contents(mem_dc, Some(pixels), state, w, h);
+        BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
+        SelectObject(mem_dc, old_bmp);
+        DeleteObject(dib);
+    } else {
+        let mem_bmp = CreateCompatibleBitmap(hdc, w, h);
+        let old_bmp = SelectObject(mem_dc, mem_bmp);
+        draw_flyout_contents(mem_dc, None, state, w, h);
+        BitBlt(hdc, 0, 0, w, h, mem_dc, 0, 0, SRCCOPY);
+        SelectObject(mem_dc, old_bmp);
+        DeleteObject(mem_bmp);
+    }
     DeleteDC(mem_dc);
     EndPaint(hwnd, &ps);
 }
 
 unsafe fn draw_flyout_contents(
     hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    mut pixels: Option<&mut [u8]>,
     state: &mut FlyoutState,
     w: i32,
     h: i32,
@@ -1271,8 +1482,8 @@ unsafe fn draw_flyout_contents(
     let content_w = right - left;
     let mut y = scale(13, d);
 
-    // ── 1. 顶部状态头（38px） ─────────────────────────────────────────
-    let top_row_h = scale(20, d);
+    // ── 1. 顶部单行极简状态头（左状态标题 + 右一键切号胶囊，仅异常时展开故障副行） ──
+    let top_row_h = scale(23, d);
     let dot_cy = y + top_row_h / 2;
     let dot_cx = left + scale(6, d);
     fill_circle(
@@ -1293,53 +1504,135 @@ unsafe fn draw_flyout_contents(
     );
 
     let title_x = left + scale(17, d);
-    let title_w = measure_or_draw_text(
+    let title_w = measure_text_width(hdc, f_title, state.model.status_title);
+
+    let chip_h = top_row_h;
+    let chip_cy = dot_cy;
+    let carrier_seg = if state.model.has_account && !state.model.chip_carrier.is_empty() {
+        format!(" · {}", state.model.chip_carrier)
+    } else {
+        String::new()
+    };
+    let name_w = measure_text_width(hdc, f_ip, &state.model.chip_name);
+    let carrier_w = if carrier_seg.is_empty() {
+        0
+    } else {
+        measure_text_width(hdc, f_body, &carrier_seg)
+    };
+    let max_chip_w = (right - (title_x + title_w + scale(10, d))).max(scale(112, d));
+    let raw_chip_w = scale(22, d) + name_w + carrier_w + scale(20, d);
+    let chip_w = raw_chip_w.clamp(scale(64, d), max_chip_w);
+    let chip_rect = RECT {
+        left: right - chip_w,
+        top: y,
+        right,
+        bottom: y + chip_h,
+    };
+
+    draw_text_line(
         hdc,
         f_title,
         state.model.status_title,
         RECT {
             left: title_x,
             top: y,
-            right: right - scale(80, d),
+            right: chip_rect.left - scale(8, d),
             bottom: y + top_row_h,
         },
         p.text,
-        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-    );
-
-    if !state.model.online_badge.is_empty() {
-        let bx = title_x + title_w + scale(8, d);
-        draw_pill_badge(
-            hdc,
-            f_bold_sm,
-            &state.model.online_badge,
-            bx,
-            dot_cy,
-            scale(18, d),
-            scale(12, d),
-            state.model.status_dot,
-            state.model.status_soft,
-            state.model.status_border,
-            d,
-        );
-    }
-
-    let meta_y = y + scale(21, d);
-    draw_text_line(
-        hdc,
-        f_sm,
-        &state.model.header_meta,
-        RECT {
-            left,
-            top: meta_y,
-            right,
-            bottom: meta_y + scale(16, d),
-        },
-        p.text_muted,
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
     );
-    y += scale(38, d);
 
+    let chip_hovered =
+        state.hovered == Some(HitTarget::AccountChip) && state.vpn_confirm_target.is_none();
+    let (chip_bg, chip_bd) = if state.account_dropdown_open {
+        (p.accent_soft, p.accent)
+    } else if chip_hovered {
+        (p.btn_hover, p.accent)
+    } else {
+        (p.subtle, p.pill_border)
+    };
+    fill_round_rect(hdc, chip_rect, scale(10, d), chip_bg, chip_bd);
+
+    let icon_fg = if state.account_dropdown_open {
+        p.accent
+    } else if state.model.has_account {
+        p.text_sec
+    } else {
+        p.warn
+    };
+    draw_user_icon(hdc, chip_rect.left + scale(12, d), chip_cy, d, icon_fg);
+
+    let text_left = chip_rect.left + scale(22, d);
+    let text_right = chip_rect.right - scale(18, d);
+    let avail_name_w = (text_right - text_left - carrier_w).max(scale(36, d));
+    let drawn_name_w = name_w.min(avail_name_w);
+    draw_text_line(
+        hdc,
+        f_ip,
+        &state.model.chip_name,
+        RECT {
+            left: text_left,
+            top: chip_rect.top,
+            right: text_left + drawn_name_w,
+            bottom: chip_rect.bottom,
+        },
+        if state.model.has_account {
+            p.text
+        } else {
+            p.warn
+        },
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+    );
+    if !carrier_seg.is_empty() && text_left + drawn_name_w < text_right {
+        draw_text_line(
+            hdc,
+            f_body,
+            &carrier_seg,
+            RECT {
+                left: text_left + drawn_name_w,
+                top: chip_rect.top,
+                right: text_right,
+                bottom: chip_rect.bottom,
+            },
+            p.text_muted,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+    }
+    draw_chevron_icon(
+        hdc,
+        chip_rect.right - scale(10, d),
+        chip_cy,
+        state.account_dropdown_open,
+        d,
+        p.accent,
+    );
+    state.hits.push(HitBox {
+        target: HitTarget::AccountChip,
+        rect: chip_rect,
+    });
+
+    if state.model.header_fault_sub.is_empty() {
+        y += scale(25, d);
+    } else {
+        let fault_y = y + scale(26, d);
+        draw_text_line(
+            hdc,
+            f_sm,
+            &state.model.header_fault_sub,
+            RECT {
+                left,
+                top: fault_y,
+                right,
+                bottom: fault_y + scale(15, d),
+            },
+            p.text_muted,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        y += scale(43, d);
+    }
+
+    let below_header_y = y + scale(8, d);
     y = draw_divider(hdc, left, right, y, p.divider, d);
 
     // ── 2. 区块一：账号流量（84px） ───────────────────────────────────
@@ -1967,6 +2260,25 @@ unsafe fn draw_flyout_contents(
         rect: r_open,
     });
 
+    // ── 6. 顶层交互叠层：一键切号下拉面板 / 校园网 VPN 防封确认弹窗 ───
+    if state.account_dropdown_open && state.vpn_confirm_target.is_none() {
+        draw_account_dropdown_overlay(
+            hdc,
+            pixels.as_deref_mut(),
+            state,
+            w,
+            h,
+            chip_rect,
+            below_header_y,
+            f_ip,
+            f_bold_sm,
+            f_sm,
+        );
+    }
+    if state.vpn_confirm_target.is_some() {
+        draw_campus_vpn_modal_overlay(hdc, pixels, state, w, h, f_sec, f_body, f_bold_sm);
+    }
+
     DeleteObject(f_title);
     DeleteObject(f_sec);
     DeleteObject(f_hero);
@@ -1975,6 +2287,723 @@ unsafe fn draw_flyout_contents(
     DeleteObject(f_bold_sm);
     DeleteObject(f_sm);
     DeleteObject(f_xs);
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_account_dropdown_overlay(
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    mut pixels: Option<&mut [u8]>,
+    state: &mut FlyoutState,
+    w: i32,
+    h: i32,
+    chip_rect: RECT,
+    scrim_top: i32,
+    f_name: windows_sys::Win32::Graphics::Gdi::HFONT,
+    f_bold_sm: windows_sys::Win32::Graphics::Gdi::HFONT,
+    f_sm: windows_sys::Win32::Graphics::Gdi::HFONT,
+) {
+    let d = state.dpi;
+    let p = state.palette;
+    let left = scale(14, d);
+    let right = w - scale(14, d);
+
+    // 轻微压暗下方数据区域，让下拉卡片具备原生浮层景深
+    dim_bgra_rect(
+        pixels.as_deref_mut(),
+        w,
+        h,
+        RECT {
+            left: 0,
+            top: scrim_top,
+            right: w,
+            bottom: h,
+        },
+        if p.dark { 150 } else { 214 },
+    );
+
+    let pad = scale(7, d);
+    let hdr_h = scale(22, d);
+    let row_h = scale(38, d);
+    let row_gap = scale(3, d);
+    let manage_h = scale(28, d);
+    let sep_space = scale(6, d);
+    let n = state.accounts.len() as i32;
+    let list_h = if n > 0 {
+        n * row_h + (n - 1) * row_gap
+    } else {
+        0
+    };
+    let card_top = chip_rect.bottom + scale(4, d);
+    let card_h = pad + hdr_h + sep_space + list_h + sep_space + manage_h + pad;
+    let card_rect = RECT {
+        left,
+        top: card_top,
+        right,
+        bottom: (card_top + card_h).min(h - scale(6, d)),
+    };
+
+    // 柔和双层投影
+    draw_soft_shadow(pixels, w, h, card_rect, d, p.dark);
+
+    let card_bg = if p.dark {
+        rgb(0x20, 0x25, 0x30)
+    } else {
+        rgb(0xFF, 0xFF, 0xFF)
+    };
+    fill_round_rect(hdc, card_rect, scale(12, d), card_bg, p.accent_border);
+
+    // 覆盖命中表：仅响应胶囊收起、账号项、管理入口与外部空白点击收起
+    state.hits.clear();
+    state.hits.push(HitBox {
+        target: HitTarget::AccountChip,
+        rect: chip_rect,
+    });
+
+    let inner_l = card_rect.left + pad;
+    let inner_r = card_rect.right - pad;
+    let mut cy_top = card_rect.top + pad;
+
+    draw_text_line(
+        hdc,
+        f_bold_sm,
+        "切换校园网账号",
+        RECT {
+            left: inner_l + scale(4, d),
+            top: cy_top,
+            right: inner_r - scale(64, d),
+            bottom: cy_top + hdr_h,
+        },
+        p.text_sec,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+    draw_text_line(
+        hdc,
+        f_sm,
+        &format!("共 {} 个", state.accounts.len()),
+        RECT {
+            left: inner_r - scale(64, d),
+            top: cy_top,
+            right: inner_r - scale(4, d),
+            bottom: cy_top + hdr_h,
+        },
+        p.text_muted,
+        DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+    cy_top += hdr_h;
+
+    draw_thin_line(
+        hdc,
+        inner_l + scale(2, d),
+        inner_r - scale(2, d),
+        cy_top + sep_space / 2,
+        p.divider,
+    );
+    cy_top += sep_space;
+
+    for (idx, acc) in state.accounts.iter().enumerate() {
+        if idx > 0 {
+            cy_top += row_gap;
+        }
+        let r_row = RECT {
+            left: inner_l,
+            top: cy_top,
+            right: inner_r,
+            bottom: cy_top + row_h,
+        };
+        let is_hov = state.hovered == Some(HitTarget::SelectAccount(idx));
+        if acc.is_active {
+            fill_round_rect(hdc, r_row, scale(8, d), p.accent_soft, p.accent_border);
+        } else if is_hov {
+            fill_round_rect(hdc, r_row, scale(8, d), p.btn_hover, p.pill_border);
+        }
+
+        let row_cy = (r_row.top + r_row.bottom) / 2;
+        let ic_cx = r_row.left + scale(14, d);
+        if acc.is_active {
+            draw_check_icon(hdc, ic_cx, row_cy, d, p.ok);
+        } else {
+            draw_user_icon(
+                hdc,
+                ic_cx,
+                row_cy,
+                d,
+                if is_hov { p.accent } else { p.text_muted },
+            );
+        }
+
+        let badge_spec = if acc.is_active {
+            Some(("当前", p.ok, p.ok_soft, p.ok_border))
+        } else if !acc.has_cred {
+            Some(("缺密码", p.warn, p.warn_soft, p.warn_border))
+        } else if is_hov {
+            Some(("切换", p.accent, p.accent_soft, p.accent_border))
+        } else {
+            None
+        };
+        let badge_reserve = if let Some((lbl, fg, bg, bd)) = badge_spec {
+            let bw = measure_text_width(hdc, f_bold_sm, lbl) + scale(12, d);
+            draw_pill_badge(
+                hdc,
+                f_bold_sm,
+                lbl,
+                r_row.right - scale(7, d) - bw,
+                row_cy,
+                scale(18, d),
+                scale(12, d),
+                fg,
+                bg,
+                bd,
+                d,
+            );
+            bw + scale(12, d)
+        } else {
+            scale(8, d)
+        };
+
+        let tx_l = r_row.left + scale(27, d);
+        let tx_r = r_row.right - badge_reserve;
+        draw_text_line(
+            hdc,
+            f_name,
+            &acc.display_name,
+            RECT {
+                left: tx_l,
+                top: r_row.top + scale(3, d),
+                right: tx_r,
+                bottom: r_row.top + scale(20, d),
+            },
+            p.text,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+        let sub_txt = if acc.has_remark {
+            format!("{} · {}", acc.masked_student_id, acc.carrier_label)
+        } else {
+            acc.carrier_label.to_string()
+        };
+        draw_text_line(
+            hdc,
+            f_sm,
+            &sub_txt,
+            RECT {
+                left: tx_l,
+                top: r_row.top + scale(19, d),
+                right: tx_r,
+                bottom: r_row.bottom - scale(3, d),
+            },
+            p.text_muted,
+            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+        );
+
+        state.hits.push(HitBox {
+            target: HitTarget::SelectAccount(idx),
+            rect: r_row,
+        });
+        cy_top += row_h;
+    }
+
+    draw_thin_line(
+        hdc,
+        inner_l + scale(2, d),
+        inner_r - scale(2, d),
+        cy_top + sep_space / 2,
+        p.divider,
+    );
+    cy_top += sep_space;
+
+    let r_manage = RECT {
+        left: inner_l,
+        top: cy_top,
+        right: inner_r,
+        bottom: cy_top + manage_h,
+    };
+    let manage_hov = state.hovered == Some(HitTarget::ManageAccounts);
+    if manage_hov {
+        fill_round_rect(hdc, r_manage, scale(8, d), p.btn_hover, p.btn_hover);
+    }
+    let m_cy = (r_manage.top + r_manage.bottom) / 2;
+    let m_fg = if manage_hov { p.accent } else { p.text_sec };
+    draw_plus_icon(hdc, r_manage.left + scale(14, d), m_cy, d, m_fg);
+    draw_text_line(
+        hdc,
+        f_bold_sm,
+        "管理 / 添加账号…",
+        RECT {
+            left: r_manage.left + scale(27, d),
+            top: r_manage.top,
+            right: r_manage.right - scale(8, d),
+            bottom: r_manage.bottom,
+        },
+        m_fg,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+    state.hits.push(HitBox {
+        target: HitTarget::ManageAccounts,
+        rect: r_manage,
+    });
+
+    state.hits.push(HitBox {
+        target: HitTarget::DismissOverlay,
+        rect: RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        },
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_campus_vpn_modal_overlay(
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    mut pixels: Option<&mut [u8]>,
+    state: &mut FlyoutState,
+    w: i32,
+    h: i32,
+    f_title: windows_sys::Win32::Graphics::Gdi::HFONT,
+    f_body: windows_sys::Win32::Graphics::Gdi::HFONT,
+    f_bold_sm: windows_sys::Win32::Graphics::Gdi::HFONT,
+) {
+    let Some(target) = state.vpn_confirm_target.clone() else {
+        return;
+    };
+    let d = state.dpi;
+    let p = state.palette;
+
+    // 全幅压暗背景遮罩
+    dim_bgra_rect(
+        pixels.as_deref_mut(),
+        w,
+        h,
+        RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        },
+        if p.dark { 72 } else { 142 },
+    );
+
+    let card_l = scale(14, d);
+    let card_r = w - scale(14, d);
+    let pad_x = scale(14, d);
+    let pad_y = scale(13, d);
+    let body_w = (card_r - card_l) - pad_x * 2;
+    let target_desc = if target.display_name.trim() == "校园网" {
+        "「校园网」出口".to_string()
+    } else {
+        format!("「{}」（校园网出口）", target.display_name)
+    };
+    let body_text = format!(
+        "即将切换至{target_desc}。切换前请务必先关闭本机 VPN、代理软件（如 Clash / Mihomo / v2rayN）或游戏加速器，避免触发校园网安全监测导致账号被封禁！"
+    );
+    let body_h = measure_wrapped_height(hdc, f_body, &body_text, body_w).max(scale(52, d));
+    let hdr_h = scale(26, d);
+    let btn_h = scale(28, d);
+    let card_h = pad_y + hdr_h + scale(8, d) + body_h + scale(12, d) + btn_h + pad_y;
+    let card_top = ((h - card_h) / 2).max(scale(12, d));
+    let card_rect = RECT {
+        left: card_l,
+        top: card_top,
+        right: card_r,
+        bottom: (card_top + card_h).min(h - scale(12, d)),
+    };
+
+    draw_soft_shadow(pixels, w, h, card_rect, d, p.dark);
+
+    let card_bg = if p.dark {
+        rgb(0x21, 0x26, 0x31)
+    } else {
+        rgb(0xFF, 0xFF, 0xFF)
+    };
+    fill_round_rect(hdc, card_rect, scale(14, d), card_bg, p.warn_border);
+
+    let inner_l = card_rect.left + pad_x;
+    let inner_r = card_rect.right - pad_x;
+    let mut cy = card_rect.top + pad_y;
+
+    let badge_s = scale(26, d);
+    let badge_r = RECT {
+        left: inner_l,
+        top: cy,
+        right: inner_l + badge_s,
+        bottom: cy + badge_s,
+    };
+    fill_round_rect(hdc, badge_r, scale(8, d), p.warn_soft, p.warn_border);
+    draw_shield_alert_icon(hdc, inner_l + badge_s / 2, cy + badge_s / 2, d, p.warn);
+    draw_text_line(
+        hdc,
+        f_title,
+        "切换至校园网出口安全提醒",
+        RECT {
+            left: badge_r.right + scale(9, d),
+            top: cy,
+            right: inner_r,
+            bottom: cy + badge_s,
+        },
+        p.text,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+    cy += hdr_h + scale(8, d);
+
+    draw_text_line(
+        hdc,
+        f_body,
+        &body_text,
+        RECT {
+            left: inner_l,
+            top: cy,
+            right: inner_r,
+            bottom: cy + body_h + scale(4, d),
+        },
+        p.text_sec,
+        DT_LEFT | DT_WORDBREAK_FLAG | DT_NOPREFIX,
+    );
+
+    let btn_y = card_rect.bottom - pad_y - btn_h;
+    let confirm_lbl = "已关闭 VPN，继续切换";
+    let confirm_w = measure_text_width(hdc, f_bold_sm, confirm_lbl) + scale(22, d);
+    let r_confirm = RECT {
+        left: inner_r - confirm_w,
+        top: btn_y,
+        right: inner_r,
+        bottom: btn_y + btn_h,
+    };
+    let confirm_hov = state.hovered == Some(HitTarget::ConfirmVpnSwitch);
+    let confirm_bg = if confirm_hov {
+        p.accent_hover
+    } else {
+        p.accent
+    };
+    fill_round_rect(hdc, r_confirm, scale(8, d), confirm_bg, confirm_bg);
+    draw_text_line(
+        hdc,
+        f_bold_sm,
+        confirm_lbl,
+        r_confirm,
+        rgb(0xFF, 0xFF, 0xFF),
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+
+    let cancel_lbl = "取消";
+    let cancel_w = measure_text_width(hdc, f_body, cancel_lbl) + scale(22, d);
+    let r_cancel = RECT {
+        left: r_confirm.left - scale(8, d) - cancel_w,
+        top: btn_y,
+        right: r_confirm.left - scale(8, d),
+        bottom: btn_y + btn_h,
+    };
+    let cancel_hov = state.hovered == Some(HitTarget::CancelVpnSwitch);
+    fill_round_rect(
+        hdc,
+        r_cancel,
+        scale(8, d),
+        if cancel_hov { p.btn_hover } else { p.btn_bg },
+        p.btn_border,
+    );
+    draw_text_line(
+        hdc,
+        f_body,
+        cancel_lbl,
+        r_cancel,
+        if cancel_hov { p.text } else { p.text_sec },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+
+    state.hits.clear();
+    state.hits.push(HitBox {
+        target: HitTarget::ConfirmVpnSwitch,
+        rect: r_confirm,
+    });
+    state.hits.push(HitBox {
+        target: HitTarget::CancelVpnSwitch,
+        rect: r_cancel,
+    });
+}
+
+fn dim_bgra_rect(pixels: Option<&mut [u8]>, w: i32, h: i32, rect: RECT, factor: u32) {
+    let Some(buf) = pixels else {
+        return;
+    };
+    unsafe {
+        GdiFlush();
+    }
+    let x0 = rect.left.clamp(0, w);
+    let x1 = rect.right.clamp(0, w);
+    let y0 = rect.top.clamp(0, h);
+    let y1 = rect.bottom.clamp(0, h);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let stride = (w as usize) * 4;
+    for py in y0 as usize..y1 as usize {
+        let row = &mut buf[py * stride..(py + 1) * stride];
+        for px in x0 as usize..x1 as usize {
+            let i = px * 4;
+            row[i] = ((row[i] as u32 * factor) >> 8) as u8;
+            row[i + 1] = ((row[i + 1] as u32 * factor) >> 8) as u8;
+            row[i + 2] = ((row[i + 2] as u32 * factor) >> 8) as u8;
+            row[i + 3] = 255;
+        }
+    }
+}
+
+fn dim_bgra_round_rect(
+    pixels: Option<&mut [u8]>,
+    w: i32,
+    h: i32,
+    rect: RECT,
+    radius: i32,
+    factor: u32,
+) {
+    let Some(buf) = pixels else {
+        return;
+    };
+    unsafe {
+        GdiFlush();
+    }
+    let x0 = rect.left.clamp(0, w);
+    let x1 = rect.right.clamp(0, w);
+    let y0 = rect.top.clamp(0, h);
+    let y1 = rect.bottom.clamp(0, h);
+    if x0 >= x1 || y0 >= y1 {
+        return;
+    }
+    let rad = radius.max(0);
+    let r2 = rad * rad;
+    let stride = (w as usize) * 4;
+    for py in y0..y1 {
+        let dy = if py < rect.top + rad {
+            rect.top + rad - py
+        } else if py >= rect.bottom - rad {
+            py - (rect.bottom - rad - 1)
+        } else {
+            0
+        };
+        let row = &mut buf[(py as usize) * stride..((py as usize) + 1) * stride];
+        for px in x0..x1 {
+            if dy > 0 {
+                let dx = if px < rect.left + rad {
+                    rect.left + rad - px
+                } else if px >= rect.right - rad {
+                    px - (rect.right - rad - 1)
+                } else {
+                    0
+                };
+                if dx > 0 && dx * dx + dy * dy > r2 {
+                    continue;
+                }
+            }
+            let i = (px as usize) * 4;
+            row[i] = ((row[i] as u32 * factor) >> 8) as u8;
+            row[i + 1] = ((row[i + 1] as u32 * factor) >> 8) as u8;
+            row[i + 2] = ((row[i + 2] as u32 * factor) >> 8) as u8;
+            row[i + 3] = 255;
+        }
+    }
+}
+
+fn draw_soft_shadow(mut pixels: Option<&mut [u8]>, w: i32, h: i32, r: RECT, d: u32, dark: bool) {
+    let outer = RECT {
+        left: r.left - scale(3, d),
+        top: r.top + scale(2, d),
+        right: r.right + scale(3, d),
+        bottom: r.bottom + scale(6, d),
+    };
+    let inner = RECT {
+        left: r.left - scale(1, d),
+        top: r.top + scale(1, d),
+        right: r.right + scale(1, d),
+        bottom: r.bottom + scale(3, d),
+    };
+    dim_bgra_round_rect(
+        pixels.as_deref_mut(),
+        w,
+        h,
+        outer,
+        scale(9, d),
+        if dark { 165 } else { 222 },
+    );
+    dim_bgra_round_rect(
+        pixels,
+        w,
+        h,
+        inner,
+        scale(7, d),
+        if dark { 135 } else { 205 },
+    );
+}
+
+unsafe fn draw_thin_line(
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    left: i32,
+    right: i32,
+    y: i32,
+    color: COLORREF,
+) {
+    let pen = CreatePen(PS_SOLID, 1, color);
+    let old = SelectObject(hdc, pen);
+    MoveToEx(hdc, left, y, null_mut());
+    LineTo(hdc, right, y);
+    SelectObject(hdc, old);
+    DeleteObject(pen);
+}
+
+unsafe fn draw_user_icon(
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    cx: i32,
+    cy: i32,
+    d: u32,
+    color: COLORREF,
+) {
+    let stroke = scale(1, d).max(1);
+    let pen = CreatePen(PS_SOLID, stroke, color);
+    let null_b = windows_sys::Win32::Graphics::Gdi::GetStockObject(NULL_BRUSH);
+    let old_p = SelectObject(hdc, pen);
+    let old_b = SelectObject(hdc, null_b);
+
+    let hr = scale(2, d).max(2);
+    let hcy = cy - scale(2, d) - stroke / 2;
+    Ellipse(hdc, cx - hr, hcy - hr, cx + hr + 1, hcy + hr + 1);
+
+    let sx = scale(5, d);
+    let sy_bot = cy + scale(4, d);
+    let sy_mid = cy + scale(2, d);
+    let sy_top = cy + scale(1, d);
+    MoveToEx(hdc, cx - sx, sy_bot, null_mut());
+    LineTo(hdc, cx - scale(3, d), sy_mid);
+    LineTo(hdc, cx - scale(1, d), sy_top);
+    LineTo(hdc, cx + scale(1, d), sy_top);
+    LineTo(hdc, cx + scale(3, d), sy_mid);
+    LineTo(hdc, cx + sx, sy_bot);
+
+    SelectObject(hdc, old_b);
+    SelectObject(hdc, old_p);
+    DeleteObject(pen);
+}
+
+unsafe fn draw_chevron_icon(
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    cx: i32,
+    cy: i32,
+    up: bool,
+    d: u32,
+    color: COLORREF,
+) {
+    let stroke = scale(1, d).max(1);
+    let pen = CreatePen(PS_SOLID, stroke, color);
+    let old_p = SelectObject(hdc, pen);
+    let dx = scale(3, d).max(3);
+    let dy = scale(2, d).max(2);
+    if up {
+        MoveToEx(hdc, cx - dx, cy + dy / 2, null_mut());
+        LineTo(hdc, cx, cy - dy);
+        LineTo(hdc, cx + dx + 1, cy + dy / 2 + 1);
+    } else {
+        MoveToEx(hdc, cx - dx, cy - dy / 2, null_mut());
+        LineTo(hdc, cx, cy + dy);
+        LineTo(hdc, cx + dx + 1, cy - dy / 2 - 1);
+    }
+    SelectObject(hdc, old_p);
+    DeleteObject(pen);
+}
+
+unsafe fn draw_check_icon(
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    cx: i32,
+    cy: i32,
+    d: u32,
+    color: COLORREF,
+) {
+    let stroke = scale(2, d).max(1);
+    let pen = CreatePen(PS_SOLID, stroke, color);
+    let old_p = SelectObject(hdc, pen);
+    MoveToEx(hdc, cx - scale(4, d), cy, null_mut());
+    LineTo(hdc, cx - scale(1, d), cy + scale(3, d));
+    LineTo(hdc, cx + scale(5, d), cy - scale(3, d));
+    SelectObject(hdc, old_p);
+    DeleteObject(pen);
+}
+
+unsafe fn draw_plus_icon(
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    cx: i32,
+    cy: i32,
+    d: u32,
+    color: COLORREF,
+) {
+    let stroke = scale(1, d).max(1);
+    let pen = CreatePen(PS_SOLID, stroke, color);
+    let old_p = SelectObject(hdc, pen);
+    let r = scale(4, d).max(3);
+    MoveToEx(hdc, cx - r, cy, null_mut());
+    LineTo(hdc, cx + r + 1, cy);
+    MoveToEx(hdc, cx, cy - r, null_mut());
+    LineTo(hdc, cx, cy + r + 1);
+    SelectObject(hdc, old_p);
+    DeleteObject(pen);
+}
+
+unsafe fn draw_shield_alert_icon(
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    cx: i32,
+    cy: i32,
+    d: u32,
+    color: COLORREF,
+) {
+    let stroke = scale(1, d).max(1);
+    let pen = CreatePen(PS_SOLID, stroke, color);
+    let old_p = SelectObject(hdc, pen);
+    let top = cy - scale(6, d);
+    let sh_y = cy - scale(4, d);
+    let mid_y = cy + scale(1, d);
+    let low_y = cy + scale(4, d);
+    let bot = cy + scale(7, d);
+    let w_top = scale(5, d);
+    let w_mid = scale(5, d);
+    let w_low = scale(3, d);
+
+    MoveToEx(hdc, cx, top, null_mut());
+    LineTo(hdc, cx + w_top, sh_y);
+    LineTo(hdc, cx + w_mid, mid_y);
+    LineTo(hdc, cx + w_low, low_y);
+    LineTo(hdc, cx, bot);
+    LineTo(hdc, cx - w_low, low_y);
+    LineTo(hdc, cx - w_mid, mid_y);
+    LineTo(hdc, cx - w_top, sh_y);
+    LineTo(hdc, cx, top);
+
+    // 盾牌中心感叹号
+    MoveToEx(hdc, cx, cy - scale(3, d), null_mut());
+    LineTo(hdc, cx, cy + scale(2, d));
+    SelectObject(hdc, old_p);
+    DeleteObject(pen);
+    fill_circle(hdc, cx, cy + scale(4, d) - 1, stroke.max(1), color, color);
+}
+
+unsafe fn measure_wrapped_height(
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    font: windows_sys::Win32::Graphics::Gdi::HFONT,
+    text: &str,
+    width: i32,
+) -> i32 {
+    const DT_CALCRECT: u32 = 0x0000_0400;
+    let old = SelectObject(hdc, font);
+    let mut r = RECT {
+        left: 0,
+        top: 0,
+        right: width.max(40),
+        bottom: 0,
+    };
+    let wide: Vec<u16> = text.encode_utf16().collect();
+    DrawTextW(
+        hdc,
+        wide.as_ptr(),
+        wide.len() as i32,
+        &mut r,
+        DT_CALCRECT | DT_WORDBREAK_FLAG | DT_NOPREFIX,
+    );
+    SelectObject(hdc, old);
+    r.bottom - r.top
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2285,7 +3314,7 @@ fn detect_dark_mode(app_dir: &Path) -> bool {
 
 fn carrier_name(carrier: &str) -> &'static str {
     match carrier {
-        "0" => "校园用户",
+        "0" => "校园网",
         "1" => "中国电信",
         "2" => "中国联通",
         "3" => "中国移动",
@@ -2512,13 +3541,17 @@ mod tests {
             Some(now - 6960),
             &TrafficSummary::default(),
             &ss,
-            "DEMO",
+            "联通宽带",
             "2",
             FlyoutTrafficMode::Carrier,
             &pts,
             TimeRange::H7,
         );
         assert_eq!(carrier_m.status_title, "校园网已连接");
+        assert!(carrier_m.has_account);
+        assert_eq!(carrier_m.chip_name, "联通宽带");
+        assert_eq!(carrier_m.chip_carrier, "中国联通");
+        assert!(carrier_m.header_fault_sub.is_empty());
         assert!(carrier_m.traffic_hero.contains("GB"));
         assert_eq!(carrier_m.devices.len(), 2);
         assert_eq!(carrier_m.slots.len(), 36);
@@ -2535,9 +3568,25 @@ mod tests {
             &pts,
             TimeRange::H7,
         );
+        assert_eq!(campus_m.chip_carrier, "校园网");
         assert_eq!(campus_m.traffic_hero, "540.1 GB");
         assert!(campus_m.traffic_sub.contains("99.9%"));
         assert!(campus_m.traffic_foot_right.contains("本科-计科"));
+
+        let same_name_m = build_flyout_model(
+            &pal,
+            Some(&snap),
+            Some(now - 6960),
+            &TrafficSummary::default(),
+            &ss,
+            "校园网",
+            "0",
+            FlyoutTrafficMode::Campus,
+            &pts,
+            TimeRange::H7,
+        );
+        assert_eq!(same_name_m.chip_name, "校园网");
+        assert_eq!(same_name_m.chip_carrier, "");
 
         // Optional GDI visual QA dump when GXNU_FLYOUT_QA_DIR is set
         if let Ok(dir) = std::env::var("GXNU_FLYOUT_QA_DIR") {
@@ -2547,15 +3596,38 @@ mod tests {
                 &out_dir.join("flyout-dark.bgra"),
                 true,
                 FlyoutTrafficMode::Carrier,
-                false,
+                true,
+                SnapshotOverlay::None,
+            );
+            render_gdi_snapshot(
+                &out_dir.join("flyout-dropdown.bgra"),
+                true,
+                FlyoutTrafficMode::Carrier,
+                true,
+                SnapshotOverlay::Dropdown,
+            );
+            render_gdi_snapshot(
+                &out_dir.join("flyout-vpn-modal.bgra"),
+                true,
+                FlyoutTrafficMode::Carrier,
+                true,
+                SnapshotOverlay::VpnModal,
             );
             render_gdi_snapshot(
                 &out_dir.join("flyout-light.bgra"),
                 false,
                 FlyoutTrafficMode::Campus,
                 true,
+                SnapshotOverlay::None,
             );
         }
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum SnapshotOverlay {
+        None,
+        Dropdown,
+        VpnModal,
     }
 
     fn render_gdi_snapshot(
@@ -2563,31 +3635,68 @@ mod tests {
         dark: bool,
         mode: FlyoutTrafficMode,
         two_devices: bool,
+        overlay: SnapshotOverlay,
     ) {
-        use windows_sys::Win32::Graphics::Gdi::{
-            CreateDIBSection, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS,
-        };
         let now = Local::now().timestamp();
         let snap = sample_snapshot(now);
         let ss = sample_self_service(now, two_devices);
         let pts = sample_telemetry(now);
         let pal = FlyoutPalette::of(dark);
+        let acct_name = if mode == FlyoutTrafficMode::Campus {
+            "校园网"
+        } else {
+            "联通宽带"
+        };
+        let carrier_code = if mode == FlyoutTrafficMode::Campus {
+            "0"
+        } else {
+            "2"
+        };
         let model = build_flyout_model(
             &pal,
             Some(&snap),
             Some(now - 6960),
             &TrafficSummary::default(),
             &ss,
-            "DEMO",
-            if mode == FlyoutTrafficMode::Campus {
-                "0"
-            } else {
-                "2"
-            },
+            acct_name,
+            carrier_code,
             mode,
             &pts,
             TimeRange::H7,
         );
+        let mock_accounts = vec![
+            FlyoutAccountItem {
+                id: "acc-unicom".into(),
+                display_name: "联通宽带".into(),
+                masked_student_id: "2024***".into(),
+                has_remark: true,
+                carrier: "2".into(),
+                carrier_label: "中国联通",
+                is_active: mode == FlyoutTrafficMode::Carrier,
+                has_cred: true,
+            },
+            FlyoutAccountItem {
+                id: "acc-campus".into(),
+                display_name: "校园网备用".into(),
+                masked_student_id: "2024***".into(),
+                has_remark: true,
+                carrier: "0".into(),
+                carrier_label: "校园网",
+                is_active: mode == FlyoutTrafficMode::Campus,
+                has_cred: true,
+            },
+            FlyoutAccountItem {
+                id: "acc-lab".into(),
+                display_name: "实验室电信".into(),
+                masked_student_id: "2023***".into(),
+                has_remark: true,
+                carrier: "1".into(),
+                carrier_label: "中国电信",
+                is_active: false,
+                has_cred: false,
+            },
+        ];
+        let vpn_target = (overlay == SnapshotOverlay::VpnModal).then(|| mock_accounts[1].clone());
         let dpi: u32 = 144;
         let tmp_dir = std::env::temp_dir().join("gxnu_flyout_qa_dummy");
         let mut state = FlyoutState {
@@ -2597,23 +3706,29 @@ mod tests {
                 online_since_unix: Arc::new(Mutex::new(Some(now - 6960))),
                 latest_traffic: Arc::new(Mutex::new(TrafficSummary::default())),
                 latest_self_service: Arc::new(Mutex::new(ss)),
-                active_account_label: Arc::new(Mutex::new("DEMO".into())),
-                active_carrier: Arc::new(Mutex::new("2".into())),
+                active_account_label: Arc::new(Mutex::new(acct_name.into())),
+                active_carrier: Arc::new(Mutex::new(carrier_code.into())),
                 metrics_store: Arc::new(MetricsStore::new(&tmp_dir)),
             },
             on_action: Arc::new(|_| {}),
             palette: pal,
             traffic_mode: mode,
             traffic_user_override: true,
-            last_carrier: "2".into(),
+            last_account_label: acct_name.into(),
+            last_carrier: carrier_code.into(),
+            accounts: mock_accounts,
+            account_dropdown_open: overlay == SnapshotOverlay::Dropdown,
+            vpn_confirm_target: vpn_target,
             range: TimeRange::H7,
             dpi,
             width_px: scale(326, dpi),
             height_px: 0,
-            hovered: if dark {
-                Some(HitTarget::OpenMain)
-            } else {
-                None
+            anchor_x: None,
+            hovered: match overlay {
+                SnapshotOverlay::Dropdown => Some(HitTarget::SelectAccount(1)),
+                SnapshotOverlay::VpnModal => Some(HitTarget::ConfirmVpnSwitch),
+                SnapshotOverlay::None if dark => Some(HitTarget::AccountChip),
+                SnapshotOverlay::None => None,
             },
             tracking_mouse: false,
             hits: Vec::new(),
@@ -2640,13 +3755,13 @@ mod tests {
             let dib = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
             if !dib.is_null() && !bits.is_null() {
                 let old = SelectObject(mem_dc, dib);
-                draw_flyout_contents(mem_dc, &mut state, w, h);
                 let byte_len = (w * h * 4) as usize;
-                let slice = std::slice::from_raw_parts(bits as *const u8, byte_len);
+                let pixels = std::slice::from_raw_parts_mut(bits as *mut u8, byte_len);
+                draw_flyout_contents(mem_dc, Some(pixels), &mut state, w, h);
                 let mut buf = Vec::with_capacity(8 + byte_len);
                 buf.extend_from_slice(&(w as u32).to_le_bytes());
                 buf.extend_from_slice(&(h as u32).to_le_bytes());
-                buf.extend_from_slice(slice);
+                buf.extend_from_slice(pixels);
                 let _ = std::fs::write(out_path, buf);
                 SelectObject(mem_dc, old);
                 DeleteObject(dib);

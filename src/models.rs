@@ -433,7 +433,7 @@ pub struct AccountProfile {
     /// 用户自定义备注（如「宿舍联通」「实验室电信」），界面优先显示备注。
     pub remark: String,
     pub student_id: String,
-    /// 运营商编码：`"0"` 校园用户 / `"1"` 电信 / `"2"` 联通 / `"3"` 移动。
+    /// 运营商编码：`"0"` 校园网 / `"1"` 电信 / `"2"` 联通 / `"3"` 移动。
     pub carrier: String,
     /// 可选月流量提醒上限（GB）；`0` 表示不限制（默认，适合运营商免计费出口）。
     pub monthly_quota_gb: i64,

@@ -6,11 +6,13 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, TrayIcon, TrayIconBuilder, 
 
 use crate::models::{MonitorSnapshot, MonitorState};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TrayAction {
     ToggleFlyout,
     OpenMenu,
     Show,
+    OpenAccountSettings,
+    SwitchAccount(String),
     Start,
     Pause,
     Check,

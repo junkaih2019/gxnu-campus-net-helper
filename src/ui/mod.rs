@@ -117,17 +117,17 @@ struct AccountPreverifyJob {
     also_save_global: bool,
 }
 
-/// 选择或切换到「校园用户（校园网）」出口时的 VPN 防封禁居中模态提醒框。
+/// 选择或切换到「校园网」出口时的 VPN 防封禁居中模态提醒框。
 #[derive(Debug, Clone)]
 enum CampusVpnModal {
-    /// 在设置页点击选择「校园用户」出口时的即时提醒。
+    /// 在设置页点击选择「校园网」出口时的即时提醒。
     CarrierSelected,
-    /// 在主页或设置列表点击切换到某个「校园用户」账号前的确认拦截。
+    /// 在主页或设置列表点击切换到某个「校园网」账号前的确认拦截。
     ConfirmSwitch {
         account_id: String,
         display_name: String,
     },
-    /// 保存并启用某个「校园用户」账号前的确认拦截（若点选出口时已确认过则不重复弹出）。
+    /// 保存并启用某个「校园网」账号前的确认拦截（若点选出口时已确认过则不重复弹出）。
     ConfirmSave {
         also_save_global: bool,
         force_skip_verify: bool,
@@ -941,6 +941,19 @@ impl GuardApp {
             };
             self.finish_command(pending, Err(message.into()));
         }
+        if self.ipc.open_account_settings.swap(false, Ordering::AcqRel) {
+            self.settings = self.store.load();
+            self.refresh_account_creds();
+            self.account_menu_open = false;
+            self.view = AppView::Settings;
+            self.form.tab = settings_page::SettingsTab::Account;
+            if !self.form.is_account_draft_dirty(&self.settings) {
+                if let Some(active) = self.settings.active_account().cloned() {
+                    self.form.load_account_draft(&active);
+                }
+            }
+        }
+
         while let Ok(env) = self.snapshots.try_recv() {
             let snapshot = env.snapshot;
             self.online_since_unix = env.online_since_unix;
@@ -950,10 +963,21 @@ impl GuardApp {
             if !env.active_account_id.is_empty()
                 && env.active_account_id != self.settings.active_account_id
             {
-                let _ = self.settings.switch_active_account(&env.active_account_id);
+                if self
+                    .settings
+                    .switch_active_account(&env.active_account_id)
+                    .is_err()
+                {
+                    self.settings = self.store.load();
+                }
                 self.traffic_view_user_override = false;
                 self.traffic_view_mode =
                     TrafficViewMode::default_for_carrier(&self.settings.carrier);
+                if !self.form.is_account_draft_dirty(&self.settings) {
+                    if let Some(active) = self.settings.active_account().cloned() {
+                        self.form.load_account_draft(&active);
+                    }
+                }
             } else if !self.traffic_view_user_override {
                 self.traffic_view_mode =
                     TrafficViewMode::default_for_carrier(&self.settings.carrier);
@@ -1605,22 +1629,29 @@ impl GuardApp {
 
         let (title, body, primary_lbl, has_cancel) = match &modal {
             CampusVpnModal::CarrierSelected => (
-                "「校园用户」出口防封提醒",
-                "您已选择「校园用户（校园网）」出口。使用校园网出口联网时，请务必先关闭本机 VPN、代理软件（如 Clash / Mihomo / v2rayN）或游戏加速器，避免触发校园网安全监测导致账号被封禁！".to_string(),
+                "「校园网」出口防封提醒",
+                "您已选择「校园网」出口。使用校园网出口联网时，请务必先关闭本机 VPN、代理软件（如 Clash / Mihomo / v2rayN）或游戏加速器，避免触发校园网安全监测导致账号被封禁！".to_string(),
                 "我知道了",
                 false,
             ),
-            CampusVpnModal::ConfirmSwitch { display_name, .. } => (
-                "切换至校园网出口安全提醒",
-                format!(
-                    "即将切换至「{display_name}」（校园用户出口）。切换前请确认已关闭本机 VPN、代理软件（如 Clash / Mihomo / v2rayN）或游戏加速器，避免触发校园网安全监测导致账号被封禁！"
-                ),
-                "已关闭 VPN，继续切换",
-                true,
-            ),
+            CampusVpnModal::ConfirmSwitch { display_name, .. } => {
+                let target_desc = if display_name.trim() == "校园网" {
+                    "「校园网」出口".to_string()
+                } else {
+                    format!("「{display_name}」（校园网出口）")
+                };
+                (
+                    "切换至校园网出口安全提醒",
+                    format!(
+                        "即将切换至{target_desc}。切换前请确认已关闭本机 VPN、代理软件（如 Clash / Mihomo / v2rayN）或游戏加速器，避免触发校园网安全监测导致账号被封禁！"
+                    ),
+                    "已关闭 VPN，继续切换",
+                    true,
+                )
+            }
             CampusVpnModal::ConfirmSave { .. } => (
                 "启用校园网出口安全提醒",
-                "即将保存并启用「校园用户（校园网）」出口。连接前请确认已关闭本机 VPN、代理软件（如 Clash / Mihomo / v2rayN）或游戏加速器，避免触发校园网安全监测导致账号被封禁！".to_string(),
+                "即将保存并启用「校园网」出口。连接前请确认已关闭本机 VPN、代理软件（如 Clash / Mihomo / v2rayN）或游戏加速器，避免触发校园网安全监测导致账号被封禁！".to_string(),
                 "已关闭 VPN，继续保存",
                 true,
             ),
@@ -2136,7 +2167,7 @@ fn draw_account_chip(
             ..Default::default()
         },
     );
-    if has_account {
+    if has_account && display_name.trim() != carrier {
         job.append(
             &format!(" · {carrier}"),
             0.0,

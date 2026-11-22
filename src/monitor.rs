@@ -1784,6 +1784,7 @@ mod tests {
         let opened = Arc::new(AtomicUsize::new(0));
         let shows = Arc::clone(&opened);
         let commands = crate::DaemonCommands {
+            main_tid: 0,
             store: crate::config::SettingsStore {
                 app_dir: dir.into(),
                 path: path.clone(),
@@ -1803,7 +1804,7 @@ mod tests {
                 Arc::new(|_, _| None),
                 Arc::new(|_| {}),
             )),
-            show_ui: Box::new(move || {
+            show_ui: Box::new(move |_| {
                 shows.fetch_add(1, Ordering::SeqCst);
                 Ok(())
             }),

@@ -43,6 +43,7 @@ pub enum DaemonToUi {
     Snapshot(Box<SnapshotEnvelope>),
     LogLine { line: String },
     CommandResult { id: u64, result: Result<(), String> },
+    OpenAccountSettings,
     Shutdown,
 }
 
@@ -223,6 +224,13 @@ impl IpcServer {
             .broadcast(DaemonToUi::LogLine { line });
     }
 
+    pub fn broadcast_open_account_settings(&self) {
+        self.subscribers
+            .lock()
+            .unwrap()
+            .broadcast(DaemonToUi::OpenAccountSettings);
+    }
+
     pub fn broadcast_shutdown(&self) {
         let mut hub = self.subscribers.lock().unwrap();
         if hub.closed {
@@ -327,6 +335,7 @@ pub struct IpcClient {
     pub replies: Receiver<(u64, Result<(), String>)>,
     pub daemon_closed: Arc<AtomicBool>,
     pub connection_lost: Arc<AtomicBool>,
+    pub open_account_settings: Arc<AtomicBool>,
 }
 
 impl IpcClient {
@@ -355,10 +364,12 @@ impl IpcClient {
         let (snap_tx, snap_rx) = mpsc::channel::<SnapshotEnvelope>();
         let (log_tx, log_rx) = mpsc::channel::<String>();
         let daemon_closed = Arc::new(AtomicBool::new(false));
+        let open_account_settings = Arc::new(AtomicBool::new(false));
         let (reply_tx, replies) = mpsc::channel();
         let connection_lost = Arc::new(AtomicBool::new(false));
         let lost_ref = Arc::clone(&connection_lost);
         let closed_ref = Arc::clone(&daemon_closed);
+        let open_acct_ref = Arc::clone(&open_account_settings);
 
         std::thread::Builder::new()
             .name("ipc-ui-reader".to_string())
@@ -384,6 +395,9 @@ impl IpcClient {
                                     DaemonToUi::CommandResult { id, result } => {
                                         let _ = reply_tx.send((id, result));
                                     }
+                                    DaemonToUi::OpenAccountSettings => {
+                                        open_acct_ref.store(true, Ordering::Release);
+                                    }
                                     DaemonToUi::Shutdown => {
                                         closed_ref.store(true, Ordering::SeqCst);
                                         break;
@@ -403,6 +417,7 @@ impl IpcClient {
                 replies,
                 daemon_closed,
                 connection_lost,
+                open_account_settings,
             },
             snap_rx,
             log_rx,

@@ -617,7 +617,7 @@ unsafe extern "system" fn menu_wnd_proc(
             let mx = (lparam & 0xFFFF) as i16 as i32;
             let my = ((lparam >> 16) & 0xFFFF) as i16 as i32;
             if let Some(idx) = hit_test(&state.items, mx, my) {
-                let action = state.items[idx].action;
+                let action = state.items[idx].action.clone();
                 ShowWindow(hwnd, SW_HIDE);
                 let cb = Arc::clone(&state.on_action);
                 cb(action);

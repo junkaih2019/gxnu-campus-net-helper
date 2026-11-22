@@ -327,7 +327,7 @@ pub fn translate_drcom_message(raw: &str) -> String {
         return "运营商宽带账号已绑定其他端口或位置".to_string();
     }
     if lower.contains("oppp error: can't find user") || lower == "bind userid error" {
-        return "未绑定该运营商宽带，请检查运营商是否选错（电信/联通/移动/校园用户）".to_string();
+        return "未绑定该运营商宽带，请检查运营商是否选错（电信/联通/移动/校园网）".to_string();
     }
     if lower.contains("oppp error: timeout") {
         return "运营商宽带状态异常（可能欠费停机或运营商响应超时）".to_string();

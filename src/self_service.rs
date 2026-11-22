@@ -1394,7 +1394,7 @@ mod tests {
         .unwrap();
         assert!(msg.contains("未见并发挤线"));
 
-        // 2. 校园用户且剩余流量 0 -> 离线诊断精准报流量耗尽
+        // 2. 校园网出口且剩余流量 0 -> 离线诊断精准报流量耗尽
         let (warn, msg) = build_trigger_diagnosis(
             &FetchTrigger::LoginRejected {
                 local_campus_ip: "192.0.2.1".into(),

@@ -531,8 +531,10 @@ fn run_daemon(
     let action_log_path = log_path.clone();
     let endpoint = ipc_server.endpoint().clone();
     let child = Arc::clone(&ui_child);
+    let ipc_for_show = Arc::clone(&ipc_server);
     let app_dir = store.app_dir.clone();
     let commands = Arc::new(Mutex::new(DaemonCommands {
+        main_tid,
         control: monitor_ctrl.clone(),
         store,
         notifier,
@@ -543,7 +545,9 @@ fn run_daemon(
         traffic_tracker: Arc::clone(&traffic_tracker),
         latest_traffic: Arc::clone(&latest_traffic),
         self_service: Arc::clone(&self_service_mgr),
-        show_ui: Box::new(move || show_or_spawn_ui(&child, &endpoint)),
+        show_ui: Box::new(move |open_account_settings| {
+            show_or_spawn_ui(&child, &endpoint, &ipc_for_show, open_account_settings)
+        }),
     }));
     if settings.auto_start_monitoring {
         if let Err(err) = commands.lock().unwrap().apply(ipc::UiToDaemon::Start) {
@@ -570,6 +574,18 @@ fn run_daemon(
                 return post_thread_msg(main_tid, WM_TRAY_TOGGLE_FLYOUT)
             }
             tray::TrayAction::Show => ipc::UiToDaemon::ShowUi,
+            tray::TrayAction::OpenAccountSettings => {
+                if let Err(err) = tray_commands.lock().unwrap().open_account_settings() {
+                    logging::warn(&format!("[COMMAND_FAILED] {err}"));
+                }
+                return;
+            }
+            tray::TrayAction::SwitchAccount(account_id) => {
+                if let Err(err) = tray_commands.lock().unwrap().switch_from_tray(&account_id) {
+                    logging::warn(&format!("[ACCOUNT_SWITCH_FAILED] {err}"));
+                }
+                return;
+            }
             tray::TrayAction::Start => ipc::UiToDaemon::Start,
             tray::TrayAction::Pause => ipc::UiToDaemon::Pause,
             tray::TrayAction::Check => ipc::UiToDaemon::ForceCheck,
@@ -671,6 +687,7 @@ fn run_daemon(
 }
 
 struct DaemonCommands {
+    main_tid: u32,
     control: monitor::MonitorControl,
     store: config::SettingsStore,
     notifier: Arc<Mutex<notify::ToastNotifier>>,
@@ -681,7 +698,7 @@ struct DaemonCommands {
     traffic_tracker: Arc<Mutex<traffic::TrafficTracker>>,
     latest_traffic: Arc<Mutex<models::TrafficSummary>>,
     self_service: Arc<self_service::SelfServiceManager>,
-    show_ui: Box<dyn Fn() -> Result<(), String> + Send + Sync>,
+    show_ui: Box<dyn Fn(bool) -> Result<(), String> + Send + Sync>,
 }
 
 impl DaemonCommands {
@@ -703,6 +720,40 @@ impl DaemonCommands {
         *self.latest_traffic.lock().unwrap() = refreshed;
         self.self_service
             .sync_account(acct_id, &settings.student_id, &settings.carrier);
+    }
+
+    fn open_account_settings(&self) -> Result<(), String> {
+        (self.show_ui)(true)?;
+        self.self_service
+            .trigger(self_service::FetchTrigger::UiOpen);
+        Ok(())
+    }
+
+    fn switch_from_tray(&self, account_id: &str) -> Result<(), String> {
+        let mut settings = self.store.load();
+        if settings.active_account_id == account_id {
+            return Ok(());
+        }
+        let target = settings.switch_active_account(account_id)?;
+        if !credentials::has_credential_for(&target.id, &target.student_id) {
+            let _ = self.open_account_settings();
+            return Err(format!(
+                "账号「{}」尚未保存密码，已打开设置页供补充",
+                target.display_name()
+            ));
+        }
+        self.store.save_settings(&settings)?;
+        let label = settings.active_display_name();
+        self.sync_active_account_state(&settings);
+        self.self_service.notify_account_switching();
+        self.control.switch_account(settings)?;
+        if self.main_tid != 0 {
+            post_thread_msg(self.main_tid, WM_TRAY_REFRESH);
+        }
+        logging::info(&format!(
+            "[ACCOUNT_SWITCH] 托盘快捷浮窗开始切换至账号「{label}」"
+        ));
+        Ok(())
     }
 
     fn apply(&self, cmd: ipc::UiToDaemon) -> Result<(), String> {
@@ -773,7 +824,7 @@ impl DaemonCommands {
                 ));
             }
             ShowUi => {
-                (self.show_ui)()?;
+                (self.show_ui)(false)?;
                 self.self_service
                     .trigger(self_service::FetchTrigger::UiOpen);
             }
@@ -873,12 +924,17 @@ fn run_ui_process(args: &[String]) -> ExitCode {
 fn show_or_spawn_ui(
     ui_child: &Arc<Mutex<Option<Child>>>,
     endpoint: &ipc::DaemonEndpoint,
+    ipc_server: &ipc::IpcServer,
+    open_account_settings: bool,
 ) -> Result<(), String> {
     let mut guard = ui_child.lock().map_err(|_| "无法访问界面进程状态")?;
     if let Some(child) = guard.as_mut() {
         match child.try_wait() {
             Ok(None) => {
-                // 界面进程仍在运行：直接前置恢复窗口
+                // 界面进程仍在运行：可选通知切到账号设置页，并直接前置恢复窗口
+                if open_account_settings {
+                    ipc_server.broadcast_open_account_settings();
+                }
                 bring_pid_window_to_front(child.id());
                 return Ok(());
             }
@@ -889,16 +945,19 @@ fn show_or_spawn_ui(
     }
 
     let exe = std::env::current_exe().map_err(|e| format!("无法定位程序：{e}"))?;
-    let child = std::process::Command::new(exe)
-        .args([
-            "--ui",
-            "--ipc-port",
-            &endpoint.port.to_string(),
-            "--ipc-token",
-            &endpoint.token,
-        ])
-        .spawn()
-        .map_err(|e| format!("打开主界面失败：{e}"))?;
+    let mut cmd = std::process::Command::new(exe);
+    cmd.args([
+        "--ui",
+        "--ipc-port",
+        &endpoint.port.to_string(),
+        "--ipc-token",
+        &endpoint.token,
+    ]);
+    if open_account_settings {
+        cmd.env("GXNU_VIEW", "settings")
+            .env("GXNU_SETTINGS_TAB", "account");
+    }
+    let child = cmd.spawn().map_err(|e| format!("打开主界面失败：{e}"))?;
     *guard = Some(child);
     Ok(())
 }

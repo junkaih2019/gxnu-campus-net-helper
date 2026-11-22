@@ -624,7 +624,7 @@ pub fn status_short(state: Option<MonitorState>) -> &'static str {
 
 pub fn carrier_label(carrier: &str) -> &'static str {
     match carrier {
-        "0" => "校园用户",
+        "0" => "校园网",
         "1" => "中国电信",
         "2" => "中国联通",
         "3" => "中国移动",
