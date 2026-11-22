@@ -54,7 +54,7 @@ impl CampusStatusProbe {
     pub fn measure_rtt_and_ip(&self) -> Option<(u64, Option<String>)> {
         let url = format!("{}?callback=dr1002&v=4532&lang=zh", self.url);
         let started = Instant::now();
-        match http::get(&self.agent, &url) {
+        match http::get_portal(&self.agent, &url) {
             Ok(response) if (200..300).contains(&response.status) => {
                 let detail = parse_chkstatus_detail(&response.body)?;
                 Some((
@@ -74,7 +74,7 @@ impl CampusStatusProbe {
     /// 返回门户在线状态以及门户侧识别到的真实校园网 IPv4。
     pub fn check_detail(&self) -> Option<CampusStatusInfo> {
         let url = format!("{}?callback=dr1002&v=4532&lang=zh", self.url);
-        match http::get(&self.agent, &url) {
+        match http::get_portal(&self.agent, &url) {
             Ok(response) => {
                 let detail = (200..300)
                     .contains(&response.status)
@@ -101,10 +101,7 @@ impl CampusStatusProbe {
                 detail
             }
             Err(err) => {
-                logging::info(&format!(
-                    "[CAMPUS_STATUS] 无法查询门户在线状态：{}",
-                    err.as_str()
-                ));
+                logging::info(&format!("[CAMPUS_STATUS] 无法查询门户在线状态：{err}"));
                 None
             }
         }

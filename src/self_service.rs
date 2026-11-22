@@ -33,6 +33,7 @@ const DASHBOARD: &str = "http://172.16.4.2/Self/dashboard";
 const SESSION_IMAGE: &str = "http://172.16.4.2/Self/login/randomCode";
 const ONLINE_LOG_PAGE: &str = "http://172.16.4.2/Self/bill/userOnlineLog";
 const ONLINE_LOG_API: &str = "http://172.16.4.2/Self/bill/getUserOnlineLog";
+const PAGE_BODY_LIMIT: usize = 512 * 1024;
 
 pub const CACHE_TTL_SECS: i64 = 5 * 60;
 pub const MANUAL_THROTTLE_SECS: i64 = 15;
@@ -45,10 +46,20 @@ pub enum PortalError {
     UnsupportedPassword,
     AuthFailed(String),
     Unreachable(String),
-    ParseError(String),
+    ParseError(PageError),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PageError {
+    Invalid(String),
+    TooLarge(String),
 }
 
 impl PortalError {
+    fn invalid_page(message: impl Into<String>) -> Self {
+        Self::ParseError(PageError::Invalid(message.into()))
+    }
+
     pub fn status(&self) -> SelfServiceStatus {
         match self {
             Self::CaptchaRequired => SelfServiceStatus::CaptchaCooldown,
@@ -62,7 +73,9 @@ impl PortalError {
         match self {
             Self::CaptchaRequired => "门户要求验证码，已暂停自动同步".to_string(),
             Self::UnsupportedPassword => "密码含非单字节字符，暂不支持自助服务同步".to_string(),
-            Self::AuthFailed(msg) | Self::Unreachable(msg) | Self::ParseError(msg) => msg.clone(),
+            Self::AuthFailed(msg)
+            | Self::Unreachable(msg)
+            | Self::ParseError(PageError::Invalid(msg) | PageError::TooLarge(msg)) => msg.clone(),
         }
     }
 }
@@ -89,8 +102,8 @@ pub fn fetch_snapshot(credential: &StoredCredential) -> Result<SelfServiceData, 
     let fetched_at_unix = Local::now().timestamp();
 
     // 优先查询本月上网明细接口（包含运营商实际上下行流量）；失败时平滑回退到首页近期记录。
-    let recent_sessions = match fetch_month_online_log(&agent) {
-        Ok((sessions, summary_down, summary_up, summary_count)) => {
+    let recent_sessions = match optional_page(fetch_month_online_log(&agent))? {
+        Some((sessions, summary_down, summary_up, summary_count)) => {
             if let Some(d) = summary_down {
                 if d > traffic_info.month_down_mb {
                     traffic_info.month_down_mb = d;
@@ -104,7 +117,7 @@ pub fn fetch_snapshot(credential: &StoredCredential) -> Result<SelfServiceData, 
             traffic_info.month_session_count = summary_count;
             sessions
         }
-        Err(_) => fetch_dashboard_history_fallback(&agent).unwrap_or_default(),
+        None => optional_page(fetch_dashboard_history_fallback(&agent))?.unwrap_or_default(),
     };
 
     Ok(SelfServiceData {
@@ -147,9 +160,9 @@ fn login_handshake_with_urls(
     session_image_url: &str,
 ) -> Result<(), PortalError> {
     let response = checked_response("打开自助服务", agent.get(entry_url).call())?;
-    require_entry_redirect(&response, dash_url, "打开自助服务")?;
+    require_entry_redirect(response, dash_url, "打开自助服务")?;
     let response = checked_response("打开账户首页", agent.get(dash_url).call())?;
-    require_entry_redirect(&response, login_url, "打开账户首页")?;
+    require_entry_redirect(response, login_url, "打开账户首页")?;
 
     let page = get_page(agent, login_url, "打开登录表单")?;
     let checkcode = parse_login_page_for(&page, login_url, verify_url)?;
@@ -168,7 +181,7 @@ fn login_handshake_with_urls(
             image.status()
         )));
     }
-    drop(image);
+    http::drain_small_body(image);
 
     // 兼容用户误在学号栏附带 `@ctc` / `@unicom` 等运营商后缀的情况：自助服务仅识别纯学号
     let clean_account = credential
@@ -203,10 +216,10 @@ fn login_handshake_with_urls(
             ]),
     )?;
     if matches!(response.status(), 200) {
-        let body = response.into_string().unwrap_or_default();
+        let body = read_page_body(response, "提交登录")?;
         return Err(classify_verify_failure_page(&body));
     }
-    verify_login_redirect_for(agent, &response, dash_url)
+    verify_login_redirect_for(agent, response, dash_url)
 }
 
 /// 轻量严格解析登录表单：校验 `action`、确认 `#randomDiv` 隐藏、提取隐藏 `checkcode` 与 `var md5 = true;`。
@@ -256,17 +269,14 @@ fn parse_login_page_for(
     }
 
     if !form_ok {
-        return Err(PortalError::ParseError(
-            "自助服务登录表单地址与预期不符".into(),
-        ));
+        return Err(PortalError::invalid_page("自助服务登录表单地址与预期不符"));
     }
     if !random_div_hidden {
         return Err(PortalError::CaptchaRequired);
     }
-    let checkcode =
-        checkcode.ok_or_else(|| PortalError::ParseError("登录表单缺少 checkcode".into()))?;
+    let checkcode = checkcode.ok_or_else(|| PortalError::invalid_page("登录表单缺少 checkcode"))?;
     if !page.contains("var md5 = true;") {
-        return Err(PortalError::ParseError("登录页密码处理方式已变化".into()));
+        return Err(PortalError::invalid_page("登录页密码处理方式已变化"));
     }
     Ok(checkcode)
 }
@@ -321,8 +331,8 @@ fn parse_dashboard_account(page: &str) -> Result<(SelfServiceTraffic, Option<u32
             return Ok((traffic_info, max_online));
         }
     }
-    Err(PortalError::ParseError(
-        "门户首页缺少已用流量或可用流量字段".into(),
+    Err(PortalError::invalid_page(
+        "门户首页缺少已用流量或可用流量字段",
     ))
 }
 
@@ -437,7 +447,7 @@ fn kick_ip_sessions_with_base(
         "读取待注销设备列表",
     )?;
     let raw: Vec<RawOnlineSession> = serde_json::from_str(&list_body)
-        .map_err(|_| PortalError::ParseError("读取待注销设备列表时收到无法识别的数据".into()))?;
+        .map_err(|_| PortalError::invalid_page("读取待注销设备列表时收到无法识别的数据"))?;
 
     let matched: Vec<RawOnlineSession> = raw
         .into_iter()
@@ -463,7 +473,7 @@ fn kick_ip_sessions_with_base(
                 ("mac", clean_mac.as_str()),
             ],
         )
-        .map_err(|e| PortalError::ParseError(format!("构造注销地址失败：{e}")))?;
+        .map_err(|e| PortalError::invalid_page(format!("构造注销地址失败：{e}")))?;
 
         let resp = checked_response(
             "提交设备注销请求",
@@ -477,7 +487,7 @@ fn kick_ip_sessions_with_base(
             last_err = Some(format!("服务端返回 HTTP {}", resp.status()));
             continue;
         }
-        let body = resp.into_string().unwrap_or_default();
+        let body = optional_page(read_page_body(resp, "提交设备注销请求"))?.unwrap_or_default();
         match serde_json::from_str::<RawToOfflineReply>(&body) {
             Ok(rep) if rep.success => {
                 kicked += 1;
@@ -558,15 +568,13 @@ fn fetch_month_online_log(agent: &Agent) -> Result<OnlineLogBundle, PortalError>
             response.status()
         )));
     }
-    let body = response
-        .into_string()
-        .map_err(|_| PortalError::ParseError("无法读取上网记录明细响应".into()))?;
+    let body = read_page_body(response, "读取上网记录明细")?;
     parse_month_online_log(&body)
 }
 
 fn parse_month_online_log(body: &str) -> Result<OnlineLogBundle, PortalError> {
     let parsed: RawOnlineLogResponse = serde_json::from_str(body)
-        .map_err(|_| PortalError::ParseError("上网记录明细 JSON 格式无法识别".into()))?;
+        .map_err(|_| PortalError::invalid_page("上网记录明细 JSON 格式无法识别"))?;
     let mut sessions: Vec<RecentSession> = parsed
         .rows
         .into_iter()
@@ -647,7 +655,7 @@ fn dashboard_json<T: DeserializeOwned>(
 ) -> Result<T, PortalError> {
     let body = get_page(agent, &format!("{DASHBOARD}/{endpoint}"), stage)?;
     serde_json::from_str(&body)
-        .map_err(|_| PortalError::ParseError(format!("{stage}时收到无法识别的数据")))
+        .map_err(|_| PortalError::invalid_page(format!("{stage}时收到无法识别的数据")))
 }
 
 fn checked_response(
@@ -674,9 +682,25 @@ fn get_page(agent: &Agent, url: &str, stage: &str) -> Result<String, PortalError
             response.status()
         )));
     }
-    response
-        .into_string()
-        .map_err(|_| PortalError::ParseError(format!("{stage}无法读取响应正文")))
+    read_page_body(response, stage)
+}
+
+fn read_page_body(response: Response, stage: &str) -> Result<String, PortalError> {
+    http::read_text(response, PAGE_BODY_LIMIT).map_err(|err| match err {
+        http::HttpError::BodyTooLarge(_) => {
+            PortalError::ParseError(PageError::TooLarge(format!("{stage}：{err}")))
+        }
+        _ => PortalError::invalid_page(format!("{stage}无法读取响应正文（{err}）")),
+    })
+}
+
+/// 可选页面读取失败时沿用已有回退，超限时将具体阶段和上限交给调用方。
+fn optional_page<T>(result: Result<T, PortalError>) -> Result<Option<T>, PortalError> {
+    match result {
+        Ok(value) => Ok(Some(value)),
+        Err(err @ PortalError::ParseError(PageError::TooLarge(_))) => Err(err),
+        Err(_) => Ok(None),
+    }
 }
 
 fn matches_destination(base: &str, destination: &str, expected: &str) -> bool {
@@ -691,7 +715,7 @@ fn matches_destination(base: &str, destination: &str, expected: &str) -> bool {
 }
 
 fn require_entry_redirect(
-    response: &Response,
+    response: Response,
     expected: &str,
     stage: &str,
 ) -> Result<(), PortalError> {
@@ -703,19 +727,21 @@ fn require_entry_redirect(
             "{stage}被重定向到非预期地址，请确认已连入师大校园内网且未开全局代理"
         )));
     }
+    http::drain_small_body(response);
     Ok(())
 }
 
 /// 校验 `POST /Self/login/verify` 后的重定向目标，将跳回登录页、强制改密页等场景直接翻译为大白话中文。
 fn verify_login_redirect_for(
     agent: &Agent,
-    response: &Response,
+    response: Response,
     dash_url: &str,
 ) -> Result<(), PortalError> {
     let status = response.status();
     let destination = response.header("Location").unwrap_or_default();
     if matches!(status, 302 | 303) && matches_destination(response.get_url(), destination, dash_url)
     {
+        http::drain_small_body(response);
         return Ok(());
     }
 
@@ -724,7 +750,9 @@ fn verify_login_redirect_for(
         if is_login_page_destination(response.get_url(), destination) {
             if let Ok(login_url) = Url::parse(response.get_url()).and_then(|u| u.join(destination))
             {
-                if let Ok(login_html) = get_page(agent, login_url.as_str(), "读取登录失败原因")
+                http::drain_small_body(response);
+                if let Some(login_html) =
+                    optional_page(get_page(agent, login_url.as_str(), "读取登录失败原因"))?
                 {
                     return Err(classify_verify_failure_page(&login_html));
                 }
@@ -1484,6 +1512,35 @@ fn build_trigger_diagnosis(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunked_dashboard_accepts_the_limit_and_reports_one_extra_byte() {
+        use std::io::Write;
+        for extra in [0, 1] {
+            let (base, server) = http::mock::serve(move |stream| {
+                let mut body = br#"<script>(function(){})({"useFlow":1,"leftFlow":8,"userGroup":{"ipMaxCount":3}});</script>"#.to_vec();
+                body.resize(PAGE_BODY_LIMIT + extra, b' ');
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                    body.len()
+                )
+                .unwrap();
+                stream.write_all(&body).unwrap();
+                let _ = stream.write_all(b"\r\n0\r\n\r\n");
+            });
+            let result = get_page(&http::no_redirect_agent(5), &base, "读取账户首页");
+            if extra == 0 {
+                let (traffic, devices) = parse_dashboard_account(&result.unwrap()).unwrap();
+                assert_eq!((traffic.campus_remaining_mb, devices), (8.0, Some(3)));
+            } else {
+                let err = optional_page(result).unwrap_err();
+                assert_eq!(err.status(), SelfServiceStatus::Unreachable);
+                assert_eq!(err.summary(), "读取账户首页：响应正文超过 524288 字节上限");
+            }
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn parse_login_page_extracts_checkcode_and_detects_captcha() {

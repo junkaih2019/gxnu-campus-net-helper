@@ -18,6 +18,7 @@ use chrono::Local;
 use serde::{Deserialize, Serialize};
 use url::Url;
 
+use crate::http;
 use crate::logging;
 use crate::models::{ReleaseInfo, UpdateState, UpdateStatus};
 
@@ -30,6 +31,7 @@ pub const GITHUB_REPO_WEB: &str = "https://github.com/junkaih2019/gxnu-campus-ne
 pub const GITHUB_RELEASES_PAGE: &str =
     "https://github.com/junkaih2019/gxnu-campus-net-helper/releases";
 const GITHUB_API_BASE: &str = "https://api.github.com/repos/junkaih2019/gxnu-campus-net-helper";
+const UPDATE_METADATA_LIMIT: usize = 256 * 1024;
 
 /// 后台静默自动检查周期：12 小时。
 const AUTO_CHECK_INTERVAL_SECS: i64 = 12 * 3600;
@@ -448,7 +450,7 @@ fn check_for_updates_with_bases(
         {
             Ok(resp) if resp.status() == 200 => {
                 saw_network_ok = true;
-                if let Ok(raw_body) = resp.into_string() {
+                if let Ok(raw_body) = http::read_text(resp, UPDATE_METADATA_LIMIT) {
                     let body = raw_body.trim_start_matches('\u{feff}');
                     if let Ok(manifest) = serde_json::from_str::<LatestManifest>(body) {
                         if let Some(info) = release_from_manifest(
@@ -519,9 +521,8 @@ fn check_for_updates_with_bases(
             .call()
         {
             Ok(resp) if resp.status() == 200 => {
-                let body = resp
-                    .into_string()
-                    .map_err(|_| "读取 GitHub Release 响应失败".to_string())?;
+                let body = http::read_text(resp, UPDATE_METADATA_LIMIT)
+                    .map_err(|err| format!("读取 GitHub Release 响应失败：{err}"))?;
                 let parsed: GithubApiRelease = serde_json::from_str(&body)
                     .map_err(|_| "解析 GitHub Release 元数据失败".to_string())?;
                 if parsed.draft || parsed.prerelease {
@@ -1363,6 +1364,29 @@ mod tests {
         assert_eq!(fs::read(&target).unwrap(), b"MZ-new-binary");
         assert_eq!(fs::read(&old_path).unwrap(), b"MZ-old-binary");
         assert!(!staged.exists());
+    }
+
+    #[test]
+    fn oversized_manifest_falls_back_and_oversized_release_api_reports_limit() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            // The manifest would say the installed version is current if only its prefix were parsed.
+            let manifest = r#"{"version":"1.0.0","download_url":"https://github.com/fixture"}"#;
+            let responses = [
+                format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{manifest}{}", " ".repeat(UPDATE_METADATA_LIMIT)),
+                "HTTP/1.1 302 Found\r\nLocation: /releases/tag/v2.0.0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", UPDATE_METADATA_LIMIT + 1),
+            ];
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                http::mock::read_request(&mut stream);
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        let error = check_for_updates_with_bases("1.0.0", &base, &base, true).unwrap_err();
+        assert!(error.contains("262144 字节上限"), "{error}");
+        server.join().unwrap();
     }
 
     #[test]

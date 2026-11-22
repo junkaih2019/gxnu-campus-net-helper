@@ -29,6 +29,8 @@ pub const DEFAULT_PROBES: &[ProbeTarget] = &[
     },
 ];
 
+const PROBE_TEXT_LIMIT: usize = 4 * 1024;
+
 /// 只用来做路由决策，不发包。
 const ROUTE_PROBE_IP: Ipv4Addr = Ipv4Addr::new(223, 5, 5, 5);
 
@@ -45,30 +47,35 @@ pub(crate) enum RoutePath {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProbeKind {
     Ok,
-    Unexpected,
-    HttpStatus,
-    Dns,
-    Timeout,
-    Error,
+    Unexpected(u16),
+    HttpStatus(u16),
+    Error(HttpError),
 }
 
 impl ProbeKind {
     fn as_str(self) -> &'static str {
         match self {
             Self::Ok => "ok",
-            Self::Unexpected => "unexpected",
-            Self::HttpStatus => "http_status",
-            Self::Dns => "dns",
-            Self::Timeout => "timeout",
-            Self::Error => "error",
+            Self::Unexpected(_) => "unexpected",
+            Self::HttpStatus(_) => "http_status",
+            Self::Error(HttpError::Dns) => "dns",
+            Self::Error(HttpError::Timeout) => "timeout",
+            Self::Error(_) => "error",
+        }
+    }
+
+    fn note(self) -> String {
+        match self {
+            Self::Ok => String::new(),
+            Self::Unexpected(status) | Self::HttpStatus(status) => format!("HTTP {status}"),
+            Self::Error(error) => error.as_str().into(),
         }
     }
 }
 
 struct ProbeOutcome {
     kind: ProbeKind,
-    note: String,
-    hostname: String,
+    hostname: &'static str,
 }
 
 struct ProbeRequest {
@@ -236,7 +243,7 @@ impl NetworkDiagnostics {
             String::new()
         };
         if let Some(ok) = outcomes.iter().find(|o| o.kind == ProbeKind::Ok) {
-            evidence.push(("probe".into(), ok.hostname.clone()));
+            evidence.push(("probe".into(), ok.hostname.into()));
             return finish(
                 DiagnosticResult::new(true, DisconnectReason::Online, "公网连接正常")
                     .with_ip(local_ip.to_string(), gateway_text),
@@ -244,8 +251,13 @@ impl NetworkDiagnostics {
             );
         }
 
-        let dns_only = !outcomes.is_empty() && outcomes.iter().all(|o| o.kind == ProbeKind::Dns);
-        let captive = outcomes.iter().any(|o| o.kind == ProbeKind::Unexpected);
+        let dns_only = !outcomes.is_empty()
+            && outcomes
+                .iter()
+                .all(|o| o.kind == ProbeKind::Error(HttpError::Dns));
+        let captive = outcomes
+            .iter()
+            .any(|o| matches!(o.kind, ProbeKind::Unexpected(_)));
         let mut gateway_reachable = None;
         if routed_gateway && !dns_only && !captive {
             gateway_reachable = gateway_ping_fn(gateway);
@@ -303,7 +315,9 @@ impl NetworkDiagnostics {
             .authenticatable(true),
             None if gateway_reachable == Some(true)
                 && !outcomes.is_empty()
-                && outcomes.iter().all(|o| o.kind == ProbeKind::Timeout) =>
+                && outcomes
+                    .iter()
+                    .all(|o| o.kind == ProbeKind::Error(HttpError::Timeout)) =>
             {
                 DiagnosticResult::new(false, DisconnectReason::InternetTimeout, "公网探测均超时")
                     .authenticatable(true)
@@ -343,12 +357,7 @@ impl NetworkDiagnostics {
                 } else {
                     format!("probe_{}", outcome.hostname)
                 };
-                let value = if outcome.note.is_empty() {
-                    outcome.kind.as_str().to_string()
-                } else {
-                    outcome.note.clone()
-                };
-                evidence.push((key, value));
+                evidence.push((key, outcome.kind.note()));
             }
         }
         outcomes
@@ -383,40 +392,38 @@ fn probe_once(agent: &ureq::Agent, target: &ProbeTarget) -> ProbeOutcome {
         .split("://")
         .nth(1)
         .and_then(|rest| rest.split('/').next())
-        .unwrap_or("")
-        .to_string();
-    match http::get(agent, target.url) {
-        Ok(response) => {
-            let mut expected = response.status == 200;
-            if let Some(text) = target.expect_text {
-                expected = expected && response.body.contains(text);
-            }
-            ProbeOutcome {
-                kind: if expected {
-                    ProbeKind::Ok
-                } else if (200..400).contains(&response.status) || response.status == 511 {
-                    ProbeKind::Unexpected
-                } else {
-                    ProbeKind::HttpStatus
-                },
-                note: if expected {
-                    String::new()
-                } else {
-                    format!("HTTP {}", response.status)
-                },
-                hostname,
-            }
-        }
-        Err(err) => ProbeOutcome {
-            kind: match err {
-                HttpError::Timeout => ProbeKind::Timeout,
-                HttpError::Dns => ProbeKind::Dns,
-                _ => ProbeKind::Error,
-            },
-            note: err.as_str().to_string(),
-            hostname,
-        },
+        .unwrap_or("");
+    let kind = http::get_response(agent, target.url)
+        .and_then(|response| probe_response(response, target.expect_text))
+        .unwrap_or_else(ProbeKind::Error);
+    ProbeOutcome { kind, hostname }
+}
+
+fn probe_response(
+    response: ureq::Response,
+    expect_text: Option<&str>,
+) -> Result<ProbeKind, HttpError> {
+    let status = response.status();
+    if let (200, Some(text)) = (status, expect_text) {
+        let mut prefix = [0; PROBE_TEXT_LIMIT];
+        let len = http::read_prefix(response.into_reader(), &mut prefix)?;
+        let matched = text.is_empty()
+            || prefix[..len]
+                .windows(text.len())
+                .any(|part| part == text.as_bytes());
+        return Ok(if matched {
+            ProbeKind::Ok
+        } else {
+            ProbeKind::Unexpected(status)
+        });
     }
+
+    http::drain_small_body(response);
+    Ok(match status {
+        200 => ProbeKind::Ok,
+        201..=399 | 511 => ProbeKind::Unexpected(status),
+        _ => ProbeKind::HttpStatus(status),
+    })
 }
 
 fn read_adapters() -> (Vec<String>, Vec<Ipv4Addr>) {
@@ -541,20 +548,12 @@ pub fn log_diagnostic(result: &DiagnosticResult, failures: u32) {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
 
     fn spawn_http_once(response: String) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            if let Ok((mut stream, _)) = listener.accept() {
-                let mut buf = [0u8; 1024];
-                let _ = stream.read(&mut buf);
-                let _ = stream.write_all(response.as_bytes());
-                let _ = stream.flush();
-            }
+        let (base, _) = http::mock::serve(move |stream| {
+            let _ = stream.write_all(response.as_bytes());
         });
-        format!("http://127.0.0.1:{port}/test")
+        format!("{base}/test")
     }
 
     fn http_200(body: &str) -> String {
@@ -563,6 +562,104 @@ mod tests {
             body.len(),
             body
         )
+    }
+
+    #[test]
+    fn chunked_binary_icon_reuses_the_same_connection() {
+        let (base, server) = http::mock::serve(|stream| {
+            let icon = [0xff; http::DRAIN_LIMIT];
+            write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: image/x-icon\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n", icon.len() - 1).unwrap();
+            stream.write_all(&icon[1..]).unwrap();
+            stream.write_all(b"\r\n0\r\n\r\n").unwrap();
+            http::mock::read_request(stream);
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                icon.len()
+            )
+            .unwrap();
+            stream.write_all(&icon).unwrap();
+            http::mock::read_request(stream);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                .unwrap();
+        });
+        let target = ProbeTarget {
+            url: Box::leak(format!("{base}/favicon.ico").into_boxed_str()),
+            expect_text: None,
+        };
+        let agent = http::no_redirect_agent(5);
+        for _ in 0..3 {
+            assert_eq!(probe_once(&agent, &target).kind, ProbeKind::Ok);
+        }
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn probes_close_large_streams_at_their_byte_budget() {
+        for (status, expected_text, sent, kind) in [
+            (200, None, http::DRAIN_LIMIT, ProbeKind::Ok),
+            (
+                511,
+                Some("test"),
+                http::DRAIN_LIMIT,
+                ProbeKind::Unexpected(511),
+            ),
+            (
+                503,
+                Some("test"),
+                http::DRAIN_LIMIT,
+                ProbeKind::HttpStatus(503),
+            ),
+            (
+                200,
+                Some("test"),
+                PROBE_TEXT_LIMIT,
+                ProbeKind::Unexpected(200),
+            ),
+        ] {
+            let (base, server) = http::mock::serve(move |stream| {
+                // Declare a 16 MiB chunk but withhold everything past the client's budget.
+                write!(
+                    stream,
+                    "HTTP/1.1 {status} Mock\r\nTransfer-Encoding: chunked\r\n\r\n1000000\r\n"
+                )
+                .unwrap();
+                stream
+                    .write_all(&[0xff; http::DRAIN_LIMIT][..sent])
+                    .unwrap();
+                match stream.read(&mut [0]) {
+                    Ok(0) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    other => panic!("expected client to drop the unfinished stream, got {other:?}"),
+                }
+            });
+            let target = ProbeTarget {
+                url: Box::leak(format!("{base}/test").into_boxed_str()),
+                expect_text: expected_text,
+            };
+            assert_eq!(probe_once(&http::no_redirect_agent(8), &target).kind, kind);
+            server.join().unwrap();
+        }
+    }
+
+    #[test]
+    fn text_marker_must_fit_entirely_in_the_prefix() {
+        let marker = "Microsoft Connect Test";
+        for (end, kind) in [
+            (PROBE_TEXT_LIMIT, ProbeKind::Ok),
+            (PROBE_TEXT_LIMIT + 1, ProbeKind::Unexpected(200)),
+        ] {
+            let padding = "x".repeat(end - marker.len());
+            // Split the marker over two reads, even when both chunks arrive together.
+            let first = format!("{padding}Microsoft ");
+            let response = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{first}\r\nc\r\nConnect Test\r\n0\r\n\r\n", first.len());
+            let target = ProbeTarget {
+                url: Box::leak(spawn_http_once(response).into_boxed_str()),
+                expect_text: Some(marker),
+            };
+            assert_eq!(probe_once(&http::no_redirect_agent(3), &target).kind, kind);
+        }
     }
 
     #[test]
@@ -577,8 +674,8 @@ mod tests {
             expect_text: None,
         };
         let outcome = probe_once(&agent, &target);
-        assert_eq!(outcome.kind, ProbeKind::Unexpected);
-        assert_eq!(outcome.note, "HTTP 302");
+        assert_eq!(outcome.kind, ProbeKind::Unexpected(302));
+        assert_eq!(outcome.kind.note(), "HTTP 302");
     }
 
     #[test]
@@ -588,14 +685,12 @@ mod tests {
             NetworkDiagnostics::new().with_campus_status(CampusStatusProbe::with_url(portal_url));
         let outcomes = vec![
             ProbeOutcome {
-                kind: ProbeKind::Dns,
-                note: "DnsError".to_string(),
-                hostname: "www.msftconnecttest.com".to_string(),
+                kind: ProbeKind::Error(HttpError::Dns),
+                hostname: "www.msftconnecttest.com",
             },
             ProbeOutcome {
-                kind: ProbeKind::Dns,
-                note: "DnsError".to_string(),
-                hostname: "www.baidu.com".to_string(),
+                kind: ProbeKind::Error(HttpError::Dns),
+                hostname: "www.baidu.com",
             },
         ];
         let res = diag.classify_outcomes(
@@ -617,9 +712,8 @@ mod tests {
         let diag =
             NetworkDiagnostics::new().with_campus_status(CampusStatusProbe::with_url(portal_url));
         let outcomes = vec![ProbeOutcome {
-            kind: ProbeKind::Dns,
-            note: "DnsError".to_string(),
-            hostname: "www.baidu.com".to_string(),
+            kind: ProbeKind::Error(HttpError::Dns),
+            hostname: "www.baidu.com",
         }];
         let res = diag.classify_outcomes(
             &outcomes,
@@ -636,8 +730,12 @@ mod tests {
     #[test]
     fn online_portal_prevents_login_for_redirect_and_public_service_error() {
         for (status, expected) in [
-            ("302 Found", ProbeKind::Unexpected),
-            ("503 Service Unavailable", ProbeKind::HttpStatus),
+            ("302 Found", ProbeKind::Unexpected(302)),
+            (
+                "511 Network Authentication Required",
+                ProbeKind::Unexpected(511),
+            ),
+            ("503 Service Unavailable", ProbeKind::HttpStatus(503)),
         ] {
             let url = spawn_http_once(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n"));
             let probe = probe_once(
@@ -652,9 +750,8 @@ mod tests {
             let diag =
                 NetworkDiagnostics::new().with_campus_status(CampusStatusProbe::with_url(portal));
             let timeout = ProbeOutcome {
-                kind: ProbeKind::Timeout,
-                note: "Timeout".into(),
-                hostname: "mock".into(),
+                kind: ProbeKind::Error(HttpError::Timeout),
+                hostname: "mock",
             };
             let result = diag.classify_outcomes(
                 &[probe, timeout],
@@ -677,17 +774,15 @@ mod tests {
             running.send(()).unwrap();
             gate.recv_timeout(Duration::from_secs(3)).unwrap();
             ProbeOutcome {
-                kind: ProbeKind::Timeout,
-                note: String::new(),
-                hostname: "slow".into(),
+                kind: ProbeKind::Error(HttpError::Timeout),
+                hostname: "slow",
             }
         });
         let fast = probe_worker(move || {
             started.recv_timeout(Duration::from_secs(3)).unwrap();
             ProbeOutcome {
                 kind: ProbeKind::Ok,
-                note: String::new(),
-                hostname: "fast".into(),
+                hostname: "fast",
             }
         });
         let diag = NetworkDiagnostics {
@@ -708,9 +803,8 @@ mod tests {
     fn ordinary_http_error_without_portal_confirmation_never_submits_credentials() {
         let d = NetworkDiagnostics::new();
         let failure = ProbeOutcome {
-            kind: ProbeKind::HttpStatus,
-            note: "HTTP 503".into(),
-            hostname: "mock".into(),
+            kind: ProbeKind::HttpStatus(503),
+            hostname: "mock",
         };
         let status = d.classify_outcomes(
             &[failure],
@@ -739,12 +833,14 @@ mod tests {
         let diag = NetworkDiagnostics::new();
         for (kind, expected) in [
             (ProbeKind::Ok, DisconnectReason::Online),
-            (ProbeKind::Error, DisconnectReason::UplinkUnreachable),
+            (
+                ProbeKind::Error(HttpError::Other),
+                DisconnectReason::UplinkUnreachable,
+            ),
         ] {
             let outcome = ProbeOutcome {
                 kind,
-                hostname: "fixture".into(),
-                note: String::new(),
+                hostname: "fixture",
             };
             let result = diag.classify_outcomes(
                 &[outcome],
@@ -765,9 +861,8 @@ mod tests {
         let diag =
             NetworkDiagnostics::new().with_campus_status(CampusStatusProbe::with_url(portal));
         let failure = ProbeOutcome {
-            kind: ProbeKind::Error,
-            hostname: "fixture".into(),
-            note: String::new(),
+            kind: ProbeKind::Error(HttpError::Other),
+            hostname: "fixture",
         };
         let r = diag.classify_outcomes(
             &[failure],
@@ -782,10 +877,9 @@ mod tests {
 
     #[test]
     fn mixed_dns_and_transport_failures_follow_portal_evidence() {
-        let outcomes = [ProbeKind::Dns, ProbeKind::Error].map(|kind| ProbeOutcome {
-            kind,
-            note: String::new(),
-            hostname: "fixture".into(),
+        let outcomes = [HttpError::Dns, HttpError::Other].map(|error| ProbeOutcome {
+            kind: ProbeKind::Error(error),
+            hostname: "fixture",
         });
         for (reply, reason, can_auth) in [
             (
@@ -817,9 +911,8 @@ mod tests {
     #[test]
     fn public_timeouts_with_unknown_session_require_a_verified_gateway() {
         let outcomes = [ProbeOutcome {
-            kind: ProbeKind::Timeout,
-            note: String::new(),
-            hostname: "fixture".into(),
+            kind: ProbeKind::Error(HttpError::Timeout),
+            hostname: "fixture",
         }];
         let diag = NetworkDiagnostics::new();
         for gateway in [Some(false), None, Some(true)] {
@@ -840,9 +933,8 @@ mod tests {
             .into_iter()
             .map(|hostname| {
                 probe_worker(move || ProbeOutcome {
-                    kind: ProbeKind::Dns,
-                    note: "DNS".into(),
-                    hostname: hostname.into(),
+                    kind: ProbeKind::Error(HttpError::Dns),
+                    hostname,
                 })
             })
             .collect();
@@ -861,6 +953,13 @@ mod tests {
     fn portal_latency_requires_a_successful_recognizable_portal_response() {
         for (response, measured) in [
             (http_200(r#"dr1002({"result":1})"#), true),
+            (
+                http_200(&format!(
+                    r#"dr1002({{"result":1}}){}"#,
+                    " ".repeat(32 * 1024)
+                )),
+                false,
+            ),
             (http_200("<html>error</html>"), false),
             (
                 http_200(r#"dr1002({"result":1})"#).replace("200 OK", "503 Unavailable"),

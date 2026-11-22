@@ -66,7 +66,7 @@ impl CampusAuthenticator {
             "{}?callback=dr1005&jsVersion=4.2.2&v=4532&lang=zh",
             self.logout_url
         );
-        match http::get(&self.agent, &url) {
+        match http::get_portal(&self.agent, &url) {
             Ok(response) => {
                 if !(200..300).contains(&response.status) {
                     return LogoutResult {
@@ -87,7 +87,7 @@ impl CampusAuthenticator {
             }
             Err(err) => LogoutResult {
                 success: false,
-                message: format!("请求注销接口失败：{}", err.as_str()),
+                message: format!("请求注销接口失败：{err}"),
             },
         }
     }
@@ -138,7 +138,7 @@ impl CampusAuthenticator {
         if !begin() {
             return None;
         }
-        Some(match http::get(&self.agent, &url) {
+        Some(match http::get_portal(&self.agent, &url) {
             Ok(response) => {
                 let reply = (200..300)
                     .contains(&response.status)
@@ -164,11 +164,11 @@ impl CampusAuthenticator {
                 }
             }
             Err(err) => {
-                logging::warn(&format!("[PORTAL_ERROR] 认证请求失败：{}", err.as_str()));
+                logging::warn(&format!("[PORTAL_ERROR] 认证请求失败：{err}"));
                 AuthenticationResult {
                     success: false,
                     reason: DisconnectReason::PortalUnavailable,
-                    message: format!("认证服务器请求失败：{}", err.as_str()),
+                    message: format!("认证服务器请求失败：{err}"),
                     code: String::new(),
                 }
             }
@@ -417,6 +417,29 @@ fn sanitize(message: &str, secrets: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_and_logout_report_oversized_jsonp() {
+        use std::io::Write;
+        for logout in [false, true] {
+            let (base, server) = http::mock::serve(|stream| {
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 32769\r\n\r\n")
+                    .unwrap();
+            });
+            let auth = CampusAuthenticator::with_url(format!("{base}/login"));
+            let (success, message) = if logout {
+                let reply = auth.logout();
+                (reply.success, reply.message)
+            } else {
+                let reply = auth.authenticate("fixture", "fixture", "0", "192.0.2.10");
+                (reply.success, reply.message)
+            };
+            assert!(!success);
+            assert!(message.contains("32768 字节上限"), "{message}");
+            server.join().unwrap();
+        }
+    }
 
     #[test]
     fn success_reply_is_parsed() {
