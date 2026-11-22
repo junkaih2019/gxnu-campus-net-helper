@@ -540,19 +540,49 @@ pub fn install_fonts(ctx: &egui::Context) {
         cjk_regular
     };
 
-    // Proportional: 微软雅黑常规体统一渲染中文、英文与数字
+    // 系统 Emoji 矢量回退字体（只读文件映射、零堆拷贝，仅用于补全微软雅黑缺失的 Emoji，不影响中英文基线）
+    let emoji_tweak = egui::FontTweak {
+        scale: 0.94,
+        y_offset_factor: 0.04,
+        ..default_tweak
+    };
+    let emoji_font = if load_with_tweak(
+        &mut fonts,
+        "win-emoji",
+        r"C:\Windows\Fonts\seguiemj.ttf",
+        0,
+        emoji_tweak,
+    ) || load_with_tweak(
+        &mut fonts,
+        "win-emoji",
+        r"C:\Windows\Fonts\seguisym.ttf",
+        0,
+        emoji_tweak,
+    ) {
+        Some("win-emoji")
+    } else {
+        None
+    };
+
+    // Proportional: 微软雅黑常规体统一渲染中文、英文与数字，缺失 Emoji 回退到 Windows Segoe UI Emoji
     let prop = fonts
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default();
+    if let Some(emoji) = emoji_font {
+        prop.insert(0, emoji.to_owned());
+    }
     if let Some(cjk) = cjk_regular {
         prop.insert(0, cjk.to_owned());
     }
 
-    // Bold family: 微软雅黑粗体统一渲染粗体中英文与数字
+    // Bold family: 微软雅黑粗体统一渲染粗体中英文与数字，同样挂载系统 Emoji 回退
     let mut bold_list = Vec::new();
     if let Some(cjk) = cjk_bold {
         bold_list.push(cjk.to_owned());
+    }
+    if let Some(emoji) = emoji_font {
+        bold_list.push(emoji.to_owned());
     }
     if bold_list.is_empty() {
         bold_list = fonts

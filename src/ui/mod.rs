@@ -6,6 +6,7 @@
 mod charts;
 mod icons;
 mod logs;
+mod markdown;
 mod settings;
 mod theme;
 mod widgets;
@@ -270,6 +271,7 @@ pub struct GuardApp {
     recent_sessions_clicked: bool,
     update_state: UpdateState,
     update_modal_open: bool,
+    update_notes_cache: markdown::MarkdownCache,
     pending_manual_update_check: Option<u64>,
     last_check_seq: u64,
     last_check_unix: Option<i64>,
@@ -366,6 +368,11 @@ impl GuardApp {
             egui::TextureOptions::LINEAR,
         );
 
+        let repaint_ctx = cc.egui_ctx.clone();
+        deps.ipc.inbox.set_waker(std::sync::Arc::new(move || {
+            repaint_ctx.request_repaint();
+        }));
+
         let open_update_from_env = std::env::var_os("GXNU_OPEN_UPDATE").is_some();
         let just_updated_from_env = std::env::var_os("GXNU_JUST_UPDATED").is_some();
         let initial_traffic_view = TrafficViewMode::default_for_carrier(&deps.settings.carrier);
@@ -404,6 +411,7 @@ impl GuardApp {
                 ..Default::default()
             },
             update_modal_open: open_update_from_env,
+            update_notes_cache: markdown::MarkdownCache::default(),
             pending_manual_update_check: None,
             last_check_seq: 0,
             last_check_unix: None,
@@ -2280,10 +2288,12 @@ impl GuardApp {
 
     fn draw_update_modal(&mut self, ctx: &egui::Context, p: &Palette) {
         if !self.update_modal_open {
+            self.update_notes_cache.clear();
             return;
         }
         let Some(rel) = self.update_state.release.clone() else {
             self.update_modal_open = false;
+            self.update_notes_cache.clear();
             return;
         };
 
@@ -2309,6 +2319,7 @@ impl GuardApp {
         let mut do_close = false;
         let mut do_skip = false;
         let mut do_open_web = false;
+        let mut clicked_note_url: Option<String> = None;
         if !busy {
             ctx.input(|i| {
                 if i.key_pressed(egui::Key::Escape) {
@@ -2317,11 +2328,29 @@ impl GuardApp {
             });
         }
 
+        let notes_txt = if rel.notes.trim().is_empty() {
+            "包含功能体验优化与稳定性修复，可前往 GitHub Release 查看完整变更。"
+        } else {
+            rel.notes.trim()
+        };
+        let blocks = self.update_notes_cache.blocks_for(notes_txt);
+
+        // 标题右侧轻量元信息（发布日期 · 安装包体积）
+        let mut meta_parts: Vec<String> = Vec::new();
+        if let Some(date) = rel.published_at.get(..10).filter(|d| d.len() == 10) {
+            meta_parts.push(date.to_string());
+        }
+        if let Some(sz) = rel.size_bytes.filter(|&b| b > 0) {
+            meta_parts.push(format!("{:.2} MB", sz as f64 / 1_048_576.0));
+        }
+        let meta_hint = meta_parts.join(" · ");
+
         egui::Area::new(egui::Id::new("auto_update_modal_dialog"))
             .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
             .order(egui::Order::Tooltip)
             .show(ctx, |ui| {
-                let card_w = 432.0_f32.min((screen.width() - 36.0).max(296.0));
+                let card_w = 504.0_f32.min((screen.width() - 36.0).max(320.0));
+                let notes_max_h = (screen.height() * 0.55).clamp(160.0, 340.0);
                 egui::Frame::new()
                     .fill(p.card)
                     .stroke(Stroke::new(1.2_f32, p.accent_border))
@@ -2337,11 +2366,11 @@ impl GuardApp {
                         ui.set_width(card_w);
                         ui.spacing_mut().item_spacing.y = 10.0;
 
-                        // 标题栏
+                        // 标题栏：新版本主标题 + 版本跃迁胶囊 + 发布日期/体积
                         ui.horizontal(|ui| {
                             ui.spacing_mut().item_spacing.x = 9.0;
                             let (badge_r, _) =
-                                ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                                ui.allocate_exact_size(Vec2::splat(30.0), Sense::hover());
                             ui.painter().rect(
                                 badge_r,
                                 CornerRadius::same(8),
@@ -2351,13 +2380,13 @@ impl GuardApp {
                             );
                             icons::paint(
                                 ui.painter(),
-                                badge_r.shrink(6.0),
+                                badge_r.shrink(6.5),
                                 Icon::Download,
                                 p.accent,
                             );
                             ui.label(bold_text(
                                 format!("发现新版本 v{}", rel.version),
-                                14.5,
+                                15.0,
                                 p.text,
                             ));
                             badge(
@@ -2365,37 +2394,38 @@ impl GuardApp {
                                 p.text_muted,
                                 p.subtle,
                                 p.border,
-                                &format!("当前 v{}", crate::VERSION),
+                                &format!("v{} → v{}", crate::VERSION, rel.version),
                             );
+                            if !meta_hint.is_empty() {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(body_text(&meta_hint, 10.5, p.text_muted));
+                                    },
+                                );
+                            }
                         });
 
-                        // 更新说明框
-                        let notes_txt = if rel.notes.trim().is_empty() {
-                            "包含功能体验优化与稳定性修复，可前往 GitHub Release 查看完整变更。"
-                        } else {
-                            rel.notes.trim()
-                        };
+                        // 富文本更新说明框（悬浮细滚动条，支持标题/加粗/行内代码/嵌套列表/引用/链接）
                         egui::Frame::new()
                             .fill(p.subtle)
                             .stroke(Stroke::new(1.0_f32, p.divider))
                             .corner_radius(CornerRadius::same(8))
-                            .inner_margin(egui::Margin::symmetric(12, 9))
+                            .inner_margin(egui::Margin::symmetric(14, 11))
                             .show(ui, |ui| {
-                                ui.set_width(card_w - 24.0);
+                                let inner_w = (card_w - 30.0).max(240.0);
+                                ui.set_width(inner_w);
+                                ui.style_mut().spacing.scroll =
+                                    egui::style::ScrollStyle::floating();
                                 egui::ScrollArea::vertical()
                                     .id_salt("update_release_notes_scroll")
-                                    .max_height(145.0)
+                                    .max_height(notes_max_h)
                                     .auto_shrink([false, true])
                                     .show(ui, |ui| {
-                                        ui.set_width(card_w - 28.0);
-                                        ui.add(
-                                            egui::Label::new(body_text(
-                                                notes_txt,
-                                                11.5,
-                                                p.text_secondary,
-                                            ))
-                                            .wrap(),
-                                        );
+                                        ui.set_width(inner_w);
+                                        if let Some(url) = markdown::draw_markdown(ui, p, blocks) {
+                                            clicked_note_url = Some(url);
+                                        }
                                     });
                             });
 
@@ -2513,6 +2543,9 @@ impl GuardApp {
                     });
             });
 
+        if let Some(url) = clicked_note_url {
+            crate::updater::open_browser_url(&url);
+        }
         if do_open_web {
             let url = if rel.html_url.is_empty() {
                 crate::updater::GITHUB_RELEASES_PAGE
