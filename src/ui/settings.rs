@@ -329,7 +329,7 @@ pub fn draw_settings_view(
                     Stroke::new(1.0_f32, p.border),
                 );
 
-                // 左侧 50px 底部单行低对比度品牌水印（与右侧底部状态栏严格共享同一条水平中线 cy）
+                // 左侧 50px 底部优雅双层英文品牌水印（视觉几何中心锁定 wm_cy，与右侧状态栏严格共轴）
                 let has_new_ver = update_state.has_visible_update(&saved.skipped_update_version);
                 let (wm_rect, wm_resp) = ui.allocate_exact_size(
                     Vec2::new(nav_w, 50.0),
@@ -341,22 +341,34 @@ pub fn draw_settings_view(
                 );
                 ui.painter()
                     .rect_filled(wm_rect, CornerRadius::ZERO, p.sidebar);
+                let wm_cx = wm_rect.center().x;
                 let wm_cy = wm_rect.center().y;
                 let is_dark = p.sidebar.r() < 128;
                 let base_alpha: u8 = if wm_resp.hovered() {
                     if is_dark {
-                        170
+                        172
                     } else {
-                        205
+                        208
                     }
                 } else if is_dark {
-                    128
+                    132
                 } else {
-                    172
+                    174
                 };
-                let sub_alpha: u8 = base_alpha.saturating_sub(24);
-                let wm_icon_c = crate::ui::theme::with_alpha(p.text_muted, sub_alpha);
+                let sub_alpha: u8 = base_alpha.saturating_sub(28);
+                let rule_alpha: u8 = if wm_resp.hovered() {
+                    if is_dark {
+                        78
+                    } else {
+                        132
+                    }
+                } else if is_dark {
+                    52
+                } else {
+                    104
+                };
                 let wm_brand_c = crate::ui::theme::with_alpha(p.text_muted, base_alpha);
+                let wm_rule_c = crate::ui::theme::with_alpha(p.text_muted, rule_alpha);
                 let wm_ver_c = if has_new_ver {
                     crate::ui::theme::with_alpha(
                         p.accent,
@@ -366,42 +378,69 @@ pub fn draw_settings_view(
                     crate::ui::theme::with_alpha(p.text_muted, sub_alpha)
                 };
 
-                let brand_g = ui.painter().layout_no_wrap(
-                    "GXNU 守护助手".to_string(),
-                    egui::FontId::proportional(10.5),
+                let mut brand_g = ui.painter().layout_no_wrap(
+                    "GXNU Campus Net Helper".to_string(),
+                    egui::FontId::proportional(9.8),
                     wm_brand_c,
                 );
+                if brand_g.size().x > nav_w - 16.0 {
+                    brand_g = ui.painter().layout_no_wrap(
+                        "GXNU Campus Net Helper".to_string(),
+                        egui::FontId::proportional(9.0),
+                        wm_brand_c,
+                    );
+                }
                 let ver_label = if has_new_ver {
-                    format!(" · v{} ↑", crate::VERSION)
+                    format!("v{} ↑", crate::VERSION)
                 } else {
-                    format!(" · v{}", crate::VERSION)
+                    format!("v{}", crate::VERSION)
                 };
                 let ver_g = ui.painter().layout_no_wrap(
                     ver_label,
-                    egui::FontId::proportional(10.0),
+                    egui::FontId::proportional(9.2),
                     wm_ver_c,
                 );
-                let ic_sz = 11.5_f32;
-                let ic_gap = 5.0_f32;
-                let total_wm_w = ic_sz + ic_gap + brand_g.size().x + ver_g.size().x;
-                let start_x = (wm_rect.center().x - total_wm_w * 0.5).max(wm_rect.left() + 10.0);
-                let ic_rect = egui::Rect::from_center_size(
-                    egui::Pos2::new(start_x + ic_sz * 0.5, wm_cy),
-                    Vec2::splat(ic_sz),
-                );
-                icons::paint(ui.painter(), ic_rect, Icon::Shield, wm_icon_c);
-                let brand_x = start_x + ic_sz + ic_gap;
-                let ver_x = brand_x + brand_g.size().x;
+
+                let line1_cy = wm_cy - 6.6;
+                let line2_cy = wm_cy + 6.8;
+
                 ui.painter().galley(
-                    egui::Pos2::new(brand_x, wm_cy - brand_g.size().y * 0.5),
+                    egui::Pos2::new(
+                        wm_cx - brand_g.size().x * 0.5,
+                        line1_cy - brand_g.size().y * 0.5,
+                    ),
                     brand_g,
                     wm_brand_c,
                 );
+
+                let ver_half_w = ver_g.size().x * 0.5;
                 ui.painter().galley(
-                    egui::Pos2::new(ver_x, wm_cy - ver_g.size().y * 0.5),
+                    egui::Pos2::new(wm_cx - ver_half_w, line2_cy - ver_g.size().y * 0.5),
                     ver_g,
                     wm_ver_c,
                 );
+
+                // 版本号两侧纤细对称装饰短线，收束倒金字塔水印视觉重心
+                let rule_gap = 6.0_f32;
+                let rule_len = 12.0_f32;
+                if ver_half_w + rule_gap + rule_len < nav_w * 0.5 - 14.0 {
+                    let rule_stroke = Stroke::new(1.0_f32, wm_rule_c);
+                    ui.painter().line_segment(
+                        [
+                            egui::Pos2::new(wm_cx - ver_half_w - rule_gap - rule_len, line2_cy),
+                            egui::Pos2::new(wm_cx - ver_half_w - rule_gap, line2_cy),
+                        ],
+                        rule_stroke,
+                    );
+                    ui.painter().line_segment(
+                        [
+                            egui::Pos2::new(wm_cx + ver_half_w + rule_gap, line2_cy),
+                            egui::Pos2::new(wm_cx + ver_half_w + rule_gap + rule_len, line2_cy),
+                        ],
+                        rule_stroke,
+                    );
+                }
+
                 if has_new_ver {
                     let wm_resp = wm_resp
                         .on_hover_cursor(CursorIcon::PointingHand)
