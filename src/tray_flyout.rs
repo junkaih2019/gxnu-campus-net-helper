@@ -205,6 +205,7 @@ enum HitTarget {
     CheckNow,
     ToggleMonitor,
     OpenMain,
+    Exit,
 }
 
 #[derive(Clone, Copy)]
@@ -537,8 +538,8 @@ fn compute_height_px(state: &FlyoutState) -> i32 {
         0
     };
     // top(13) + hdr(38) + sep(17) + traffic(84) + sep(17) + dev_hdr(22) + gap(6) + dev_list + extra
-    // + sep(17) + stab(56) + sep(17) + foot(28) + bot(12)
-    let logical_h = 13 + 38 + 17 + 84 + 17 + 22 + 6 + dev_list_h + extra_h + 17 + 56 + 17 + 28 + 12;
+    // + sep(17) + stab(56) + footer_top_gap(10) + footer_strip(36)
+    let logical_h = 13 + 38 + 17 + 84 + 17 + 22 + 6 + dev_list_h + extra_h + 17 + 56 + 10 + 36;
     scale(logical_h, d)
 }
 
@@ -1153,6 +1154,11 @@ unsafe extern "system" fn flyout_wnd_proc(
                         ShowWindow(hwnd, SW_HIDE);
                         let cb = Arc::clone(&state.on_action);
                         cb(TrayAction::Show);
+                    }
+                    HitTarget::Exit => {
+                        ShowWindow(hwnd, SW_HIDE);
+                        let cb = Arc::clone(&state.on_action);
+                        cb(TrayAction::Exit);
                     }
                 }
             }
@@ -1841,42 +1847,36 @@ unsafe fn draw_flyout_contents(
         p.text_sec,
         DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
     );
-    y += ruler_h;
+    y += ruler_h + scale(10, d);
 
-    y = draw_divider(hdc, left, right, y, p.divider, d);
+    // ── 5. 底部静谧幽灵文字栏（无框纯文字，悬停浮现柔和圆角矩形轮廓） ──
+    let sep_pen = CreatePen(PS_SOLID, 1, p.divider);
+    let old_pen = SelectObject(hdc, sep_pen);
+    MoveToEx(hdc, 0, y, null_mut());
+    LineTo(hdc, w, y);
+    SelectObject(hdc, old_pen);
+    DeleteObject(sep_pen);
 
-    // ── 5. 底部快捷操作栏（28px） ────────────────────────────────────
-    let btn_h = scale(28, d);
-    let btn_gap = scale(6, d);
-    let avail_btn_w = content_w - btn_gap * 2;
-    let w1 = avail_btn_w * 29 / 100;
-    let w2 = avail_btn_w * 30 / 100;
-    let w3 = avail_btn_w - w1 - w2;
+    let foot_h = h - y;
+    let foot_cy = y + foot_h / 2;
+    let pill_h = scale(24, d);
+    let pad_h = scale(8, d);
+    let btn_gap = scale(4, d);
 
-    let r1 = RECT {
-        left,
-        top: y,
-        right: left + w1,
-        bottom: y + btn_h,
+    // 左侧：立即检测 · 暂停守护
+    let check_lbl = "立即检测";
+    let check_w = measure_text_width(hdc, f_body, check_lbl) + pad_h * 2;
+    let r_check = RECT {
+        left: left - pad_h / 2,
+        top: foot_cy - pill_h / 2,
+        right: left - pad_h / 2 + check_w,
+        bottom: foot_cy + pill_h / 2,
     };
-    let r2 = RECT {
-        left: r1.right + btn_gap,
-        top: y,
-        right: r1.right + btn_gap + w2,
-        bottom: y + btn_h,
-    };
-    let r3 = RECT {
-        left: r2.right + btn_gap,
-        top: y,
-        right: r2.right + btn_gap + w3,
-        bottom: y + btn_h,
-    };
-
-    draw_action_button(
+    draw_ghost_footer_btn(
         hdc,
         f_body,
-        r1,
-        "立即检测",
+        r_check,
+        check_lbl,
         false,
         state.hovered == Some(HitTarget::CheckNow),
         &p,
@@ -1884,7 +1884,7 @@ unsafe fn draw_flyout_contents(
     );
     state.hits.push(HitBox {
         target: HitTarget::CheckNow,
-        rect: r1,
+        rect: r_check,
     });
 
     let toggle_lbl = if state.model.monitoring_enabled {
@@ -1892,10 +1892,17 @@ unsafe fn draw_flyout_contents(
     } else {
         "开始守护"
     };
-    draw_action_button(
+    let toggle_w = measure_text_width(hdc, f_body, toggle_lbl) + pad_h * 2;
+    let r_toggle = RECT {
+        left: r_check.right + btn_gap,
+        top: foot_cy - pill_h / 2,
+        right: r_check.right + btn_gap + toggle_w,
+        bottom: foot_cy + pill_h / 2,
+    };
+    draw_ghost_footer_btn(
         hdc,
         f_body,
-        r2,
+        r_toggle,
         toggle_lbl,
         false,
         state.hovered == Some(HitTarget::ToggleMonitor),
@@ -1904,22 +1911,54 @@ unsafe fn draw_flyout_contents(
     );
     state.hits.push(HitBox {
         target: HitTarget::ToggleMonitor,
-        rect: r2,
+        rect: r_toggle,
     });
 
-    draw_action_button(
+    // 右侧：打开主窗口 · 退出
+    let exit_lbl = "退出";
+    let exit_w = measure_text_width(hdc, f_body, exit_lbl) + pad_h * 2;
+    let r_exit = RECT {
+        left: right + pad_h / 2 - exit_w,
+        top: foot_cy - pill_h / 2,
+        right: right + pad_h / 2,
+        bottom: foot_cy + pill_h / 2,
+    };
+    draw_ghost_footer_btn(
         hdc,
-        f_ip,
-        r3,
-        "打开主界面 →",
+        f_body,
+        r_exit,
+        exit_lbl,
         true,
+        state.hovered == Some(HitTarget::Exit),
+        &p,
+        d,
+    );
+    state.hits.push(HitBox {
+        target: HitTarget::Exit,
+        rect: r_exit,
+    });
+
+    let open_lbl = "打开主窗口";
+    let open_w = measure_text_width(hdc, f_body, open_lbl) + pad_h * 2;
+    let r_open = RECT {
+        left: r_exit.left - btn_gap - open_w,
+        top: foot_cy - pill_h / 2,
+        right: r_exit.left - btn_gap,
+        bottom: foot_cy + pill_h / 2,
+    };
+    draw_ghost_footer_btn(
+        hdc,
+        f_body,
+        r_open,
+        open_lbl,
+        false,
         state.hovered == Some(HitTarget::OpenMain),
         &p,
         d,
     );
     state.hits.push(HitBox {
         target: HitTarget::OpenMain,
-        rect: r3,
+        rect: r_open,
     });
 
     DeleteObject(f_title);
@@ -2001,24 +2040,27 @@ unsafe fn draw_segmented_pair(
 }
 
 #[allow(clippy::too_many_arguments)]
-unsafe fn draw_action_button(
+unsafe fn draw_ghost_footer_btn(
     hdc: windows_sys::Win32::Graphics::Gdi::HDC,
     font: windows_sys::Win32::Graphics::Gdi::HFONT,
     rect: RECT,
     label: &str,
-    primary: bool,
+    danger: bool,
     hovered: bool,
     p: &FlyoutPalette,
     dpi: u32,
 ) {
-    let (bg, bd, fg) = if primary {
-        let fill = if hovered { p.accent_hover } else { p.accent };
-        (fill, fill, rgb(0xFF, 0xFF, 0xFF))
+    let fg = if hovered {
+        if danger {
+            fill_round_rect(hdc, rect, scale(6, dpi), p.danger_soft, p.danger_border);
+            p.danger
+        } else {
+            fill_round_rect(hdc, rect, scale(6, dpi), p.btn_hover, p.btn_hover);
+            p.text
+        }
     } else {
-        let fill = if hovered { p.btn_hover } else { p.btn_bg };
-        (fill, p.btn_border, p.text)
+        p.text_sec
     };
-    fill_round_rect(hdc, rect, scale(6, dpi), bg, bd);
     draw_text_line(
         hdc,
         font,
@@ -2562,7 +2604,11 @@ mod tests {
             dpi,
             width_px: scale(326, dpi),
             height_px: 0,
-            hovered: None,
+            hovered: if dark {
+                Some(HitTarget::OpenMain)
+            } else {
+                None
+            },
             tracking_mouse: false,
             hits: Vec::new(),
             model,
