@@ -9,8 +9,10 @@
 use std::cmp::Ordering;
 use std::fs::{self, File};
 use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -32,6 +34,18 @@ pub const GITHUB_RELEASES_PAGE: &str =
     "https://github.com/junkaih2019/gxnu-campus-net-helper/releases";
 const GITHUB_API_BASE: &str = "https://api.github.com/repos/junkaih2019/gxnu-campus-net-helper";
 const UPDATE_METADATA_LIMIT: usize = 256 * 1024;
+
+/// 元数据检查超时：严格限制单次请求总耗时，避免重定向/多 IP 挂起数十秒。
+const CHECK_CONNECT_DIRECT: Duration = Duration::from_secs(4);
+const CHECK_CONNECT_PROXY: Duration = Duration::from_secs(2);
+const CHECK_READ_TIMEOUT: Duration = Duration::from_secs(5);
+const CHECK_OVERALL_TIMEOUT: Duration = Duration::from_secs(7);
+/// 本地回环代理（如 Clash / Mihomo）存活快检超时：未运行时 200ms 内直接回退直连，避免 Windows 2s SYN 重试。
+const LOOPBACK_PROXY_PROBE_TIMEOUT: Duration = Duration::from_millis(200);
+/// 手动检查时若主通道（GitHub API）超过此阈值未返回，则并行发起 `latest.json` 对冲请求，先到先用。
+const MANUAL_HEDGE_DELAY: Duration = Duration::from_millis(1600);
+/// GitHub API 触发 403/429 限流时的默认冷却时间（15 分钟）。
+const DEFAULT_API_COOLDOWN_SECS: u64 = 15 * 60;
 
 /// 后台静默自动检查周期：12 小时。
 const AUTO_CHECK_INTERVAL_SECS: i64 = 12 * 3600;
@@ -325,7 +339,69 @@ fn normalize_sha256(raw: Option<&str>) -> Option<String> {
     }
 }
 
-// ── 网络客户端构建（支持 Windows 系统代理 + 失败自动回退直连）──────────────────
+// ── 网络客户端构建（代理去重 + 本地代理快检 + 严格总超时 + 路由与连接池复用）──
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RouteKind {
+    Proxy,
+    Direct,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckMode {
+    Auto,
+    Manual,
+}
+
+/// 规范化代理地址：优先 `https=` / `http=` / `socks=`，并将 `https://` 转为 `http://` 以兼容 `ureq::Proxy`。
+fn normalize_proxy_url(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (picked, default_scheme) = if trimmed.contains('=') {
+        let mut https_v = None;
+        let mut http_v = None;
+        let mut socks_v = None;
+        for pair in trimmed.split(';') {
+            let Some((k, v)) = pair.split_once('=') else {
+                continue;
+            };
+            let v = v.trim();
+            if v.is_empty() {
+                continue;
+            }
+            match k.trim().to_ascii_lowercase().as_str() {
+                "https" => https_v = Some(v),
+                "http" => http_v = Some(v),
+                "socks" | "socks5" => socks_v = Some(v),
+                _ => {}
+            }
+        }
+        if let Some(v) = https_v.or(http_v) {
+            (v, "http://")
+        } else {
+            (socks_v?, "socks5://")
+        }
+    } else {
+        (trimmed, "http://")
+    };
+
+    if picked.is_empty() {
+        return None;
+    }
+    if let Some(rest) = picked
+        .strip_prefix("https://")
+        .or_else(|| picked.strip_prefix("HTTPS://"))
+    {
+        return Some(format!("http://{rest}"));
+    }
+    if picked.contains("://") {
+        Some(picked.to_string())
+    } else {
+        Some(format!("{default_scheme}{picked}"))
+    }
+}
 
 fn read_windows_system_proxy() -> Option<String> {
     use winreg::enums::HKEY_CURRENT_USER;
@@ -340,64 +416,239 @@ fn read_windows_system_proxy() -> Option<String> {
         return None;
     }
     let server: String = key.get_value("ProxyServer").ok()?;
-    let trimmed = server.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let picked = if trimmed.contains('=') {
-        trimmed
-            .split(';')
-            .find_map(|pair| {
-                let (k, v) = pair.split_once('=')?;
-                let k = k.trim().to_ascii_lowercase();
-                (k == "https" || k == "http").then_some(v.trim())
-            })
-            .unwrap_or("")
-    } else {
-        trimmed
-    };
-    if picked.is_empty() {
-        return None;
-    }
-    if picked.contains("://") {
-        Some(picked.to_string())
-    } else {
-        Some(format!("http://{picked}"))
-    }
+    normalize_proxy_url(&server)
 }
 
-fn build_update_agents(connect_secs: u64, read_secs: u64, redirects: u32) -> Vec<ureq::Agent> {
-    let mut agents = Vec::new();
-    if let Some(sys_proxy) = read_windows_system_proxy() {
-        if let Ok(proxy) = ureq::Proxy::new(&sys_proxy) {
-            agents.push(
-                ureq::AgentBuilder::new()
-                    .proxy(proxy)
-                    .timeout_connect(Duration::from_secs(connect_secs))
-                    .timeout_read(Duration::from_secs(read_secs))
-                    .redirects(redirects)
-                    .build(),
-            );
+fn detect_env_proxy() -> Option<String> {
+    for key in [
+        "ALL_PROXY",
+        "all_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+    ] {
+        if let Ok(val) = std::env::var(key) {
+            if let Some(norm) = normalize_proxy_url(&val) {
+                if ureq::Proxy::new(&norm).is_ok() {
+                    return Some(norm);
+                }
+            }
         }
-    } else {
-        agents.push(
-            ureq::AgentBuilder::new()
-                .try_proxy_from_env(true)
-                .timeout_connect(Duration::from_secs(connect_secs))
-                .timeout_read(Duration::from_secs(read_secs))
-                .redirects(redirects)
-                .build(),
-        );
     }
-    agents.push(
-        ureq::AgentBuilder::new()
-            .try_proxy_from_env(false)
-            .timeout_connect(Duration::from_secs(connect_secs))
-            .timeout_read(Duration::from_secs(read_secs))
-            .redirects(redirects)
-            .build(),
-    );
-    agents
+    None
+}
+
+fn detect_effective_proxy() -> Option<String> {
+    read_windows_system_proxy()
+        .filter(|p| ureq::Proxy::new(p).is_ok())
+        .or_else(detect_env_proxy)
+}
+
+/// 若代理位于本机回环地址，先做一次 200ms 快速 TCP 探活；未监听时立即跳过，避免 Windows 2s SYN 重试。
+fn is_proxy_likely_reachable(proxy_url: &str) -> bool {
+    let Ok(url) = Url::parse(proxy_url) else {
+        return false;
+    };
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    let port = url.port_or_known_default().unwrap_or(80);
+    let addrs: Vec<SocketAddr> = match host.to_ascii_lowercase().as_str() {
+        "127.0.0.1" => vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port)],
+        "::1" | "[::1]" => vec![SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port)],
+        "localhost" => vec![
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
+            SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), port),
+        ],
+        _ => return true,
+    };
+    let per_addr = if addrs.len() > 1 {
+        Duration::from_millis(120)
+    } else {
+        LOOPBACK_PROXY_PROBE_TIMEOUT
+    };
+    addrs
+        .into_iter()
+        .any(|addr| TcpStream::connect_timeout(&addr, per_addr).is_ok())
+}
+
+fn build_single_agent(
+    proxy: Option<&str>,
+    connect_timeout: Duration,
+    read_timeout: Duration,
+    overall_timeout: Option<Duration>,
+    redirects: u32,
+) -> Option<ureq::Agent> {
+    let mut builder = ureq::AgentBuilder::new()
+        .try_proxy_from_env(false)
+        .timeout_connect(connect_timeout)
+        .timeout_read(read_timeout)
+        .redirects(redirects)
+        .max_idle_connections(2)
+        .max_idle_connections_per_host(1);
+    if let Some(total) = overall_timeout {
+        builder = builder.timeout(total);
+    }
+    if let Some(proxy_url) = proxy {
+        let parsed = ureq::Proxy::new(proxy_url).ok()?;
+        builder = builder.proxy(parsed);
+    }
+    Some(builder.build())
+}
+
+fn build_dedup_routes(
+    proxy_url: Option<&str>,
+    preferred: Option<RouteKind>,
+    connect_direct: Duration,
+    connect_proxy: Duration,
+    read_timeout: Duration,
+    overall_timeout: Option<Duration>,
+    redirects: u32,
+) -> Vec<(RouteKind, ureq::Agent)> {
+    let mut routes = Vec::with_capacity(2);
+    if let Some(url) = proxy_url {
+        if is_proxy_likely_reachable(url) {
+            if let Some(agent) = build_single_agent(
+                Some(url),
+                connect_proxy,
+                read_timeout,
+                overall_timeout,
+                redirects,
+            ) {
+                routes.push((RouteKind::Proxy, agent));
+            }
+        }
+    }
+    if let Some(direct) = build_single_agent(
+        None,
+        connect_direct,
+        read_timeout,
+        overall_timeout,
+        redirects,
+    ) {
+        routes.push((RouteKind::Direct, direct));
+    }
+    if let Some(pref) = preferred {
+        if let Some(pos) = routes.iter().position(|(k, _)| *k == pref) {
+            if pos > 0 {
+                routes.swap(0, pos);
+            }
+        }
+    }
+    routes
+}
+
+/// 跨次检查复用的轻量化网络上下文：复用连接池、记住最近有效路由以及 GitHub API 限流冷却窗口。
+#[derive(Default)]
+struct UpdateNetContext {
+    proxy_url: Option<String>,
+    preferred_route: Option<RouteKind>,
+    proxy_dead_until: Option<Instant>,
+    follow_agents: Vec<(RouteKind, ureq::Agent)>,
+    no_redir_agents: Vec<(RouteKind, ureq::Agent)>,
+    api_rate_limited_until: Option<Instant>,
+}
+
+impl UpdateNetContext {
+    fn sync_proxy(&mut self, allow_local_http: bool) {
+        let next_proxy = if allow_local_http {
+            None
+        } else {
+            detect_effective_proxy()
+        };
+        if next_proxy != self.proxy_url {
+            self.proxy_url = next_proxy;
+            self.preferred_route = None;
+            self.proxy_dead_until = None;
+            self.follow_agents.clear();
+            self.no_redir_agents.clear();
+        }
+    }
+
+    fn effective_proxy_for_build(&mut self) -> Option<&str> {
+        if let Some(until) = self.proxy_dead_until {
+            if Instant::now() < until {
+                return None;
+            }
+            self.proxy_dead_until = None;
+            self.follow_agents.clear();
+            self.no_redir_agents.clear();
+        }
+        self.proxy_url.as_deref()
+    }
+
+    fn record_proxy_liveness(&mut self, built: &[(RouteKind, ureq::Agent)]) {
+        if self.proxy_url.is_some() && !built.iter().any(|(k, _)| *k == RouteKind::Proxy) {
+            self.proxy_dead_until = Some(Instant::now() + Duration::from_secs(30));
+        }
+    }
+
+    fn follow_agents(&mut self, allow_local_http: bool) -> Vec<(RouteKind, ureq::Agent)> {
+        self.sync_proxy(allow_local_http);
+        let proxy_opt = self.effective_proxy_for_build().map(str::to_string);
+        if self.follow_agents.is_empty() {
+            let built = build_dedup_routes(
+                proxy_opt.as_deref(),
+                self.preferred_route,
+                CHECK_CONNECT_DIRECT,
+                CHECK_CONNECT_PROXY,
+                CHECK_READ_TIMEOUT,
+                Some(CHECK_OVERALL_TIMEOUT),
+                5,
+            );
+            self.record_proxy_liveness(&built);
+            self.follow_agents = built;
+        }
+        self.reorder_by_preferred(self.follow_agents.clone())
+    }
+
+    fn no_redir_agents(&mut self, allow_local_http: bool) -> Vec<(RouteKind, ureq::Agent)> {
+        self.sync_proxy(allow_local_http);
+        let proxy_opt = self.effective_proxy_for_build().map(str::to_string);
+        if self.no_redir_agents.is_empty() {
+            let built = build_dedup_routes(
+                proxy_opt.as_deref(),
+                self.preferred_route,
+                CHECK_CONNECT_DIRECT,
+                CHECK_CONNECT_PROXY,
+                CHECK_READ_TIMEOUT,
+                Some(CHECK_OVERALL_TIMEOUT),
+                0,
+            );
+            self.record_proxy_liveness(&built);
+            self.no_redir_agents = built;
+        }
+        self.reorder_by_preferred(self.no_redir_agents.clone())
+    }
+
+    fn reorder_by_preferred(
+        &self,
+        mut routes: Vec<(RouteKind, ureq::Agent)>,
+    ) -> Vec<(RouteKind, ureq::Agent)> {
+        if let Some(pref) = self.preferred_route {
+            if let Some(pos) = routes.iter().position(|(k, _)| *k == pref) {
+                if pos > 0 {
+                    routes.swap(0, pos);
+                }
+            }
+        }
+        routes
+    }
+
+    fn remember_route(&mut self, route: RouteKind) {
+        self.preferred_route = Some(route);
+    }
+
+    fn is_api_rate_limited(&self) -> bool {
+        self.api_rate_limited_until
+            .is_some_and(|until| Instant::now() < until)
+    }
+
+    fn note_api_rate_limited(&mut self, cooldown_secs: u64) {
+        let clamped = cooldown_secs.clamp(60, 3600);
+        self.api_rate_limited_until = Some(Instant::now() + Duration::from_secs(clamped));
+    }
 }
 
 fn user_agent_header() -> String {
@@ -424,10 +675,142 @@ fn is_trusted_github_url(raw: &str, allow_local_http: bool) -> bool {
         || host.ends_with(".githubusercontent.com")
 }
 
-// ── GitHub Release 检查逻辑 ──────────────────────────────────────────────────
+/// 清理 GitHub Release 正文中的网页下载模板尾注（如 `---` 后的「下载与使用」）与冗余顶层「更新内容」标题，
+/// 使 API 与 `latest.json` 返回的更新说明在弹窗中保持同样精炼易读。
+pub fn normalize_release_notes(raw: &str) -> String {
+    let trimmed = raw.trim_start_matches('\u{feff}').trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let normalized = trimmed.replace("\r\n", "\n");
+    let lines: Vec<&str> = normalized.lines().collect();
+
+    let mut end = lines.len();
+    for (idx, line) in lines.iter().enumerate() {
+        let t = line.trim();
+        if t.starts_with('#')
+            && (t.contains("下载与使用") || t.to_ascii_lowercase().contains("download & usage"))
+        {
+            let mut cut = idx;
+            while cut > 0 && lines[cut - 1].trim().is_empty() {
+                cut -= 1;
+            }
+            if cut > 0 && is_markdown_hr(lines[cut - 1].trim()) {
+                cut -= 1;
+                while cut > 0 && lines[cut - 1].trim().is_empty() {
+                    cut -= 1;
+                }
+            }
+            if cut > 0 {
+                end = cut;
+                break;
+            }
+        }
+    }
+
+    let mut start = 0usize;
+    while start < end && lines[start].trim().is_empty() {
+        start += 1;
+    }
+    if start < end {
+        let first = lines[start].trim();
+        if let Some(heading_body) = strip_atx_heading(first) {
+            let plain = heading_body
+                .trim_start_matches(|c: char| {
+                    let cp = c as u32;
+                    c.is_whitespace()
+                        || (0x1F300..=0x1FAFF).contains(&cp)
+                        || (0x2600..=0x27BF).contains(&cp)
+                        || c == '\u{fe0f}'
+                })
+                .trim();
+            if matches!(
+                plain,
+                "更新内容" | "更新日志" | "变更内容" | "What's Changed" | "Changelog"
+            ) && start + 1 < end
+            {
+                start += 1;
+                while start < end && lines[start].trim().is_empty() {
+                    start += 1;
+                }
+            }
+        }
+    }
+
+    lines[start..end].join("\n").trim().to_string()
+}
+
+fn is_markdown_hr(trimmed: &str) -> bool {
+    let mut marker = None;
+    let mut count = 0usize;
+    for ch in trimmed.chars() {
+        if ch == ' ' || ch == '\t' {
+            continue;
+        }
+        if matches!(ch, '-' | '*' | '_') {
+            match marker {
+                None => {
+                    marker = Some(ch);
+                    count = 1;
+                }
+                Some(m) if m == ch => count += 1,
+                Some(_) => return false,
+            }
+        } else {
+            return false;
+        }
+    }
+    count >= 3
+}
+
+fn strip_atx_heading(trimmed: &str) -> Option<&str> {
+    let hashes = trimmed.bytes().take_while(|&b| b == b'#').count();
+    if !(1..=6).contains(&hashes) {
+        return None;
+    }
+    let rest = &trimmed[hashes..];
+    if !rest.starts_with([' ', '\t']) {
+        return None;
+    }
+    Some(rest.trim().trim_end_matches('#').trim())
+}
+
+// ── GitHub Release 检查逻辑（手动单跳极速 + 对冲兜底 / 后台零配额 HEAD 探测）────
+
+enum ApiFetchOutcome {
+    Ok(Option<Box<ReleaseInfo>>, RouteKind),
+    RateLimited {
+        cooldown_secs: u64,
+        route: RouteKind,
+    },
+    HardError(String),
+    TransportError(String),
+}
+
+enum TagProbeOutcome {
+    NoRelease(RouteKind),
+    Tag { tag: String, route: RouteKind },
+    Unknown { saw_network_ok: bool },
+    TransportError,
+}
+
+enum ManifestFetchOutcome {
+    Ok(Option<Box<ReleaseInfo>>, RouteKind),
+    Fallback { saw_network_ok: bool },
+    TransportError,
+}
 
 pub fn check_for_updates(current_version: &str) -> Result<Option<ReleaseInfo>, String> {
-    check_for_updates_with_bases(current_version, GITHUB_REPO_WEB, GITHUB_API_BASE, false)
+    let mut ctx = UpdateNetContext::default();
+    check_for_updates_internal(
+        current_version,
+        GITHUB_REPO_WEB,
+        GITHUB_API_BASE,
+        false,
+        CheckMode::Manual,
+        MANUAL_HEDGE_DELAY,
+        &mut ctx,
+    )
 }
 
 fn check_for_updates_with_bases(
@@ -436,20 +819,447 @@ fn check_for_updates_with_bases(
     api_base: &str,
     allow_local_http: bool,
 ) -> Result<Option<ReleaseInfo>, String> {
-    let follow_agents = build_update_agents(8, 12, 5);
-    let no_redir_agents = build_update_agents(8, 10, 0);
+    let mut ctx = UpdateNetContext::default();
+    check_for_updates_internal(
+        current_version,
+        web_base,
+        api_base,
+        allow_local_http,
+        CheckMode::Auto,
+        MANUAL_HEDGE_DELAY,
+        &mut ctx,
+    )
+}
 
-    // 1. 优先尝试静态 `latest.json`（走下载通道，完全无 60 次/小时 REST API 限流，且自带 SHA-256）
-    let manifest_url = format!("{web_base}/releases/latest/download/latest.json");
+fn check_for_updates_internal(
+    current_version: &str,
+    web_base: &str,
+    api_base: &str,
+    allow_local_http: bool,
+    mode: CheckMode,
+    hedge_delay: Duration,
+    net: &mut UpdateNetContext,
+) -> Result<Option<ReleaseInfo>, String> {
+    match mode {
+        CheckMode::Auto => check_web_first(
+            current_version,
+            web_base,
+            api_base,
+            allow_local_http,
+            true,
+            net,
+        ),
+        CheckMode::Manual => check_manual_fast(
+            current_version,
+            web_base,
+            api_base,
+            allow_local_http,
+            hedge_delay,
+            net,
+        ),
+    }
+}
+
+/// 手动点击检查：优先单 RTT 的 GitHub Releases API（约 1 秒即达，含 SHA-256 与更新说明）；
+/// 若遇限流（403/429）或超时缓慢（超过 `hedge_delay`），立即无缝对冲/回退至零配额 Web 通道。
+fn check_manual_fast(
+    current_version: &str,
+    web_base: &str,
+    api_base: &str,
+    allow_local_http: bool,
+    hedge_delay: Duration,
+    net: &mut UpdateNetContext,
+) -> Result<Option<ReleaseInfo>, String> {
+    if net.is_api_rate_limited() {
+        return check_web_first(
+            current_version,
+            web_base,
+            api_base,
+            allow_local_http,
+            false,
+            net,
+        );
+    }
+
+    enum RaceMsg {
+        Api(ApiFetchOutcome),
+        Web(Result<Option<ReleaseInfo>, String>, Option<RouteKind>),
+    }
+
+    let api_agents = net.follow_agents(allow_local_http);
+    let (tx, rx) = mpsc::channel::<RaceMsg>();
+
+    {
+        let tx_api = tx.clone();
+        let cur = current_version.to_string();
+        let api = api_base.to_string();
+        let _ = std::thread::Builder::new()
+            .name("update-check-api".to_string())
+            .spawn(move || {
+                let outcome = fetch_from_github_api(&api_agents, &cur, &api, allow_local_http);
+                let _ = tx_api.send(RaceMsg::Api(outcome));
+            });
+    }
+
+    match rx.recv_timeout(hedge_delay) {
+        Ok(RaceMsg::Api(ApiFetchOutcome::Ok(info, route))) => {
+            net.remember_route(route);
+            return Ok(info.map(|b| *b));
+        }
+        Ok(RaceMsg::Api(ApiFetchOutcome::RateLimited {
+            cooldown_secs,
+            route,
+        })) => {
+            net.remember_route(route);
+            net.note_api_rate_limited(cooldown_secs);
+            return check_web_first(
+                current_version,
+                web_base,
+                api_base,
+                allow_local_http,
+                false,
+                net,
+            );
+        }
+        Ok(RaceMsg::Api(ApiFetchOutcome::HardError(err))) => {
+            if err.contains("字节上限") {
+                return Err(err);
+            }
+            return check_web_first(
+                current_version,
+                web_base,
+                api_base,
+                allow_local_http,
+                false,
+                net,
+            )
+            .or(Err(err));
+        }
+        Ok(RaceMsg::Api(ApiFetchOutcome::TransportError(api_err))) => {
+            return check_web_first(
+                current_version,
+                web_base,
+                api_base,
+                allow_local_http,
+                false,
+                net,
+            )
+            .map_err(|_| api_err);
+        }
+        Ok(RaceMsg::Web(res, route)) => {
+            if let Some(r) = route {
+                net.remember_route(r);
+            }
+            return res;
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            return check_web_first(
+                current_version,
+                web_base,
+                api_base,
+                allow_local_http,
+                false,
+                net,
+            );
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // API 通道偏慢：立即并行拉起零配额 Web 通道对冲，谁先拿到有效结果立刻弹出
+            let web_follow = net.follow_agents(allow_local_http);
+            let web_no_redir = net.no_redir_agents(allow_local_http);
+            let cur = current_version.to_string();
+            let web = web_base.to_string();
+            let tx_web = tx;
+            let _ = std::thread::Builder::new()
+                .name("update-check-web".to_string())
+                .spawn(move || {
+                    let (res, route) = fetch_via_web_only(
+                        &web_no_redir,
+                        &web_follow,
+                        &cur,
+                        &web,
+                        allow_local_http,
+                    );
+                    let _ = tx_web.send(RaceMsg::Web(res, route));
+                });
+        }
+    }
+
+    let mut api_err: Option<String> = None;
+    let mut web_err: Option<String> = None;
+    for _ in 0..2 {
+        match rx.recv() {
+            Ok(RaceMsg::Api(ApiFetchOutcome::Ok(info, route))) => {
+                net.remember_route(route);
+                return Ok(info.map(|b| *b));
+            }
+            Ok(RaceMsg::Web(Ok(info), route)) => {
+                if let Some(r) = route {
+                    net.remember_route(r);
+                }
+                return Ok(info);
+            }
+            Ok(RaceMsg::Api(ApiFetchOutcome::RateLimited {
+                cooldown_secs,
+                route,
+            })) => {
+                net.remember_route(route);
+                net.note_api_rate_limited(cooldown_secs);
+                api_err = Some(
+                    "GitHub 接口访问受限（校园网共享 IP 触发限流），请稍后重试或前往 GitHub 页面下载"
+                        .to_string(),
+                );
+            }
+            Ok(RaceMsg::Api(ApiFetchOutcome::HardError(e)))
+            | Ok(RaceMsg::Api(ApiFetchOutcome::TransportError(e))) => {
+                api_err = Some(e);
+            }
+            Ok(RaceMsg::Web(Err(e), _)) => {
+                web_err = Some(e);
+            }
+            Err(_) => break,
+        }
+    }
+
+    Err(api_err
+        .or(web_err)
+        .unwrap_or_else(|| "检查更新失败，请检查网络连接".to_string()))
+}
+
+/// 零 API 配额优先通道：
+/// 1. 单跳 `HEAD /releases/latest` 读取 302 Location（已是最新时 1 RTT / 0 字节正文即结束）；
+/// 2. 确有新版时直接直达 `/releases/download/{tag}/latest.json`（省去第一跳重定向并复用 Keep-Alive 连接）；
+/// 3. 仅在无 `latest.json` 或拉取失败且允许 API 回退时调用 GitHub Releases API。
+fn check_web_first(
+    current_version: &str,
+    web_base: &str,
+    api_base: &str,
+    allow_local_http: bool,
+    allow_api_fallback: bool,
+    net: &mut UpdateNetContext,
+) -> Result<Option<ReleaseInfo>, String> {
+    let no_redir_agents = net.no_redir_agents(allow_local_http);
     let mut saw_network_ok = false;
-    for agent in &follow_agents {
+    let mut probed_tag: Option<String> = None;
+
+    match probe_latest_tag_302(&no_redir_agents, web_base) {
+        TagProbeOutcome::NoRelease(route) => {
+            net.remember_route(route);
+            return Ok(None);
+        }
+        TagProbeOutcome::Tag { tag, route } => {
+            net.remember_route(route);
+            saw_network_ok = true;
+            if !is_newer_stable_version(current_version, &tag) {
+                return Ok(None);
+            }
+            probed_tag = Some(tag);
+        }
+        TagProbeOutcome::Unknown { saw_network_ok: ok } => {
+            saw_network_ok |= ok;
+        }
+        TagProbeOutcome::TransportError => {}
+    }
+
+    let follow_agents = net.follow_agents(allow_local_http);
+    let manifest_url = match &probed_tag {
+        Some(tag) => format!("{web_base}/releases/download/{tag}/latest.json"),
+        None => format!("{web_base}/releases/latest/download/latest.json"),
+    };
+    match fetch_manifest_url(
+        &follow_agents,
+        current_version,
+        &manifest_url,
+        web_base,
+        allow_local_http,
+    ) {
+        ManifestFetchOutcome::Ok(info, route) => {
+            net.remember_route(route);
+            return Ok(info.map(|b| *b));
+        }
+        ManifestFetchOutcome::Fallback { saw_network_ok: ok } => {
+            saw_network_ok |= ok;
+        }
+        ManifestFetchOutcome::TransportError => {}
+    }
+
+    if allow_api_fallback && !net.is_api_rate_limited() {
+        let api_agents = net.follow_agents(allow_local_http);
+        match fetch_from_github_api(&api_agents, current_version, api_base, allow_local_http) {
+            ApiFetchOutcome::Ok(info, route) => {
+                net.remember_route(route);
+                return Ok(info.map(|b| *b));
+            }
+            ApiFetchOutcome::RateLimited {
+                cooldown_secs,
+                route,
+            } => {
+                net.remember_route(route);
+                net.note_api_rate_limited(cooldown_secs);
+                return Err(
+                    "GitHub 接口访问受限（校园网共享 IP 触发限流），请稍后重试或前往 GitHub 页面下载"
+                        .to_string(),
+                );
+            }
+            ApiFetchOutcome::HardError(err) => return Err(err),
+            ApiFetchOutcome::TransportError(err) => {
+                return Err(if saw_network_ok {
+                    "连接 GitHub Release 接口超时，请稍后重试".to_string()
+                } else {
+                    err
+                });
+            }
+        }
+    }
+
+    Err(if saw_network_ok {
+        "获取 GitHub Release 更新信息超时，请稍后重试或打开浏览器下载".to_string()
+    } else {
+        "无法连接 GitHub（校园网直连可能受阻），可开启代理后重试或打开浏览器下载".to_string()
+    })
+}
+
+fn fetch_via_web_only(
+    no_redir_agents: &[(RouteKind, ureq::Agent)],
+    follow_agents: &[(RouteKind, ureq::Agent)],
+    current_version: &str,
+    web_base: &str,
+    allow_local_http: bool,
+) -> (Result<Option<ReleaseInfo>, String>, Option<RouteKind>) {
+    let mut saw_network_ok = false;
+    let mut probed_tag: Option<String> = None;
+    let mut winning_route = None;
+
+    match probe_latest_tag_302(no_redir_agents, web_base) {
+        TagProbeOutcome::NoRelease(route) => return (Ok(None), Some(route)),
+        TagProbeOutcome::Tag { tag, route } => {
+            saw_network_ok = true;
+            winning_route = Some(route);
+            if !is_newer_stable_version(current_version, &tag) {
+                return (Ok(None), Some(route));
+            }
+            probed_tag = Some(tag);
+        }
+        TagProbeOutcome::Unknown { saw_network_ok: ok } => {
+            saw_network_ok |= ok;
+        }
+        TagProbeOutcome::TransportError => {}
+    }
+
+    let manifest_url = match &probed_tag {
+        Some(tag) => format!("{web_base}/releases/download/{tag}/latest.json"),
+        None => format!("{web_base}/releases/latest/download/latest.json"),
+    };
+    match fetch_manifest_url(
+        follow_agents,
+        current_version,
+        &manifest_url,
+        web_base,
+        allow_local_http,
+    ) {
+        ManifestFetchOutcome::Ok(info, route) => (Ok(info.map(|b| *b)), Some(route)),
+        ManifestFetchOutcome::Fallback { saw_network_ok: ok } => {
+            saw_network_ok |= ok;
+            let msg = if saw_network_ok {
+                "获取 GitHub Release 清单失败，请稍后重试或前往 GitHub 页面下载"
+            } else {
+                "无法连接 GitHub（校园网直连可能受阻），可开启代理后重试或打开浏览器下载"
+            };
+            (Err(msg.to_string()), winning_route)
+        }
+        ManifestFetchOutcome::TransportError => {
+            let msg = if saw_network_ok {
+                "连接 GitHub 下载清单超时，请稍后重试"
+            } else {
+                "无法连接 GitHub（校园网直连可能受阻），可开启代理后重试或打开浏览器下载"
+            };
+            (Err(msg.to_string()), winning_route)
+        }
+    }
+}
+
+fn probe_latest_tag_302(
+    no_redir_agents: &[(RouteKind, ureq::Agent)],
+    web_base: &str,
+) -> TagProbeOutcome {
+    let latest_page_url = format!("{web_base}/releases/latest");
+    let mut saw_network_ok = false;
+
+    for (route, agent) in no_redir_agents {
+        let mut used_head = true;
+        let head_res = agent
+            .head(&latest_page_url)
+            .set("User-Agent", &user_agent_header())
+            .call();
+        let res = match head_res {
+            Err(ureq::Error::Status(405 | 501, _)) => {
+                used_head = false;
+                agent
+                    .get(&latest_page_url)
+                    .set("User-Agent", &user_agent_header())
+                    .call()
+            }
+            other => other,
+        };
+        match res {
+            Ok(resp) if matches!(resp.status(), 301 | 302 | 303 | 307 | 308) => {
+                let tag = resp.header("Location").and_then(extract_tag_from_location);
+                if !used_head {
+                    http::drain_small_body(resp);
+                }
+                if let Some(tag) = tag {
+                    return TagProbeOutcome::Tag { tag, route: *route };
+                }
+                saw_network_ok = true;
+                break;
+            }
+            Err(ureq::Error::Status(404, resp)) => {
+                if !used_head {
+                    http::drain_small_body(resp);
+                }
+                return TagProbeOutcome::NoRelease(*route);
+            }
+            Err(ureq::Error::Status(_, resp)) => {
+                if !used_head {
+                    http::drain_small_body(resp);
+                }
+                saw_network_ok = true;
+                break;
+            }
+            Err(ureq::Error::Transport(_)) => continue,
+            Ok(resp) => {
+                if !used_head {
+                    http::drain_small_body(resp);
+                }
+                saw_network_ok = true;
+                break;
+            }
+        }
+    }
+
+    if saw_network_ok {
+        TagProbeOutcome::Unknown {
+            saw_network_ok: true,
+        }
+    } else {
+        TagProbeOutcome::TransportError
+    }
+}
+
+fn fetch_manifest_url(
+    follow_agents: &[(RouteKind, ureq::Agent)],
+    current_version: &str,
+    manifest_url: &str,
+    web_base: &str,
+    allow_local_http: bool,
+) -> ManifestFetchOutcome {
+    let mut saw_network_ok = false;
+    for (route, agent) in follow_agents {
         match agent
-            .get(&manifest_url)
+            .get(manifest_url)
             .set("User-Agent", &user_agent_header())
             .call()
         {
             Ok(resp) if resp.status() == 200 => {
-                saw_network_ok = true;
                 if let Ok(raw_body) = http::read_text(resp, UPDATE_METADATA_LIMIT) {
                     let body = raw_body.trim_start_matches('\u{feff}');
                     if let Ok(manifest) = serde_json::from_str::<LatestManifest>(body) {
@@ -459,61 +1269,57 @@ fn check_for_updates_with_bases(
                             web_base,
                             allow_local_http,
                         ) {
-                            return Ok(Some(info));
+                            return ManifestFetchOutcome::Ok(Some(Box::new(info)), *route);
                         }
                         let ver = normalize_version_str(&body_version_hint(body));
                         if !ver.is_empty() && !is_newer_stable_version(current_version, &ver) {
-                            return Ok(None);
+                            return ManifestFetchOutcome::Ok(None, *route);
                         }
                     }
                 }
-                break;
+                return ManifestFetchOutcome::Fallback {
+                    saw_network_ok: true,
+                };
             }
-            Err(ureq::Error::Status(404, _)) => {
-                // 仓库发版未附带 latest.json，继续走 302 探测 + API 回退
+            Err(ureq::Error::Status(404, resp)) => {
+                http::drain_small_body(resp);
+                return ManifestFetchOutcome::Fallback {
+                    saw_network_ok: true,
+                };
+            }
+            Err(ureq::Error::Status(_, resp)) => {
+                http::drain_small_body(resp);
+                return ManifestFetchOutcome::Fallback {
+                    saw_network_ok: true,
+                };
+            }
+            Err(ureq::Error::Transport(_)) => continue,
+            Ok(resp) => {
+                http::drain_small_body(resp);
                 saw_network_ok = true;
                 break;
             }
-            Err(ureq::Error::Status(_, _)) => {
-                break;
-            }
-            Err(ureq::Error::Transport(_)) => continue,
-            Ok(_) => break,
         }
     }
-
-    // 2. 请求 `/releases/latest` 的 302 Location 头（零 API 配额消耗即可判断是否有新版本）
-    let latest_page_url = format!("{web_base}/releases/latest");
-    for agent in &no_redir_agents {
-        match agent
-            .get(&latest_page_url)
-            .set("User-Agent", &user_agent_header())
-            .call()
-        {
-            Ok(resp) if matches!(resp.status(), 301 | 302 | 303 | 307 | 308) => {
-                saw_network_ok = true;
-                if let Some(loc) = resp.header("Location") {
-                    if let Some(tag) = extract_tag_from_location(loc) {
-                        if !is_newer_stable_version(current_version, &tag) {
-                            return Ok(None);
-                        }
-                    }
-                }
-                break;
-            }
-            Err(ureq::Error::Status(404, _)) => {
-                // 仓库尚无任何 Release
-                return Ok(None);
-            }
-            Err(ureq::Error::Transport(_)) => continue,
-            _ => break,
+    if saw_network_ok {
+        ManifestFetchOutcome::Fallback {
+            saw_network_ok: true,
         }
+    } else {
+        ManifestFetchOutcome::TransportError
     }
+}
 
-    // 3. 仅当确有新版（或未拿到 302）时，调用 GitHub Releases API 拉取 `.exe` 下载链接与更新说明
+fn fetch_from_github_api(
+    follow_agents: &[(RouteKind, ureq::Agent)],
+    current_version: &str,
+    api_base: &str,
+    allow_local_http: bool,
+) -> ApiFetchOutcome {
     let api_url = format!("{api_base}/releases/latest");
     let mut last_err = String::new();
-    for agent in &follow_agents {
+
+    for (route, agent) in follow_agents {
         match agent
             .get(&api_url)
             .set("User-Agent", &user_agent_header())
@@ -521,74 +1327,116 @@ fn check_for_updates_with_bases(
             .call()
         {
             Ok(resp) if resp.status() == 200 => {
-                let body = http::read_text(resp, UPDATE_METADATA_LIMIT)
-                    .map_err(|err| format!("读取 GitHub Release 响应失败：{err}"))?;
-                let parsed: GithubApiRelease = serde_json::from_str(&body)
-                    .map_err(|_| "解析 GitHub Release 元数据失败".to_string())?;
+                let body = match http::read_text(resp, UPDATE_METADATA_LIMIT) {
+                    Ok(b) => b,
+                    Err(err) => {
+                        return ApiFetchOutcome::HardError(format!(
+                            "读取 GitHub Release 响应失败：{err}"
+                        ));
+                    }
+                };
+                let parsed: GithubApiRelease = match serde_json::from_str(&body) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        return ApiFetchOutcome::HardError(
+                            "解析 GitHub Release 元数据失败".to_string(),
+                        );
+                    }
+                };
                 if parsed.draft || parsed.prerelease {
-                    return Ok(None);
+                    return ApiFetchOutcome::Ok(None, *route);
                 }
                 if !is_newer_stable_version(current_version, &parsed.tag_name) {
-                    return Ok(None);
+                    return ApiFetchOutcome::Ok(None, *route);
                 }
                 let Some(exe_asset) = parsed
                     .assets
                     .iter()
                     .find(|a| a.name.to_ascii_lowercase().ends_with(".exe"))
                 else {
-                    return Err("最新 Release 中未找到可下载的 .exe 安装包".to_string());
+                    return ApiFetchOutcome::HardError(
+                        "最新 Release 中未找到可下载的 .exe 安装包".to_string(),
+                    );
                 };
                 if !is_trusted_github_url(&exe_asset.browser_download_url, allow_local_http) {
-                    return Err("Release 下载地址不在受信任的 GitHub 域名下".to_string());
+                    return ApiFetchOutcome::HardError(
+                        "Release 下载地址不在受信任的 GitHub 域名下".to_string(),
+                    );
                 }
                 let html_url = if is_trusted_github_url(&parsed.html_url, allow_local_http) {
                     parsed.html_url
                 } else {
                     format!("{GITHUB_REPO_WEB}/releases/tag/{}", parsed.tag_name)
                 };
-                return Ok(Some(ReleaseInfo {
-                    version: normalize_version_str(&parsed.tag_name),
-                    tag: parsed.tag_name,
-                    asset_name: exe_asset.name.clone(),
-                    download_url: exe_asset.browser_download_url.clone(),
-                    html_url,
-                    sha256: normalize_sha256(exe_asset.digest.as_deref()),
-                    size_bytes: (exe_asset.size > 0).then_some(exe_asset.size),
-                    published_at: parsed.published_at.unwrap_or_default(),
-                    notes: parsed.body.unwrap_or_default().trim().to_string(),
-                }));
+                let notes = normalize_release_notes(parsed.body.as_deref().unwrap_or_default());
+                return ApiFetchOutcome::Ok(
+                    Some(Box::new(ReleaseInfo {
+                        version: normalize_version_str(&parsed.tag_name),
+                        tag: parsed.tag_name,
+                        asset_name: exe_asset.name.clone(),
+                        download_url: exe_asset.browser_download_url.clone(),
+                        html_url,
+                        sha256: normalize_sha256(exe_asset.digest.as_deref()),
+                        size_bytes: (exe_asset.size > 0).then_some(exe_asset.size),
+                        published_at: parsed.published_at.unwrap_or_default(),
+                        notes,
+                    })),
+                    *route,
+                );
             }
-            Err(ureq::Error::Status(404, _)) => return Ok(None),
-            Err(ureq::Error::Status(403, _)) => {
-                last_err = "GitHub 接口访问受限（校园网共享 IP 触发限流），请稍后重试或前往 GitHub 页面下载"
-                    .to_string();
-                break;
+            Err(ureq::Error::Status(404, resp)) => {
+                http::drain_small_body(resp);
+                return ApiFetchOutcome::Ok(None, *route);
             }
-            Err(ureq::Error::Status(code, _)) => {
-                last_err = format!("GitHub 返回 HTTP {code}");
-                break;
+            Err(ureq::Error::Status(403 | 429, resp)) => {
+                let cooldown_secs = parse_rate_limit_cooldown(&resp);
+                http::drain_small_body(resp);
+                return ApiFetchOutcome::RateLimited {
+                    cooldown_secs,
+                    route: *route,
+                };
+            }
+            Err(ureq::Error::Status(code, resp)) => {
+                http::drain_small_body(resp);
+                return ApiFetchOutcome::HardError(format!("GitHub 返回 HTTP {code}"));
             }
             Err(ureq::Error::Transport(_)) => {
-                last_err = if saw_network_ok {
-                    "连接 GitHub Release 接口超时，请稍后重试".to_string()
-                } else {
+                last_err =
                     "无法连接 GitHub（校园网直连可能受阻），可开启代理后重试或打开浏览器下载"
-                        .to_string()
-                };
+                        .to_string();
                 continue;
             }
             Ok(resp) => {
-                last_err = format!("GitHub 返回非预期状态 HTTP {}", resp.status());
-                break;
+                let code = resp.status();
+                http::drain_small_body(resp);
+                return ApiFetchOutcome::HardError(format!("GitHub 返回非预期状态 HTTP {code}"));
             }
         }
     }
 
-    Err(if last_err.is_empty() {
+    ApiFetchOutcome::TransportError(if last_err.is_empty() {
         "检查更新失败，请检查网络连接".to_string()
     } else {
         last_err
     })
+}
+
+fn parse_rate_limit_cooldown(resp: &ureq::Response) -> u64 {
+    if let Some(secs) = resp
+        .header("Retry-After")
+        .and_then(|v| v.trim().parse::<u64>().ok())
+    {
+        return secs.clamp(60, 3600);
+    }
+    if let Some(reset_unix) = resp
+        .header("X-RateLimit-Reset")
+        .and_then(|v| v.trim().parse::<i64>().ok())
+    {
+        let now = Local::now().timestamp();
+        let diff = (reset_unix - now).max(60) as u64;
+        return diff.clamp(60, 3600);
+    }
+    DEFAULT_API_COOLDOWN_SECS
 }
 
 fn body_version_hint(body: &str) -> String {
@@ -645,7 +1493,7 @@ fn release_from_manifest(
         sha256: normalize_sha256(m.sha256.as_deref()),
         size_bytes: m.size.filter(|&n| n > 0),
         published_at: m.published_at,
-        notes: m.notes.trim().to_string(),
+        notes: normalize_release_notes(&m.notes),
     })
 }
 
@@ -672,10 +1520,19 @@ where
         return Err("更新包地址未通过安全域名校验".to_string());
     }
 
-    let agents = build_update_agents(12, 45, 6);
+    let proxy_url = (!allow_local_http).then(detect_effective_proxy).flatten();
+    let agents = build_dedup_routes(
+        proxy_url.as_deref(),
+        None,
+        Duration::from_secs(10),
+        Duration::from_secs(4),
+        Duration::from_secs(30),
+        None,
+        6,
+    );
     let mut response_opt = None;
     let mut last_err = String::new();
-    for agent in &agents {
+    for (_route, agent) in &agents {
         match agent
             .get(&release.download_url)
             .set("User-Agent", &user_agent_header())
@@ -949,6 +1806,8 @@ struct ManagerInner {
     state: UpdateState,
     pending_task: Option<WorkerTask>,
     busy: bool,
+    in_flight_check: bool,
+    manual_promoted: bool,
     stopped: bool,
     last_error_auto_unix: Option<i64>,
 }
@@ -959,6 +1818,7 @@ type QuitTrigger = Arc<dyn Fn() + Send + Sync>;
 pub struct UpdateManager {
     app_dir: PathBuf,
     inner: Arc<(Mutex<ManagerInner>, Condvar)>,
+    on_state: StateSink,
 }
 
 impl UpdateManager {
@@ -973,7 +1833,11 @@ impl UpdateManager {
         let meta = load_persisted_meta(&app_dir);
         let initial_release = meta
             .cached_release
-            .filter(|r| is_newer_stable_version(CURRENT_VERSION, &r.version));
+            .filter(|r| is_newer_stable_version(CURRENT_VERSION, &r.version))
+            .map(|mut r| {
+                r.notes = normalize_release_notes(&r.notes);
+                r
+            });
         let initial_status = if initial_release.is_some() {
             UpdateStatus::Available
         } else {
@@ -996,6 +1860,8 @@ impl UpdateManager {
                 state: initial_state,
                 pending_task: None,
                 busy: false,
+                in_flight_check: false,
+                manual_promoted: false,
                 stopped: false,
                 last_error_auto_unix: None,
             }),
@@ -1004,6 +1870,7 @@ impl UpdateManager {
 
         let worker_pair = Arc::clone(&pair);
         let worker_dir = app_dir.clone();
+        let worker_sink = Arc::clone(&on_state);
         let _ = std::thread::Builder::new()
             .name("auto-updater".to_string())
             .spawn(move || {
@@ -1011,7 +1878,7 @@ impl UpdateManager {
                     worker_dir,
                     worker_pair,
                     is_online,
-                    on_state,
+                    worker_sink,
                     on_quit_for_restart,
                 );
             });
@@ -1019,6 +1886,7 @@ impl UpdateManager {
         Self {
             app_dir,
             inner: pair,
+            on_state,
         }
     }
 
@@ -1039,12 +1907,27 @@ impl UpdateManager {
 
     pub fn request_check(&self, manual: bool) {
         let (lock, cv) = &*self.inner;
-        let mut g = lock.lock().unwrap();
-        if g.busy {
-            return;
+        let promoted_snapshot = {
+            let mut g = lock.lock().unwrap();
+            if g.busy {
+                if manual && g.in_flight_check && !g.manual_promoted {
+                    // 后台静默检查正在进行时用户手动点选：无缝升级为手动检查，立刻反馈状态且不重复发请求
+                    g.manual_promoted = true;
+                    g.state.status = UpdateStatus::Checking;
+                    g.state.message = "正在连接 GitHub 检查新版本…".to_string();
+                    Some(g.state.clone())
+                } else {
+                    None
+                }
+            } else {
+                g.pending_task = Some(WorkerTask::Check { manual });
+                cv.notify_all();
+                None
+            }
+        };
+        if let Some(snap) = promoted_snapshot {
+            (self.on_state)(snap);
         }
-        g.pending_task = Some(WorkerTask::Check { manual });
-        cv.notify_all();
     }
 
     pub fn request_install(&self) -> Result<(), String> {
@@ -1080,6 +1963,7 @@ fn run_updater_loop(
 ) {
     let boot_instant = Instant::now();
     let (lock, cv) = &*pair;
+    let mut net_ctx = UpdateNetContext::default();
 
     loop {
         let task = {
@@ -1089,6 +1973,8 @@ fn run_updater_loop(
             }
             if let Some(t) = g.pending_task.take() {
                 g.busy = true;
+                g.in_flight_check = matches!(t, WorkerTask::Check { .. });
+                g.manual_promoted = matches!(t, WorkerTask::Check { manual: true });
                 Some(t)
             } else {
                 let now = Local::now().timestamp();
@@ -1105,6 +1991,8 @@ fn run_updater_loop(
                 if g.auto_enabled && online && ready_after_boot && due_by_time && error_cooled_down
                 {
                     g.busy = true;
+                    g.in_flight_check = true;
+                    g.manual_promoted = false;
                     Some(WorkerTask::Check { manual: false })
                 } else {
                     let wait_dur = if g.auto_enabled && online && !ready_after_boot {
@@ -1137,11 +2025,28 @@ fn run_updater_loop(
                     on_state(next);
                 }
 
-                let res = check_for_updates(CURRENT_VERSION);
+                let mode = if manual {
+                    CheckMode::Manual
+                } else {
+                    CheckMode::Auto
+                };
+                let res = check_for_updates_internal(
+                    CURRENT_VERSION,
+                    GITHUB_REPO_WEB,
+                    GITHUB_API_BASE,
+                    false,
+                    mode,
+                    MANUAL_HEDGE_DELAY,
+                    &mut net_ctx,
+                );
                 let now = Local::now().timestamp();
-                let next = {
+                let (next, meta_to_save) = {
                     let mut g = lock.lock().unwrap();
+                    let effective_manual = manual || g.manual_promoted;
                     g.busy = false;
+                    g.in_flight_check = false;
+                    g.manual_promoted = false;
+                    let mut persist = None;
                     match res {
                         Ok(Some(release)) => {
                             g.last_error_auto_unix = None;
@@ -1151,20 +2056,17 @@ fn run_updater_loop(
                             g.state.total_bytes = release.size_bytes;
                             g.state.message = format!("发现新版本 v{}", release.version);
                             let is_skipped = release.version == g.skipped_version;
-                            if manual || !is_skipped {
+                            if effective_manual || !is_skipped {
                                 logging::info(&format!(
                                     "[UPDATER] 发现新版本 {}（当前 v{}）",
                                     release.tag, CURRENT_VERSION
                                 ));
                             }
                             g.state.release = Some(release.clone());
-                            save_persisted_meta(
-                                &app_dir,
-                                &PersistedUpdateMeta {
-                                    last_checked_unix: Some(now),
-                                    cached_release: Some(release),
-                                },
-                            );
+                            persist = Some(PersistedUpdateMeta {
+                                last_checked_unix: Some(now),
+                                cached_release: Some(release),
+                            });
                         }
                         Ok(None) => {
                             g.last_error_auto_unix = None;
@@ -1174,22 +2076,19 @@ fn run_updater_loop(
                             g.state.downloaded_bytes = 0;
                             g.state.total_bytes = None;
                             g.state.message = format!("当前已是最新版本（v{CURRENT_VERSION}）");
-                            if manual {
+                            if effective_manual {
                                 logging::info(&format!(
                                     "[UPDATER] 检查完成：当前 v{CURRENT_VERSION} 已是最新版本"
                                 ));
                             }
-                            save_persisted_meta(
-                                &app_dir,
-                                &PersistedUpdateMeta {
-                                    last_checked_unix: Some(now),
-                                    cached_release: None,
-                                },
-                            );
+                            persist = Some(PersistedUpdateMeta {
+                                last_checked_unix: Some(now),
+                                cached_release: None,
+                            });
                         }
                         Err(err) => {
                             g.last_error_auto_unix = Some(now);
-                            if manual {
+                            if effective_manual {
                                 g.state.status = UpdateStatus::Error;
                                 g.state.message = err.clone();
                                 logging::warn(&format!("[UPDATER] 手动检查更新失败：{err}"));
@@ -1200,9 +2099,13 @@ fn run_updater_loop(
                             }
                         }
                     }
-                    g.state.clone()
+                    (g.state.clone(), persist)
                 };
+                // 先广播状态让界面零延迟弹出，再落盘缓存元数据
                 on_state(next);
+                if let Some(meta) = meta_to_save {
+                    save_persisted_meta(&app_dir, &meta);
+                }
             }
             WorkerTask::Install => {
                 let Some(release) = ({
@@ -1367,6 +2270,71 @@ mod tests {
     }
 
     #[test]
+    fn proxy_normalization_and_route_deduplication() {
+        assert_eq!(
+            normalize_proxy_url("127.0.0.1:7890").as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(
+            normalize_proxy_url("https://127.0.0.1:7890").as_deref(),
+            Some("http://127.0.0.1:7890")
+        );
+        assert_eq!(
+            normalize_proxy_url("http=127.0.0.1:7890;https=127.0.0.1:7891").as_deref(),
+            Some("http://127.0.0.1:7891")
+        );
+        assert_eq!(
+            normalize_proxy_url("socks=127.0.0.1:1080").as_deref(),
+            Some("socks5://127.0.0.1:1080")
+        );
+
+        // 无代理时严格仅构建 1 条直连路由（绝不重复构建两条直连 Agent）
+        let direct_only = build_dedup_routes(
+            None,
+            None,
+            CHECK_CONNECT_DIRECT,
+            CHECK_CONNECT_PROXY,
+            CHECK_READ_TIMEOUT,
+            Some(CHECK_OVERALL_TIMEOUT),
+            5,
+        );
+        assert_eq!(direct_only.len(), 1);
+        assert_eq!(direct_only[0].0, RouteKind::Direct);
+
+        // 本地回环端口未监听时，200ms 内直接跳过死代理仅留直连
+        let dead_port = {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap().port()
+        };
+        let dead_proxy = format!("http://127.0.0.1:{dead_port}");
+        let start = Instant::now();
+        let skipped = build_dedup_routes(
+            Some(&dead_proxy),
+            None,
+            CHECK_CONNECT_DIRECT,
+            CHECK_CONNECT_PROXY,
+            CHECK_READ_TIMEOUT,
+            Some(CHECK_OVERALL_TIMEOUT),
+            5,
+        );
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].0, RouteKind::Direct);
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn release_notes_normalization_strips_download_boilerplate_and_keeps_custom_notes() {
+        let template_body = "### ✨ 更新内容\n\n深度优化内存下降 **63%**。\n\n- **系统字库只读映射**：零拷贝。\n\n---\n\n### 📦 下载与使用\n\n- 直接下载下方 exe。";
+        assert_eq!(
+            normalize_release_notes(template_body),
+            "深度优化内存下降 **63%**。\n\n- **系统字库只读映射**：零拷贝。"
+        );
+
+        let custom_body = "### 核心亮点\n- 修复校园网切号问题";
+        assert_eq!(normalize_release_notes(custom_body), custom_body);
+    }
+
+    #[test]
     fn oversized_manifest_falls_back_and_oversized_release_api_reports_limit() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
@@ -1374,8 +2342,8 @@ mod tests {
             // The manifest would say the installed version is current if only its prefix were parsed.
             let manifest = r#"{"version":"1.0.0","download_url":"https://github.com/fixture"}"#;
             let responses = [
-                format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{manifest}{}", " ".repeat(UPDATE_METADATA_LIMIT)),
                 "HTTP/1.1 302 Found\r\nLocation: /releases/tag/v2.0.0\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into(),
+                format!("HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{manifest}{}", " ".repeat(UPDATE_METADATA_LIMIT)),
                 format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", UPDATE_METADATA_LIMIT + 1),
             ];
             for response in responses {
@@ -1387,6 +2355,212 @@ mod tests {
         let error = check_for_updates_with_bases("1.0.0", &base, &base, true).unwrap_err();
         assert!(error.contains("262144 字节上限"), "{error}");
         server.join().unwrap();
+    }
+
+    #[test]
+    fn auto_check_stops_after_single_head_when_up_to_date() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hits_srv = Arc::clone(&hits);
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 1024];
+            let n = stream.read(&mut req_buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&req_buf[..n]);
+            assert!(req.starts_with("HEAD /releases/latest "), "{req}");
+            hits_srv.fetch_add(1, AtomicOrdering::SeqCst);
+            let resp = "HTTP/1.1 302 Found\r\nLocation: /releases/tag/v0.2.4\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let _ = stream.write_all(resp.as_bytes());
+        });
+
+        let result = check_for_updates_with_bases("0.2.4", &base, &base, true).unwrap();
+        assert!(result.is_none());
+        server.join().unwrap();
+        assert_eq!(hits.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[test]
+    fn manual_check_uses_single_rtt_api_and_cleans_release_notes() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let dl_url = format!("{base}/download/gxnu-campus-net-helper-v0.2.5.exe");
+        let sha = sha256_bytes(b"mock-exe");
+        let api_json = serde_json::json!({
+            "tag_name": "v0.2.5",
+            "html_url": format!("{base}/releases/tag/v0.2.5"),
+            "published_at": "2026-11-23T06:00:00Z",
+            "body": "### ✨ 更新内容\n\n- **极速检查更新**：单跳响应。\n\n---\n\n### 📦 下载与使用\n\n- 忽略此尾注",
+            "assets": [{
+                "name": "gxnu-campus-net-helper-v0.2.5.exe",
+                "browser_download_url": dl_url,
+                "size": 5_300_000,
+                "digest": format!("sha256:{sha}")
+            }]
+        })
+        .to_string();
+
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut req_buf = [0u8; 2048];
+            let n = stream.read(&mut req_buf).unwrap_or(0);
+            let req = String::from_utf8_lossy(&req_buf[..n]);
+            assert!(req.starts_with("GET /releases/latest "), "{req}");
+            let hdr = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                api_json.len()
+            );
+            stream.write_all(hdr.as_bytes()).unwrap();
+            stream.write_all(api_json.as_bytes()).unwrap();
+        });
+
+        let mut net = UpdateNetContext::default();
+        let info = check_for_updates_internal(
+            "0.2.4",
+            &base,
+            &base,
+            true,
+            CheckMode::Manual,
+            Duration::from_secs(2),
+            &mut net,
+        )
+        .unwrap()
+        .expect("should detect v0.2.5 in 1 RTT");
+        server.join().unwrap();
+
+        assert_eq!(info.version, "0.2.5");
+        assert_eq!(info.sha256.as_deref(), Some(sha.as_str()));
+        assert_eq!(info.notes, "- **极速检查更新**：单跳响应。");
+    }
+
+    #[test]
+    fn manual_check_falls_back_on_403_and_skips_api_during_cooldown() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let manifest_json = serde_json::json!({
+            "version": "0.2.5",
+            "tag": "v0.2.5",
+            "asset_name": "gxnu-campus-net-helper-v0.2.5.exe",
+            "download_url": format!("{base}/download/gxnu-campus-net-helper-v0.2.5.exe"),
+            "html_url": format!("{base}/releases/tag/v0.2.5"),
+            "notes": "- **零限流回退**"
+        })
+        .to_string();
+
+        let api_hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let api_hits_srv = Arc::clone(&api_hits);
+        let server = std::thread::spawn(move || {
+            // 第一次手动检查：API 403 -> HEAD 302 -> GET /download/v0.2.5/latest.json
+            // 第二次手动检查（冷却中）：跳过 API -> HEAD 302 -> GET /download/v0.2.5/latest.json
+            for _ in 0..5 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut req_buf = [0u8; 2048];
+                let n = stream.read(&mut req_buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&req_buf[..n]);
+                if req.starts_with("GET /releases/latest ") {
+                    api_hits_srv.fetch_add(1, AtomicOrdering::SeqCst);
+                    let resp = "HTTP/1.1 403 Forbidden\r\nRetry-After: 300\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    stream.write_all(resp.as_bytes()).unwrap();
+                } else if req.starts_with("HEAD /releases/latest ") {
+                    let resp = "HTTP/1.1 302 Found\r\nLocation: /releases/tag/v0.2.5\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    stream.write_all(resp.as_bytes()).unwrap();
+                } else if req.starts_with("GET /releases/download/v0.2.5/latest.json ") {
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                        manifest_json.len()
+                    );
+                    stream.write_all(hdr.as_bytes()).unwrap();
+                    stream.write_all(manifest_json.as_bytes()).unwrap();
+                } else {
+                    panic!("unexpected request: {req}");
+                }
+            }
+        });
+
+        let mut net = UpdateNetContext::default();
+        for _ in 0..2 {
+            let info = check_for_updates_internal(
+                "0.2.4",
+                &base,
+                &base,
+                true,
+                CheckMode::Manual,
+                Duration::from_secs(2),
+                &mut net,
+            )
+            .unwrap()
+            .expect("should detect v0.2.5 via manifest");
+            assert_eq!(info.version, "0.2.5");
+        }
+        server.join().unwrap();
+        assert_eq!(api_hits.load(AtomicOrdering::SeqCst), 1);
+        assert!(net.is_api_rate_limited());
+    }
+
+    #[test]
+    fn manual_check_hedges_to_web_manifest_when_api_stalls() {
+        let api_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let api_base = format!("http://{}", api_listener.local_addr().unwrap());
+        let web_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let web_base = format!("http://{}", web_listener.local_addr().unwrap());
+        let manifest_json = serde_json::json!({
+            "version": "0.2.5",
+            "tag": "v0.2.5",
+            "asset_name": "gxnu-campus-net-helper-v0.2.5.exe",
+            "download_url": format!("{web_base}/download/gxnu-campus-net-helper-v0.2.5.exe"),
+            "html_url": format!("{web_base}/releases/tag/v0.2.5"),
+            "notes": "- 对冲通道胜出"
+        })
+        .to_string();
+
+        // 模拟 API 长时间挂起（1.5 秒）
+        let _api_srv = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = api_listener.accept() {
+                http::mock::read_request(&mut stream);
+                std::thread::sleep(Duration::from_millis(1500));
+            }
+        });
+        let web_srv = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let (mut stream, _) = web_listener.accept().unwrap();
+                let mut req_buf = [0u8; 2048];
+                let n = stream.read(&mut req_buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&req_buf[..n]);
+                if req.starts_with("HEAD /releases/latest ") {
+                    let resp = "HTTP/1.1 302 Found\r\nLocation: /releases/tag/v0.2.5\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    stream.write_all(resp.as_bytes()).unwrap();
+                } else {
+                    let hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+                        manifest_json.len()
+                    );
+                    stream.write_all(hdr.as_bytes()).unwrap();
+                    stream.write_all(manifest_json.as_bytes()).unwrap();
+                }
+            }
+        });
+
+        let started = Instant::now();
+        let mut net = UpdateNetContext::default();
+        let info = check_for_updates_internal(
+            "0.2.4",
+            &web_base,
+            &api_base,
+            true,
+            CheckMode::Manual,
+            Duration::from_millis(80),
+            &mut net,
+        )
+        .unwrap()
+        .expect("hedged web manifest should win immediately");
+        let elapsed = started.elapsed();
+        web_srv.join().unwrap();
+
+        assert_eq!(info.version, "0.2.5");
+        assert!(
+            elapsed < Duration::from_millis(900),
+            "should return before stalled API finishes: {elapsed:?}"
+        );
     }
 
     #[test]
@@ -1415,12 +2589,15 @@ mod tests {
 
         let pe_for_srv = fake_pe.clone();
         let srv = std::thread::spawn(move || {
-            for _ in 0..2 {
+            for _ in 0..3 {
                 let (mut stream, _) = listener.accept().unwrap();
                 let mut req_buf = [0u8; 2048];
                 let n = stream.read(&mut req_buf).unwrap_or(0);
                 let line = String::from_utf8_lossy(&req_buf[..n]);
-                if line.starts_with("GET /releases/latest/download/latest.json ") {
+                if line.starts_with("HEAD /releases/latest ") {
+                    let hdr = "HTTP/1.1 302 Found\r\nLocation: /releases/tag/v0.2.3\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    stream.write_all(hdr.as_bytes()).unwrap();
+                } else if line.starts_with("GET /releases/download/v0.2.3/latest.json ") {
                     let hdr = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
                         manifest_json.len()
@@ -1455,5 +2632,39 @@ mod tests {
 
         assert_eq!(last_prog, fake_pe.len() as u64);
         assert_eq!(fs::read(&dest).unwrap().len(), fake_pe.len());
+    }
+
+    #[test]
+    fn manual_request_promotes_in_flight_auto_check_and_emits_checking() {
+        let dir = tempfile::tempdir().unwrap();
+        let seen = Arc::new(Mutex::new(Vec::<UpdateStatus>::new()));
+        let seen_cb = Arc::clone(&seen);
+        let mgr = UpdateManager::new(
+            dir.path().to_path_buf(),
+            false,
+            String::new(),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(move |st| {
+                seen_cb.lock().unwrap().push(st.status);
+            }),
+            Arc::new(|| {}),
+        );
+
+        {
+            let mut g = mgr.inner.0.lock().unwrap();
+            g.busy = true;
+            g.in_flight_check = true;
+            g.manual_promoted = false;
+        }
+        mgr.request_check(true);
+
+        {
+            let g = mgr.inner.0.lock().unwrap();
+            assert!(g.manual_promoted);
+            assert_eq!(g.state.status, UpdateStatus::Checking);
+            assert!(g.pending_task.is_none());
+        }
+        assert_eq!(*seen.lock().unwrap(), vec![UpdateStatus::Checking]);
+        mgr.shutdown();
     }
 }

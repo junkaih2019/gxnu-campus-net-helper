@@ -1,5 +1,5 @@
 use std::collections::{HashSet, VecDeque};
-use std::sync::{mpsc::RecvTimeoutError, Condvar, Mutex};
+use std::sync::{mpsc::RecvTimeoutError, Arc, Condvar, Mutex};
 use std::time::Duration;
 
 use super::{DaemonToUi, SnapshotEnvelope, UiToDaemon, CLIENT_QUEUE};
@@ -144,9 +144,21 @@ fn prompt_account(snapshot: &MonitorSnapshot, opened: &mut bool) -> bool {
 pub struct ClientInbox {
     state: Mutex<Incoming>,
     reply_ready: Condvar,
+    waker: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl ClientInbox {
+    /// 注册 UI 立即重绘唤醒器（当更新状态、命令回执或弹窗指令到达时立即唤醒界面，消除 250ms 轮询延迟）。
+    pub fn set_waker(&self, waker: Arc<dyn Fn() + Send + Sync>) {
+        *self.waker.lock().unwrap() = Some(waker);
+    }
+
+    fn wake(&self) {
+        let cb = self.waker.lock().unwrap().clone();
+        if let Some(cb) = cb {
+            cb();
+        }
+    }
     pub(super) fn reserve(&self, id: u64, command: &UiToDaemon) -> Result<(), String> {
         let mut state = self.state.lock().unwrap();
         if state.disconnected || state.shutdown {
@@ -195,39 +207,66 @@ impl ClientInbox {
     }
 
     pub(super) fn receive(&self, msg: DaemonToUi) {
-        let mut state = self.state.lock().unwrap();
-        match msg {
-            DaemonToUi::Snapshot(env) => state.snapshot(env),
-            DaemonToUi::LogLine { line } => {
-                if state.unread.logs.len() == MAX_LOG_LINES {
-                    state.unread.logs.pop_front();
+        let should_wake = {
+            let mut state = self.state.lock().unwrap();
+            let had_manual_check = state.unread.manual_check.is_some();
+            match msg {
+                DaemonToUi::Snapshot(env) => {
+                    state.snapshot(env);
+                    !had_manual_check && state.unread.manual_check.is_some()
                 }
-                state.unread.logs.push_back(line);
-            }
-            DaemonToUi::CommandResult { id, result } => {
-                if state.awaiting.remove(&id) {
-                    state.unread.replies.push_back((id, result));
-                    self.reply_ready.notify_one();
+                DaemonToUi::LogLine { line } => {
+                    if state.unread.logs.len() == MAX_LOG_LINES {
+                        state.unread.logs.pop_front();
+                    }
+                    state.unread.logs.push_back(line);
+                    false
+                }
+                DaemonToUi::CommandResult { id, result } => {
+                    if state.awaiting.remove(&id) {
+                        state.unread.replies.push_back((id, result));
+                        self.reply_ready.notify_one();
+                        true
+                    } else {
+                        false
+                    }
+                }
+                DaemonToUi::KickResult {
+                    ip,
+                    is_local,
+                    result,
+                } => {
+                    state.kick_result((ip, is_local, result));
+                    true
+                }
+                DaemonToUi::UpdateState(update) => {
+                    state.update(*update);
+                    true
+                }
+                DaemonToUi::OpenAccountSettings => {
+                    state.unread.open_account_settings = true;
+                    true
+                }
+                DaemonToUi::OpenUpdateModal => {
+                    state.unread.open_update_modal = true;
+                    true
+                }
+                DaemonToUi::Shutdown => {
+                    state.shutdown = true;
+                    self.reply_ready.notify_all();
+                    true
                 }
             }
-            DaemonToUi::KickResult {
-                ip,
-                is_local,
-                result,
-            } => state.kick_result((ip, is_local, result)),
-            DaemonToUi::UpdateState(update) => state.update(*update),
-            DaemonToUi::OpenAccountSettings => state.unread.open_account_settings = true,
-            DaemonToUi::OpenUpdateModal => state.unread.open_update_modal = true,
-            DaemonToUi::Shutdown => {
-                state.shutdown = true;
-                self.reply_ready.notify_all();
-            }
+        };
+        if should_wake {
+            self.wake();
         }
     }
 
     pub(super) fn disconnect(&self) {
         self.state.lock().unwrap().disconnected = true;
         self.reply_ready.notify_all();
+        self.wake();
     }
 
     pub fn connection_lost(&self) -> bool {
@@ -369,5 +408,30 @@ mod tests {
             inbox.recv_reply_timeout(Duration::from_secs(1)),
             Err(RecvTimeoutError::Disconnected)
         );
+    }
+
+    #[test]
+    fn waker_fires_on_interactive_update_events_and_skips_routine_logs() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let inbox = ClientInbox::default();
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let wakes_cb = Arc::clone(&wakes);
+        inbox.set_waker(Arc::new(move || {
+            wakes_cb.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        inbox.receive(DaemonToUi::LogLine {
+            line: "routine heartbeat".into(),
+        });
+        assert_eq!(wakes.load(Ordering::SeqCst), 0);
+
+        inbox.receive(DaemonToUi::UpdateState(Box::new(UpdateState {
+            status: UpdateStatus::Available,
+            ..Default::default()
+        })));
+        assert_eq!(wakes.load(Ordering::SeqCst), 1);
+
+        inbox.receive(DaemonToUi::OpenUpdateModal);
+        assert_eq!(wakes.load(Ordering::SeqCst), 2);
     }
 }

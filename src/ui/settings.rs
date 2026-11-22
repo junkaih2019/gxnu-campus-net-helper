@@ -1995,8 +1995,11 @@ fn draw_monitor_page(
                                 actions.open_update_modal = true;
                             }
                         }
-                        UpdateStatus::Checking | UpdateStatus::Applying => {
-                            badge(ui, p.accent, p.accent_soft, p.accent_border, "处理中…");
+                        UpdateStatus::Checking => {
+                            badge(ui, p.accent, p.accent_soft, p.accent_border, "检查中…");
+                        }
+                        UpdateStatus::Applying => {
+                            badge(ui, p.ok, p.ok_soft, p.ok_border, "更新中…");
                         }
                         _ => {
                             if draw_compact_action_btn(
