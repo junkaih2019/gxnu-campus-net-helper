@@ -56,6 +56,8 @@ pub struct SettingsForm {
     pub password: String,
     pub show_password: bool,
     pub carrier: usize,
+    /// 新增运营商账号时是否同时自动生成同密码的「校园网」快捷切换项。
+    pub also_create_campus_exit: bool,
     /// 最近一次保存前验密被拒的中文说明；存在时在账号卡片内展示醒目红框与「仍要强制保存」兜底入口。
     pub verify_error: Option<String>,
     pub check_interval: i64,
@@ -98,6 +100,7 @@ impl SettingsForm {
             password: String::new(),
             show_password: false,
             carrier,
+            also_create_campus_exit: settings.accounts.is_empty(),
             verify_error: None,
             check_interval: settings.check_interval,
             heartbeat_minutes: (settings.heartbeat_interval / 60).clamp(1, 1440),
@@ -126,6 +129,7 @@ impl SettingsForm {
         self.password.clear();
         self.show_password = false;
         self.carrier = profile.carrier.parse::<usize>().unwrap_or(2).min(4);
+        self.also_create_campus_exit = false;
         self.verify_error = None;
         self.monthly_quota_gb = profile.monthly_quota_gb;
     }
@@ -137,8 +141,29 @@ impl SettingsForm {
         self.password.clear();
         self.show_password = false;
         self.carrier = 2;
+        self.also_create_campus_exit = true;
         self.verify_error = None;
         self.monthly_quota_gb = 0;
+    }
+
+    /// 从已有账号派生新出口草稿：默认带入当前活跃学号（可免重输密码），并自动选中尚未配置的「校园网」或下一运营商出口。
+    pub fn start_new_from_existing(&mut self, saved: &Settings) {
+        if let Some(base) = saved
+            .active_account()
+            .filter(|a| !a.student_id.trim().is_empty())
+        {
+            self.editing_account_id = None;
+            self.remark.clear();
+            self.student_id = base.student_id.clone();
+            self.password.clear();
+            self.show_password = false;
+            self.carrier = saved.suggest_next_carrier_for(&base.student_id);
+            self.also_create_campus_exit = !saved.has_carrier_for_student(&base.student_id, "0");
+            self.verify_error = None;
+            self.monthly_quota_gb = 0;
+        } else {
+            self.start_new_account();
+        }
     }
 
     /// 将全局监控/自启/通知参数合并回给定配置，保留已有账号列表与活跃账号。
@@ -249,7 +274,7 @@ pub fn draw_settings_view(
     let global_dirty = form.is_global_dirty(saved);
     let draft_dirty = form.is_account_draft_dirty(saved);
     let show_floating_bar = global_dirty
-        || (draft_dirty && form.tab != SettingsTab::Account)
+        || (draft_dirty && form.tab != SettingsTab::Account && form.editing_account_id.is_some())
         || (needs_setup && form.tab != SettingsTab::Account);
 
     let left_wm_h = 34.0_f32;
@@ -606,9 +631,14 @@ fn draw_account_page(
                     if form.editing_account_id.is_none() && !saved.accounts.is_empty() {
                         badge(ui, p.accent, p.accent_soft, p.accent_border, "正在新增账号");
                     } else if draw_compact_action_btn(ui, p, Some(Icon::Plus), "新增账号", true)
+                        .on_hover_text(if saved.accounts.is_empty() {
+                            "添加校园网账号"
+                        } else {
+                            "新增其他出口（默认带入当前学号并复用已存密码）或添加新学号"
+                        })
                         .clicked()
                     {
-                        form.start_new_account();
+                        form.start_new_from_existing(saved);
                     }
                 });
             },
@@ -634,7 +664,10 @@ fn draw_account_page(
                 let is_active = acc.id == saved.active_account_id;
                 let is_editing = form.editing_account_id.as_deref() == Some(acc.id.as_str());
                 let has_cred = account_creds.get(&acc.id).copied().unwrap_or(false);
-                draw_saved_account_row(ui, p, acc, is_active, is_editing, has_cred, form, actions);
+                let disp = saved.account_display_name(acc);
+                draw_saved_account_row(
+                    ui, p, acc, &disp, is_active, is_editing, has_cred, form, actions,
+                );
             }
         }
     });
@@ -651,6 +684,27 @@ fn draw_account_page(
         account_creds.get(&acc.id).copied().unwrap_or(false)
             && acc.student_id.trim() == form.student_id.trim()
     });
+    let reusable_peer_cred = is_new
+        && saved
+            .reusable_cred_account_id(&form.student_id, |id| {
+                account_creds.get(id).copied().unwrap_or(false)
+            })
+            .is_some();
+    let same_sid_peer_count = {
+        let sid = form.student_id.trim();
+        if sid.is_empty() {
+            0usize
+        } else {
+            saved
+                .accounts
+                .iter()
+                .filter(|a| {
+                    Some(a.id.as_str()) != form.editing_account_id.as_deref()
+                        && a.student_id.trim() == sid
+                })
+                .count()
+        }
+    };
     let draft_dirty = form.is_account_draft_dirty(saved);
 
     group_card(ui, p, |ui| {
@@ -661,7 +715,8 @@ fn draw_account_page(
             |ui| {
                 ui.spacing_mut().item_spacing.x = 6.0;
                 let heading = match editing_saved {
-                    Some(acc) => format!("编辑账号 · {}", acc.display_name()),
+                    Some(acc) => format!("编辑账号 · {}", saved.account_display_name(acc)),
+                    None if reusable_peer_cred => "新增出口（复用当前学号）".to_string(),
                     None => "新增校园网账号".to_string(),
                 };
                 ui.label(bold_text(heading, 12.5, p.text));
@@ -671,12 +726,26 @@ fn draw_account_page(
                     }
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if is_new
-                        && !saved.accounts.is_empty()
-                        && draw_compact_action_btn(ui, p, None, "取消新增", false).clicked()
-                    {
-                        if let Some(active) = saved.active_account() {
-                            form.load_account_draft(active);
+                    ui.spacing_mut().item_spacing.x = 6.0;
+                    if is_new && !saved.accounts.is_empty() {
+                        if draw_compact_action_btn(ui, p, None, "取消新增", false).clicked() {
+                            if let Some(active) = saved.active_account() {
+                                form.load_account_draft(active);
+                            }
+                        }
+                        if !form.student_id.trim().is_empty() && same_sid_peer_count > 0 {
+                            if draw_compact_action_btn(ui, p, None, "改填新学号", false)
+                                .on_hover_text("清空当前学号，填写另一个人的校园网账号")
+                                .clicked()
+                            {
+                                form.start_new_account();
+                            }
+                        } else if form.student_id.trim().is_empty()
+                            && draw_compact_action_btn(ui, p, None, "复用当前学号", true)
+                                .on_hover_text("带入当前活跃学号并自动复用已存密码")
+                                .clicked()
+                        {
+                            form.start_new_from_existing(saved);
                         }
                     }
                 });
@@ -745,6 +814,8 @@ fn draw_account_page(
                     ui.add_space(4.0);
                     let hint = if editing_has_cred {
                         "已保存，留空不修改"
+                    } else if reusable_peer_cred {
+                        "留空直接复用该学号已存密码"
                     } else {
                         "输入校园网密码"
                     };
@@ -777,18 +848,34 @@ fn draw_account_page(
                     ui.label(body_text("凭据安全存储", 11.5, p.text_secondary));
                     ui.add_space(4.0);
                     let (fg, bg, border, status_txt) = if !form.password.is_empty() {
-                        (
-                            p.accent,
-                            p.accent_soft,
-                            p.accent_border,
-                            "保存后将加密更新 DPAPI 凭据",
-                        )
+                        if same_sid_peer_count > 0 {
+                            (
+                                p.accent,
+                                p.accent_soft,
+                                p.accent_border,
+                                "保存后将加密更新并同步同号出口",
+                            )
+                        } else {
+                            (
+                                p.accent,
+                                p.accent_soft,
+                                p.accent_border,
+                                "保存后将加密更新 DPAPI 凭据",
+                            )
+                        }
                     } else if editing_has_cred {
                         (
                             p.ok,
                             p.ok_soft,
                             p.ok_border,
                             "已加密保存在 Windows 凭据管理器",
+                        )
+                    } else if reusable_peer_cred {
+                        (
+                            p.ok,
+                            p.ok_soft,
+                            p.ok_border,
+                            "自动复用同学号已加密保存的密码",
                         )
                     } else {
                         (
@@ -833,6 +920,10 @@ fn draw_account_page(
         if draw_carrier_row(ui, p, &mut form.carrier) && form.carrier == 0 {
             actions.selected_campus_carrier = true;
         }
+        let can_pair_campus = is_new
+            && form.carrier != 0
+            && (form.student_id.trim().is_empty()
+                || !saved.has_carrier_for_student(&form.student_id, "0"));
         if form.carrier == 0 {
             ui.add_space(3.0);
             ui.label(body_text(
@@ -840,6 +931,14 @@ fn draw_account_page(
                 10.5,
                 p.warn,
             ));
+        } else if can_pair_campus {
+            ui.add_space(2.0);
+            draw_inline_checkbox_row(
+                ui,
+                p,
+                &mut form.also_create_campus_exit,
+                "同时为该学号生成「校园网」快捷切换项（共享密码，顶栏与托盘可一键互切）",
+            );
         }
 
         // 若上次点击保存时当场验密未通过，展示醒目红色原因卡片与「仍要强制保存」兜底按钮
@@ -905,7 +1004,8 @@ fn draw_account_page(
 
         // 卡片底部操作行：左安全隔离说明 + 右还原/保存账号按钮
         let foot_w = ui.available_width();
-        let right_reserve = if draft_dirty && !verifying_account {
+        let show_card_reset = draft_dirty && !is_new && !verifying_account;
+        let right_reserve = if show_card_reset {
             216.0_f32
         } else {
             136.0_f32
@@ -950,16 +1050,11 @@ fn draw_account_page(
                     if clicked {
                         actions.save_profile = true;
                     }
-                    if draft_dirty
-                        && !verifying_account
-                        && secondary_button(ui, p, None, "还原").clicked()
-                    {
+                    if show_card_reset && secondary_button(ui, p, None, "还原").clicked() {
                         if let Some(id) = form.editing_account_id.clone() {
                             if let Some(acc) = saved.find_account(&id) {
                                 form.load_account_draft(acc);
                             }
-                        } else {
-                            form.start_new_account();
                         }
                     }
                 });
@@ -973,6 +1068,7 @@ fn draw_saved_account_row(
     ui: &mut egui::Ui,
     p: &Palette,
     acc: &AccountProfile,
+    display_name: &str,
     is_active: bool,
     is_editing: bool,
     has_cred: bool,
@@ -1042,11 +1138,10 @@ fn draw_saved_account_row(
     let title_y = left_rect.top() + 9.5;
     let sub_y = left_rect.bottom() - 8.5;
 
-    let display_name = acc.display_name();
     let title_font = egui::FontId::new(12.5, crate::ui::theme::bold_family());
     let title_galley = ui
         .painter()
-        .layout_no_wrap(display_name, title_font, p.text);
+        .layout_no_wrap(display_name.to_string(), title_font, p.text);
     let title_w = title_galley.size().x;
     ui.painter().galley(
         Pos2::new(text_x, title_y - title_galley.size().y * 0.5),
@@ -1090,15 +1185,18 @@ fn draw_saved_account_row(
     } else {
         String::new()
     };
-    let subtitle = if acc.remark.trim().is_empty() {
-        format!("{}{}", carrier_label(&acc.carrier), quota_part)
-    } else {
+    let carrier_lbl = carrier_label(&acc.carrier);
+    let subtitle = if !acc.remark.trim().is_empty() {
         format!(
             "{} · {}{}",
             acc.masked_student_id(),
-            carrier_label(&acc.carrier),
+            carrier_lbl,
             quota_part
         )
+    } else if display_name == carrier_lbl {
+        format!("{}{}", acc.masked_student_id(), quota_part)
+    } else {
+        format!("{}{}", carrier_lbl, quota_part)
     };
     ui.painter().text(
         Pos2::new(text_x, sub_y),
@@ -1199,6 +1297,48 @@ fn draw_compact_action_btn(
         text_c,
     );
     resp
+}
+
+fn draw_inline_checkbox_row(ui: &mut egui::Ui, p: &Palette, checked: &mut bool, label: &str) {
+    let row_w = ui.available_width();
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(row_w, 20.0), Sense::click());
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    if resp.clicked() {
+        *checked = !*checked;
+    }
+    let cy = rect.center().y;
+    let box_r = Rect::from_center_size(Pos2::new(rect.left() + 8.0, cy), Vec2::splat(14.5));
+    let (fill, stroke) = if *checked {
+        (p.accent, Stroke::NONE)
+    } else if resp.hovered() {
+        (p.card_hover, Stroke::new(1.0_f32, p.accent))
+    } else {
+        (p.input_bg, Stroke::new(1.0_f32, p.border_strong))
+    };
+    ui.painter().rect(
+        box_r,
+        CornerRadius::same(4),
+        fill,
+        stroke,
+        StrokeKind::Inside,
+    );
+    if *checked {
+        icons::paint(ui.painter(), box_r.shrink(2.2), Icon::Check, p.on_accent);
+    }
+    let text_c = if *checked || resp.hovered() {
+        p.text_secondary
+    } else {
+        p.text_muted
+    };
+    let g =
+        ui.painter()
+            .layout_no_wrap(label.to_string(), egui::FontId::proportional(10.8), text_c);
+    let clip = Rect::from_min_max(Pos2::new(box_r.right() + 6.0, rect.top()), rect.max);
+    ui.painter().with_clip_rect(clip).galley(
+        Pos2::new(box_r.right() + 6.0, cy - g.size().y * 0.5),
+        g,
+        text_c,
+    );
 }
 
 fn draw_carrier_row(ui: &mut egui::Ui, p: &Palette, carrier: &mut usize) -> bool {

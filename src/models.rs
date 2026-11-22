@@ -579,6 +579,18 @@ pub fn mask_student_id(id: &str) -> String {
     }
 }
 
+/// 运营商编码转标准中文名称（与师大认证门户 `ISP_select` 严格一致）。
+pub fn carrier_display_name(carrier: &str) -> &'static str {
+    match carrier {
+        "0" => "校园网",
+        "1" => "中国电信",
+        "2" => "中国联通",
+        "3" => "中国移动",
+        "4" => "广电网络",
+        _ => "中国联通",
+    }
+}
+
 fn normalize_carrier(raw: &str) -> String {
     if matches!(raw, "0" | "1" | "2" | "3" | "4") {
         raw.to_string()
@@ -732,10 +744,76 @@ impl Settings {
         self.accounts.iter().find(|a| a.id == id)
     }
 
-    /// 返回当前活跃账号的展示名（优先备注，次选脱敏学号，未配置时返回「未配置账号」）。
+    /// 判断同一学号在配置列表中是否拥有多个不同出口条目（如「联通 + 校园网」）。
+    pub fn has_same_student_id_peers(&self, acc: &AccountProfile) -> bool {
+        let sid = acc.student_id.trim();
+        !sid.is_empty()
+            && self
+                .accounts
+                .iter()
+                .filter(|a| a.student_id.trim() == sid)
+                .count()
+                > 1
+    }
+
+    /// 智能展示名：优先使用用户备注；若未填备注且同一学号下存在多个出口配置，则直接以出口名称（如「中国联通」「校园网」）区分；否则回退为脱敏学号。
+    pub fn account_display_name(&self, acc: &AccountProfile) -> String {
+        let remark = acc.remark.trim();
+        if !remark.is_empty() {
+            return remark.to_string();
+        }
+        if self.has_same_student_id_peers(acc) {
+            return carrier_display_name(&acc.carrier).to_string();
+        }
+        acc.display_name()
+    }
+
+    /// 判断指定学号是否已配置某个出口编码（`"0"`..`"4"`）。
+    pub fn has_carrier_for_student(&self, student_id: &str, carrier: &str) -> bool {
+        let sid = student_id.trim();
+        !sid.is_empty()
+            && self
+                .accounts
+                .iter()
+                .any(|a| a.student_id.trim() == sid && a.carrier == carrier)
+    }
+
+    /// 为同一学号派生新条目时智能推荐下一个尚未配置的出口（优先补齐 `"0"` 校园网，其次按常用运营商顺序挑选）。
+    pub fn suggest_next_carrier_for(&self, student_id: &str) -> usize {
+        for candidate in [0usize, 2, 1, 3, 4] {
+            let code = candidate.to_string();
+            if !self.has_carrier_for_student(student_id, &code) {
+                return candidate;
+            }
+        }
+        2
+    }
+
+    /// 查找同一学号下已存有加密凭据的已有账号 ID（供新增其他出口时直接免输复用密码）。
+    pub fn reusable_cred_account_id<'a>(
+        &'a self,
+        student_id: &str,
+        has_cred: impl Fn(&str) -> bool,
+    ) -> Option<&'a str> {
+        let sid = student_id.trim();
+        if sid.is_empty() {
+            return None;
+        }
+        if let Some(active) = self.active_account() {
+            if active.student_id.trim() == sid && has_cred(&active.id) {
+                return Some(active.id.as_str());
+            }
+        }
+        self.accounts
+            .iter()
+            .find(|a| a.student_id.trim() == sid && has_cred(&a.id))
+            .map(|a| a.id.as_str())
+    }
+
+    /// 返回当前活跃账号的展示名（优先备注，同号多出口次选运营商名，单账号回退脱敏学号）。
     pub fn active_display_name(&self) -> String {
         if let Some(acc) = self.active_account() {
-            return acc.display_name();
+            return self.account_display_name(acc);
         }
         if !self.student_id.trim().is_empty() {
             return mask_student_id(&self.student_id);
@@ -927,5 +1005,47 @@ mod tests {
         assert_eq!(settings.accounts.len(), 1);
         assert_eq!(settings.active_account_id, "acc-dorm");
         assert_eq!(settings.student_id, "20240001");
+    }
+
+    #[test]
+    fn dual_exit_same_student_uses_carrier_names_and_suggests_missing_campus_exit() {
+        let mut settings = Settings::default();
+        settings.upsert_account(
+            AccountProfile {
+                id: "acc-isp".into(),
+                remark: String::new(),
+                student_id: "2024010615".into(),
+                carrier: "2".into(),
+                monthly_quota_gb: 0,
+            },
+            true,
+        );
+        // 仅单个出口且无备注时保持脱敏学号展示，推荐补齐 0（校园网）
+        assert_eq!(settings.active_display_name(), "2024***");
+        assert_eq!(settings.suggest_next_carrier_for("2024010615"), 0);
+
+        // 新增同学号「校园网」出口且均未填备注时，自动以出口名称区分两条配置
+        settings.upsert_account(
+            AccountProfile {
+                id: "acc-campus".into(),
+                remark: String::new(),
+                student_id: "2024010615".into(),
+                carrier: "0".into(),
+                monthly_quota_gb: 0,
+            },
+            false,
+        );
+        assert_eq!(settings.active_display_name(), "中国联通");
+        let campus_acc = settings.find_account("acc-campus").unwrap();
+        assert_eq!(settings.account_display_name(campus_acc), "校园网");
+        assert_eq!(settings.suggest_next_carrier_for("2024010615"), 1);
+        assert_eq!(
+            settings.reusable_cred_account_id("2024010615", |id| id == "acc-isp"),
+            Some("acc-isp")
+        );
+        assert_eq!(
+            settings.reusable_cred_account_id("2024888888", |_| true),
+            None
+        );
     }
 }

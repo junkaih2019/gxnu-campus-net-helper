@@ -634,7 +634,7 @@ fn load_flyout_accounts(app_dir: &Path) -> Vec<FlyoutAccountItem> {
         .iter()
         .map(|acc| FlyoutAccountItem {
             id: acc.id.clone(),
-            display_name: acc.display_name(),
+            display_name: settings.account_display_name(acc),
             masked_student_id: acc.masked_student_id(),
             has_remark: !acc.remark.trim().is_empty(),
             carrier: acc.carrier.clone(),
@@ -2597,6 +2597,8 @@ unsafe fn draw_account_dropdown_overlay(
         );
         let sub_txt = if acc.has_remark {
             format!("{} · {}", acc.masked_student_id, acc.carrier_label)
+        } else if acc.display_name == acc.carrier_label {
+            acc.masked_student_id.clone()
         } else {
             acc.carrier_label.to_string()
         };

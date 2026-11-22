@@ -596,6 +596,27 @@ impl GuardApp {
         self.request(command, startup_error);
     }
 
+    fn load_reusable_peer_credential(
+        &self,
+        student_id: &str,
+        exclude_id: &str,
+    ) -> Option<credentials::StoredCredential> {
+        let sid = student_id.trim();
+        if sid.is_empty() {
+            return None;
+        }
+        for acc in &self.settings.accounts {
+            if acc.id != exclude_id && acc.student_id.trim() == sid {
+                if let Ok(Some(cred)) = credentials::load_for_account(&acc.id, sid) {
+                    if cred.matches_account(sid) && !cred.password.is_empty() {
+                        return Some(cred);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     fn begin_save_account_profile(
         &mut self,
         also_save_global: bool,
@@ -618,6 +639,20 @@ impl GuardApp {
                 credentials::generate_account_id()
             }
         });
+        let carrier_str = self.form.carrier.to_string();
+        if self.settings.accounts.iter().any(|a| {
+            a.id != account_id && a.student_id.trim() == student_id && a.carrier == carrier_str
+        }) {
+            self.show_toast(
+                format!(
+                    "该学号下已存在「{}」出口配置，无需重复添加",
+                    carrier_label(&carrier_str)
+                ),
+                true,
+            );
+            return;
+        }
+
         let previous = self.settings.find_account(&account_id).cloned();
         let previous_student_id = previous
             .as_ref()
@@ -640,9 +675,15 @@ impl GuardApp {
                 return;
             }
         };
+        let reused_peer = if self.form.password.is_empty() {
+            self.load_reusable_peer_credential(&student_id, &account_id)
+        } else {
+            None
+        };
         let has_matching = stored
             .as_ref()
-            .is_some_and(|c| c.matches_account(&student_id));
+            .is_some_and(|c| c.matches_account(&student_id))
+            || reused_peer.is_some();
         if (self.needs_setup || is_new) && self.form.password.is_empty() && !has_matching {
             self.show_toast("请输入该账号的校园网密码", true);
             return;
@@ -671,7 +712,6 @@ impl GuardApp {
             return;
         }
 
-        let carrier_str = self.form.carrier.to_string();
         let identity_or_pwd_changed = self.needs_setup
             || is_new
             || !self.form.password.is_empty()
@@ -687,6 +727,8 @@ impl GuardApp {
             self.form.password.clone()
         } else if let Some(c) = stored.filter(|c| c.matches_account(&student_id)) {
             c.password
+        } else if let Some(peer_cred) = reused_peer {
+            peer_cred.password
         } else {
             self.commit_account_profile(also_save_global, None);
             return;
@@ -748,7 +790,6 @@ impl GuardApp {
             self.settings.clone()
         };
         let profile = self.form.draft_profile(account_id.clone());
-        let display_name = profile.display_name();
         let make_active = self.settings.accounts.is_empty()
             || self.needs_setup
             || account_id == self.settings.active_account_id;
@@ -760,29 +801,81 @@ impl GuardApp {
             previous_student_id.as_str()
         };
         let start = self.needs_setup;
-        let result = credentials::load_for_account(&account_id, lookup_sid).and_then(|stored| {
-            let has_matching = stored
-                .as_ref()
-                .is_some_and(|c| c.matches_account(&student_id));
-            if (start || is_new) && self.form.password.is_empty() && !has_matching {
-                return Err("请输入该账号的校园网密码".into());
+        let entered_password = self.form.password.clone();
+        let reused_peer_pwd = if entered_password.is_empty() {
+            self.load_reusable_peer_credential(&student_id, &account_id)
+                .map(|c| c.password)
+        } else {
+            None
+        };
+
+        let stored = match credentials::load_for_account(&account_id, lookup_sid) {
+            Ok(s) => s,
+            Err(err) => {
+                self.show_toast(format!("保存账号失败：{err}"), true);
+                return;
             }
-            let target_id = account_id.clone();
-            self.store.save_profile_credential(
-                &next,
-                &account_id,
-                &previous_student_id,
-                &self.form.password,
-                stored.as_ref(),
-                |value| match value {
-                    Some(cred) => {
-                        credentials::save_for_account(&target_id, &cred.username, &cred.password)
-                    }
-                    None => credentials::delete_for_account(&target_id),
+        };
+        let stored_matching_pwd = stored
+            .as_ref()
+            .filter(|c| c.matches_account(&student_id))
+            .map(|c| c.password.clone());
+        let pwd_to_write = if !entered_password.is_empty() {
+            entered_password.clone()
+        } else if stored_matching_pwd.is_none() {
+            reused_peer_pwd.clone().unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if (start || is_new) && pwd_to_write.is_empty() && stored_matching_pwd.is_none() {
+            self.show_toast("保存账号失败：请输入该账号的校园网密码", true);
+            return;
+        }
+
+        // 若勾选了「同时生成校园网快捷切换项」，一并写入配置与凭据
+        let companion_pwd = if !pwd_to_write.is_empty() {
+            Some(pwd_to_write.clone())
+        } else {
+            stored_matching_pwd.clone()
+        };
+        let mut created_companion_id: Option<String> = None;
+        if is_new
+            && self.form.carrier != 0
+            && self.form.also_create_campus_exit
+            && !next.has_carrier_for_student(&student_id, "0")
+            && companion_pwd.is_some()
+        {
+            let mut cid = credentials::generate_account_id();
+            while cid == account_id || next.find_account(&cid).is_some() {
+                cid = credentials::generate_account_id();
+            }
+            next.upsert_account(
+                crate::models::AccountProfile {
+                    id: cid.clone(),
+                    remark: String::new(),
+                    student_id: student_id.clone(),
+                    carrier: "0".to_string(),
+                    monthly_quota_gb: 0,
                 },
-            )
-        });
-        let password_changed = match result {
+                false,
+            );
+            created_companion_id = Some(cid);
+        }
+
+        let target_id = account_id.clone();
+        let password_changed = match self.store.save_profile_credential(
+            &next,
+            &account_id,
+            &previous_student_id,
+            &pwd_to_write,
+            stored.as_ref(),
+            |value| match value {
+                Some(cred) => {
+                    credentials::save_for_account(&target_id, &cred.username, &cred.password)
+                }
+                None => credentials::delete_for_account(&target_id),
+            },
+        ) {
             Ok(changed) => changed,
             Err(err) => {
                 self.show_toast(format!("保存账号失败：{err}"), true);
@@ -790,9 +883,40 @@ impl GuardApp {
             }
         };
 
-        let saved_new_password = !self.form.password.is_empty();
+        if let (Some(cid), Some(pwd)) = (&created_companion_id, &companion_pwd) {
+            let _ = credentials::save_for_account(cid, &student_id, pwd);
+        }
+
+        // 同一学号改密自动联动：当用户输入了新密码时，同步刷新该学号下其他出口条目的加密凭据
+        let mut synced_peer_count = 0usize;
+        let mut peer_active_updated = false;
+        let mut synced_peer_ids = Vec::new();
+        if !entered_password.is_empty() {
+            for peer in &next.accounts {
+                if peer.id != account_id
+                    && Some(peer.id.as_str()) != created_companion_id.as_deref()
+                    && peer.student_id.trim() == student_id
+                    && credentials::save_for_account(&peer.id, &student_id, &entered_password)
+                        .is_ok()
+                {
+                    synced_peer_count += 1;
+                    synced_peer_ids.push(peer.id.clone());
+                    if peer.id == next.active_account_id {
+                        peer_active_updated = true;
+                    }
+                }
+            }
+        }
+
+        let display_name = next
+            .find_account(&account_id)
+            .map(|a| next.account_display_name(a))
+            .unwrap_or_else(|| student_id.clone());
+
+        let wrote_primary_pwd = !pwd_to_write.is_empty();
         self.form.password.clear();
         self.form.show_password = false;
+        self.form.also_create_campus_exit = false;
         self.form.verify_error = None;
         self.form.editing_account_id = Some(account_id.clone());
 
@@ -804,7 +928,7 @@ impl GuardApp {
         let affects_active = next.active_account_id == account_id;
         let command = UiToDaemon::ReloadSettings {
             start,
-            password_changed: password_changed && affects_active,
+            password_changed: (password_changed && affects_active) || peer_active_updated,
             expected: next.clone(),
         };
         self.settings = next;
@@ -813,18 +937,31 @@ impl GuardApp {
             self.form.auto_boot = self.settings.auto_boot;
         }
         self.refresh_account_creds();
-        if saved_new_password {
+        if wrote_primary_pwd {
             self.account_creds.insert(account_id.clone(), true);
+        }
+        if let Some(cid) = created_companion_id.as_ref() {
+            self.account_creds.insert(cid.clone(), true);
+        }
+        for pid in synced_peer_ids {
+            self.account_creds.insert(pid, true);
         }
         if let Some(active) = self.settings.active_account() {
             if self.account_creds.get(&active.id).copied().unwrap_or(false) {
                 self.needs_setup = false;
             }
         }
+        let extra_suffix = if created_companion_id.is_some() {
+            "，已同步生成「校园网」切换项".to_string()
+        } else if synced_peer_count > 0 {
+            format!("，已同步更新同号其他 {synced_peer_count} 个出口密码")
+        } else {
+            String::new()
+        };
         let toast_msg = match verify_note {
-            Some(note) => format!("已保存账号「{display_name}」（{note}）"),
-            None if is_new => format!("账号核验通过，已添加「{display_name}」"),
-            None => format!("账号核验通过，已保存「{display_name}」"),
+            Some(note) => format!("已保存账号「{display_name}」{extra_suffix}（{note}）"),
+            None if is_new => format!("账号核验通过，已添加「{display_name}」{extra_suffix}"),
+            None => format!("账号核验通过，已保存「{display_name}」{extra_suffix}"),
         };
         self.show_toast(toast_msg, false);
         self.request(command, startup_error);
@@ -844,12 +981,13 @@ impl GuardApp {
             .get(account_id)
             .copied()
             .unwrap_or_else(|| credentials::has_credential_for(&target.id, &target.student_id));
+        let target_label = self.settings.account_display_name(&target);
         if !has_cred {
             self.view = AppView::Settings;
             self.form.tab = settings_page::SettingsTab::Account;
             self.form.load_account_draft(&target);
             self.show_toast(
-                format!("请先为「{}」输入并保存密码后再切换", target.display_name()),
+                format!("请先为「{target_label}」输入并保存密码后再切换"),
                 true,
             );
             return;
@@ -858,7 +996,7 @@ impl GuardApp {
         if target.carrier == "0" {
             self.campus_vpn_modal = Some(CampusVpnModal::ConfirmSwitch {
                 account_id: account_id.to_string(),
-                display_name: target.display_name(),
+                display_name: target_label,
             });
             return;
         }
@@ -871,6 +1009,7 @@ impl GuardApp {
             self.show_toast("未找到目标账号", true);
             return;
         };
+        let target_label = self.settings.account_display_name(&target);
 
         let mut next = self.settings.clone();
         if let Err(err) = next.switch_active_account(account_id) {
@@ -887,7 +1026,7 @@ impl GuardApp {
         if !self.form.is_account_draft_dirty(&self.settings) {
             self.form.load_account_draft(&target);
         }
-        self.show_toast(format!("正在切换至「{}」…", target.display_name()), false);
+        self.show_toast(format!("正在切换至「{target_label}」…"), false);
         self.request(
             UiToDaemon::SwitchAccount {
                 account_id: account_id.to_string(),
@@ -1554,24 +1693,24 @@ impl GuardApp {
                                         icon_c,
                                     );
 
+                                    let disp = self.settings.account_display_name(acc);
+                                    let carrier_lbl = carrier_label(&acc.carrier);
                                     let tx = rect.left() + 31.0;
                                     let title_font =
                                         egui::FontId::new(12.0, crate::ui::theme::bold_family());
                                     ui.painter().text(
                                         Pos2::new(tx, rect.top() + 13.5),
                                         egui::Align2::LEFT_CENTER,
-                                        acc.display_name(),
+                                        &disp,
                                         title_font,
                                         p.text,
                                     );
-                                    let sub = if acc.remark.trim().is_empty() {
-                                        carrier_label(&acc.carrier).to_string()
+                                    let sub = if !acc.remark.trim().is_empty() {
+                                        format!("{} · {}", acc.masked_student_id(), carrier_lbl)
+                                    } else if disp == carrier_lbl {
+                                        acc.masked_student_id()
                                     } else {
-                                        format!(
-                                            "{} · {}",
-                                            acc.masked_student_id(),
-                                            carrier_label(&acc.carrier)
-                                        )
+                                        carrier_lbl.to_string()
                                     };
                                     ui.painter().text(
                                         Pos2::new(tx, rect.bottom() - 12.0),
