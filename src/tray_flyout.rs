@@ -30,8 +30,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyWindow, GetCursorPos, GetWindowLongPtrW,
     IsWindowVisible, LoadCursorW, RegisterClassW, SetForegroundWindow, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, CS_DROPSHADOW, CS_HREDRAW, CS_VREDRAW, GWLP_USERDATA, HWND_TOPMOST,
-    IDC_ARROW, IDC_HAND, SWP_NOACTIVATE, SW_HIDE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_ERASEBKGND,
-    WM_KEYDOWN, WM_KILLFOCUS, WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WNDCLASSW,
+    IDC_ARROW, IDC_HAND, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOREDRAW, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SW_HIDE, SW_SHOW, WA_INACTIVE, WM_ACTIVATE, WM_CLOSE, WM_ERASEBKGND, WM_KEYDOWN, WM_KILLFOCUS,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_PAINT, WM_RBUTTONUP, WM_WINDOWPOSCHANGED, WNDCLASSW,
     WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_POPUP,
 };
 
@@ -56,6 +57,7 @@ const TME_LEAVE_FLAG: u32 = 0x0000_0002;
 const VK_RETURN: u16 = 0x0D;
 const VK_ESCAPE: u16 = 0x1B;
 const DT_WORDBREAK_FLAG: u32 = 0x0000_0010;
+const DEVICE_KICK_TIMEOUT: Duration = Duration::from_secs(8);
 
 #[repr(C)]
 struct TrackMouseEventStruct {
@@ -244,6 +246,7 @@ struct HitBox {
 }
 
 #[derive(Clone)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 struct FlyoutDeviceView {
     terminal: String,
     ip: String,
@@ -253,6 +256,7 @@ struct FlyoutDeviceView {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(test, derive(Debug))]
 enum SlotKind {
     Online,
     Outage,
@@ -260,6 +264,8 @@ enum SlotKind {
     Idle,
 }
 
+#[derive(Default)]
+#[cfg_attr(test, derive(Clone, Debug, PartialEq))]
 struct FlyoutModel {
     // Header
     status_title: &'static str,
@@ -331,6 +337,25 @@ struct FlyoutState {
     last_deactivated: Option<Instant>,
 }
 
+impl FlyoutState {
+    fn release_hidden_data(&mut self) {
+        self.telemetry_cache = Vec::new();
+        self.hits = Vec::new();
+        self.accounts = Vec::new();
+        self.model = FlyoutModel::default();
+        self.account_dropdown_open = false;
+        self.vpn_confirm_target = None;
+        self.local_kick_confirm_ip = None;
+        self.hovered = None;
+        self.tracking_mouse = false;
+
+        // 快速重开时仍须禁止重复注销同一设备。
+        self.kicking_ips
+            .retain(|(_, started)| started.elapsed() < DEVICE_KICK_TIMEOUT);
+        self.kicking_ips.shrink_to_fit();
+    }
+}
+
 pub struct FluentTrayFlyout {
     hwnd: HWND,
     state_ptr: *mut FlyoutState,
@@ -374,8 +399,6 @@ impl FluentTrayFlyout {
             } else {
                 FlyoutTrafficMode::Carrier
             };
-            let placeholder_model = build_empty_model(&palette);
-
             let boxed = Box::new(FlyoutState {
                 sources,
                 on_action: Arc::new(on_action),
@@ -397,7 +420,7 @@ impl FluentTrayFlyout {
                 hovered: None,
                 tracking_mouse: false,
                 hits: Vec::new(),
-                model: placeholder_model,
+                model: FlyoutModel::default(),
                 telemetry_cache: Vec::new(),
                 last_shown: None,
                 last_deactivated: None,
@@ -442,7 +465,7 @@ impl FluentTrayFlyout {
         unsafe {
             let state = &mut *self.state_ptr;
             if IsWindowVisible(self.hwnd) != 0 {
-                hide_flyout_window(self.hwnd, state);
+                self.hide();
                 return false;
             }
             if state
@@ -452,51 +475,33 @@ impl FluentTrayFlyout {
                 state.last_deactivated = None;
                 return false;
             }
-            self.show_at_cursor_inner();
-            true
+            self.show_at_cursor_inner()
         }
     }
 
     /// 若浮窗当前处于可见状态，则即时同步最新状态并重绘（例如点击「立即检测」或自助服务返回后）。
     pub fn refresh_if_visible(&mut self) {
         unsafe {
-            if IsWindowVisible(self.hwnd) == 0 {
-                return;
-            }
-            let state = &mut *self.state_ptr;
-            refresh_flyout_state(state, false);
-            sync_flyout_height(self.hwnd, state);
-            InvalidateRect(self.hwnd, null(), 0);
+            refresh_visible_flyout(self.hwnd, &mut *self.state_ptr, false);
         }
     }
 
     pub fn hide(&mut self) {
         unsafe {
-            if IsWindowVisible(self.hwnd) != 0 {
-                let state = &mut *self.state_ptr;
-                hide_flyout_window(self.hwnd, state);
-            }
+            hide_flyout_window(self.hwnd);
         }
     }
 
-    unsafe fn show_at_cursor_inner(&mut self) {
-        let state = &mut *self.state_ptr;
-        state.palette = FlyoutPalette::load(&state.sources.app_dir);
-        state.hovered = None;
-        state.tracking_mouse = false;
-        state.account_dropdown_open = false;
-        state.vpn_confirm_target = None;
-        state.local_kick_confirm_ip = None;
-        refresh_flyout_state(state, true);
-
-        let dark_val: u32 = if state.palette.dark { 1 } else { 0 };
+    unsafe fn show_at_cursor_inner(&mut self) -> bool {
+        let palette = FlyoutPalette::load(&(*self.state_ptr).sources.app_dir);
+        let dark_val: u32 = if palette.dark { 1 } else { 0 };
         let _ = DwmSetWindowAttribute(
             self.hwnd,
             DWMWA_USE_IMMERSIVE_DARK_MODE,
             &dark_val as *const u32 as *const c_void,
             std::mem::size_of::<u32>() as u32,
         );
-        let border_color = state.palette.border;
+        let border_color = palette.border;
         let _ = DwmSetWindowAttribute(
             self.hwnd,
             DWMWA_BORDER_COLOR,
@@ -505,15 +510,27 @@ impl FluentTrayFlyout {
         );
 
         let dpi = GetDpiForWindow(self.hwnd).max(96);
+        let state = &mut *self.state_ptr;
+        state.palette = palette;
         state.dpi = dpi;
         state.width_px = scale(326, dpi);
-        state.height_px = compute_height_px(state);
-
-        state.last_shown = Some(Instant::now());
-        position_flyout_window(self.hwnd, state, true);
+        // 先以零尺寸进入可见态。同步读盘并算出最终高度后再呈现首帧。
+        if SetWindowPos(
+            self.hwnd,
+            null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
+        ) == 0
+            || !refresh_visible_flyout(self.hwnd, &mut *self.state_ptr, true)
+        {
+            return false;
+        }
         ShowWindow(self.hwnd, SW_SHOW);
         SetForegroundWindow(self.hwnd);
-        InvalidateRect(self.hwnd, null(), 0);
+        true
     }
 }
 
@@ -533,12 +550,10 @@ impl Drop for FluentTrayFlyout {
     }
 }
 
-unsafe fn hide_flyout_window(hwnd: HWND, state: &mut FlyoutState) {
-    state.account_dropdown_open = false;
-    state.vpn_confirm_target = None;
-    state.local_kick_confirm_ip = None;
-    state.hovered = None;
-    ShowWindow(hwnd, SW_HIDE);
+unsafe fn hide_flyout_window(hwnd: HWND) {
+    if IsWindowVisible(hwnd) != 0 {
+        ShowWindow(hwnd, SW_HIDE);
+    }
 }
 
 unsafe fn sync_flyout_height(hwnd: HWND, state: &mut FlyoutState) {
@@ -645,14 +660,29 @@ fn load_flyout_accounts(app_dir: &Path) -> Vec<FlyoutAccountItem> {
         .collect()
 }
 
-fn refresh_flyout_state(state: &mut FlyoutState, reload_telemetry: bool) {
+unsafe fn refresh_visible_flyout(hwnd: HWND, state: &mut FlyoutState, opening: bool) -> bool {
+    if IsWindowVisible(hwnd) == 0 {
+        return false;
+    }
+    refresh_flyout_state(state, opening, Local::now().timestamp());
+    if opening {
+        state.height_px = compute_height_px(state);
+        state.last_shown = Some(Instant::now());
+        position_flyout_window(hwnd, state, true);
+    } else {
+        sync_flyout_height(hwnd, state);
+    }
+    InvalidateRect(hwnd, null(), 0);
+    true
+}
+
+fn refresh_flyout_state(state: &mut FlyoutState, reload_telemetry: bool, now_unix: i64) {
     let snap = state
         .sources
         .latest_snapshot
         .lock()
         .ok()
         .and_then(|g| g.clone());
-    let online_since = state.sources.online_since_unix.lock().ok().and_then(|g| *g);
     let local_traffic = state
         .sources
         .latest_traffic
@@ -700,7 +730,7 @@ fn refresh_flyout_state(state: &mut FlyoutState, reload_telemetry: bool) {
     }
 
     state.kicking_ips.retain(|(ip, started)| {
-        started.elapsed() < Duration::from_secs(8)
+        started.elapsed() < DEVICE_KICK_TIMEOUT
             && ss
                 .data
                 .as_ref()
@@ -710,7 +740,7 @@ fn refresh_flyout_state(state: &mut FlyoutState, reload_telemetry: bool) {
     state.model = build_flyout_model(
         &state.palette,
         snap.as_ref(),
-        online_since,
+        now_unix,
         &local_traffic,
         &ss,
         &acct_label,
@@ -725,7 +755,7 @@ fn refresh_flyout_state(state: &mut FlyoutState, reload_telemetry: bool) {
 fn build_flyout_model(
     p: &FlyoutPalette,
     snap: Option<&MonitorSnapshot>,
-    _online_since_unix: Option<i64>,
+    now_unix: i64,
     local_traffic: &TrafficSummary,
     ss: &SelfServiceState,
     acct_label: &str,
@@ -734,7 +764,6 @@ fn build_flyout_model(
     telemetry: &[TelemetryPoint],
     range: TimeRange,
 ) -> FlyoutModel {
-    let now_unix = Local::now().timestamp();
     let mon_state = snap.map(|s| s.state).unwrap_or(MonitorState::Paused);
     let monitoring_enabled = snap.is_some_and(|s| s.monitoring_enabled);
     let login_rejected = snap.and_then(|s| s.reason) == Some(DisconnectReason::LoginRejected);
@@ -1134,45 +1163,6 @@ fn build_flyout_model(
     }
 }
 
-fn build_empty_model(p: &FlyoutPalette) -> FlyoutModel {
-    FlyoutModel {
-        status_title: "正在初始化",
-        status_dot: p.neutral,
-        status_soft: p.neutral_soft,
-        has_account: false,
-        chip_name: "未配置账号".to_string(),
-        chip_carrier: "",
-        header_fault_sub: String::new(),
-        monitoring_enabled: true,
-        has_portal_traffic: false,
-        traffic_hero: "0 MB".to_string(),
-        traffic_sub: "等待同步".to_string(),
-        traffic_sub_color: p.text_muted,
-        traffic_sub_bold: false,
-        traffic_dual_bar: false,
-        traffic_bar_ratio: 0.0,
-        traffic_bar_color: p.accent,
-        traffic_bar_has_left: false,
-        traffic_bar_has_right: false,
-        traffic_foot_left: String::new(),
-        traffic_foot_left_dot: None,
-        traffic_foot_right: String::new(),
-        traffic_foot_right_dot: None,
-        devices_badge: "未同步".to_string(),
-        devices_badge_fg: p.neutral,
-        devices_badge_bg: p.neutral_soft,
-        devices_badge_bd: p.neutral_border,
-        devices: Vec::new(),
-        devices_overflow_extra: 0,
-        devices_empty_hint: "连入校园网后自动同步".to_string(),
-        uptime_text: "—".to_string(),
-        uptime_color: p.text_muted,
-        outage_summary: "等待采样".to_string(),
-        slots: vec![SlotKind::Idle; 36],
-        ruler_left: "--:--".to_string(),
-    }
-}
-
 unsafe extern "system" fn flyout_wnd_proc(
     hwnd: HWND,
     msg: u32,
@@ -1186,6 +1176,16 @@ unsafe extern "system" fn flyout_wnd_proc(
     let state = &mut *state_ptr;
 
     match msg {
+        WM_WINDOWPOSCHANGED if IsWindowVisible(hwnd) == 0 => {
+            // ShowWindow 和 SetWindowPos 隐藏窗口后都会走到这里。
+            state.release_hidden_data();
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+        WM_PAINT | WM_MOUSEMOVE | WM_MOUSELEAVE_MSG | WM_LBUTTONUP | WM_KEYDOWN
+            if IsWindowVisible(hwnd) == 0 =>
+        {
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
         WM_ERASEBKGND => 1,
         WM_PAINT => {
             paint_flyout(hwnd, state);
@@ -1228,8 +1228,8 @@ unsafe extern "system" fn flyout_wnd_proc(
                 match target {
                     HitTarget::AccountChip => {
                         if state.accounts.is_empty() {
-                            hide_flyout_window(hwnd, state);
                             let cb = Arc::clone(&state.on_action);
+                            hide_flyout_window(hwnd);
                             cb(TrayAction::OpenAccountSettings);
                         } else {
                             state.vpn_confirm_target = None;
@@ -1247,8 +1247,8 @@ unsafe extern "system" fn flyout_wnd_proc(
                         InvalidateRect(hwnd, null(), 0);
                     }
                     HitTarget::ManageAccounts => {
-                        hide_flyout_window(hwnd, state);
                         let cb = Arc::clone(&state.on_action);
+                        hide_flyout_window(hwnd);
                         cb(TrayAction::OpenAccountSettings);
                     }
                     HitTarget::SelectAccount(idx) => {
@@ -1259,8 +1259,8 @@ unsafe extern "system" fn flyout_wnd_proc(
                                 sync_flyout_height(hwnd, state);
                                 InvalidateRect(hwnd, null(), 0);
                             } else if !acc.has_cred {
-                                hide_flyout_window(hwnd, state);
                                 let cb = Arc::clone(&state.on_action);
+                                hide_flyout_window(hwnd);
                                 cb(TrayAction::OpenAccountSettings);
                             } else if acc.carrier == "0" {
                                 state.account_dropdown_open = false;
@@ -1326,24 +1326,20 @@ unsafe extern "system" fn flyout_wnd_proc(
                     HitTarget::TrafficCarrier => {
                         state.traffic_mode = FlyoutTrafficMode::Carrier;
                         state.traffic_user_override = true;
-                        refresh_flyout_state(state, false);
-                        InvalidateRect(hwnd, null(), 0);
+                        refresh_visible_flyout(hwnd, state, false);
                     }
                     HitTarget::TrafficCampus => {
                         state.traffic_mode = FlyoutTrafficMode::Campus;
                         state.traffic_user_override = true;
-                        refresh_flyout_state(state, false);
-                        InvalidateRect(hwnd, null(), 0);
+                        refresh_visible_flyout(hwnd, state, false);
                     }
                     HitTarget::Range7h => {
                         state.range = TimeRange::H7;
-                        refresh_flyout_state(state, false);
-                        InvalidateRect(hwnd, null(), 0);
+                        refresh_visible_flyout(hwnd, state, false);
                     }
                     HitTarget::Range24h => {
                         state.range = TimeRange::H24;
-                        refresh_flyout_state(state, false);
-                        InvalidateRect(hwnd, null(), 0);
+                        refresh_visible_flyout(hwnd, state, false);
                     }
                     HitTarget::CheckNow => {
                         let cb = Arc::clone(&state.on_action);
@@ -1359,21 +1355,21 @@ unsafe extern "system" fn flyout_wnd_proc(
                         cb(action);
                     }
                     HitTarget::OpenMain => {
-                        hide_flyout_window(hwnd, state);
                         let cb = Arc::clone(&state.on_action);
+                        hide_flyout_window(hwnd);
                         cb(TrayAction::Show);
                     }
                     HitTarget::Exit => {
-                        hide_flyout_window(hwnd, state);
                         let cb = Arc::clone(&state.on_action);
+                        hide_flyout_window(hwnd);
                         cb(TrayAction::Exit);
                     }
                 }
             }
             0
         }
-        WM_RBUTTONUP => {
-            hide_flyout_window(hwnd, state);
+        WM_CLOSE | WM_RBUTTONUP => {
+            hide_flyout_window(hwnd);
             0
         }
         WM_KEYDOWN => {
@@ -1393,7 +1389,7 @@ unsafe extern "system" fn flyout_wnd_proc(
                     sync_flyout_height(hwnd, state);
                     InvalidateRect(hwnd, null(), 0);
                 } else {
-                    hide_flyout_window(hwnd, state);
+                    hide_flyout_window(hwnd);
                 }
             } else if key == VK_RETURN {
                 if let Some(ip) = state.local_kick_confirm_ip.take() {
@@ -1417,7 +1413,7 @@ unsafe extern "system" fn flyout_wnd_proc(
                     .is_none_or(|t| t.elapsed() >= Duration::from_millis(120))
             {
                 state.last_deactivated = Some(Instant::now());
-                hide_flyout_window(hwnd, state);
+                hide_flyout_window(hwnd);
             }
             0
         }
@@ -1427,7 +1423,7 @@ unsafe extern "system" fn flyout_wnd_proc(
                 .is_none_or(|t| t.elapsed() >= Duration::from_millis(120))
             {
                 state.last_deactivated = Some(Instant::now());
-                hide_flyout_window(hwnd, state);
+                hide_flyout_window(hwnd);
             }
             0
         }
@@ -1461,10 +1457,8 @@ unsafe fn execute_flyout_account_switch(
     }
     state.last_account_label = acc.display_name;
     state.last_carrier = acc.carrier;
-    refresh_flyout_state(state, false);
-    sync_flyout_height(hwnd, state);
-    InvalidateRect(hwnd, null(), 0);
     let cb = Arc::clone(&state.on_action);
+    refresh_visible_flyout(hwnd, state, false);
     cb(TrayAction::SwitchAccount(acc.id));
 }
 
@@ -3825,7 +3819,7 @@ mod tests {
         let carrier_m = build_flyout_model(
             &pal,
             Some(&snap),
-            Some(now - 6960),
+            now,
             &TrafficSummary::default(),
             &ss,
             "联通宽带",
@@ -3846,7 +3840,7 @@ mod tests {
         let campus_m = build_flyout_model(
             &pal,
             Some(&snap),
-            Some(now - 6960),
+            now,
             &TrafficSummary::default(),
             &ss,
             "DEMO",
@@ -3863,7 +3857,7 @@ mod tests {
         let same_name_m = build_flyout_model(
             &pal,
             Some(&snap),
-            Some(now - 6960),
+            now,
             &TrafficSummary::default(),
             &ss,
             "校园网",
@@ -3925,14 +3919,122 @@ mod tests {
         LocalKickModal,
     }
 
-    fn render_gdi_snapshot(
-        out_path: &Path,
+    #[test]
+    fn hide_releases_buffers_and_preserves_preferences_for_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = Local::now().timestamp();
+        let mut state = sample_flyout_state(
+            dir.path(),
+            now,
+            true,
+            FlyoutTrafficMode::Carrier,
+            true,
+            SnapshotOverlay::VpnModal,
+        );
+        state.range = TimeRange::H24;
+        state.traffic_mode = FlyoutTrafficMode::Campus;
+        state.tracking_mouse = true;
+        state.hits.push(HitBox {
+            target: HitTarget::ConfirmVpnSwitch,
+            rect: RECT {
+                left: 0,
+                top: 0,
+                right: 1,
+                bottom: 1,
+            },
+        });
+        let deactivated = Instant::now();
+        state.last_deactivated = Some(deactivated);
+        for point in &state.telemetry_cache {
+            state.sources.metrics_store.append(point);
+        }
+        refresh_flyout_state(&mut state, false, now);
+        state
+            .kicking_ips
+            .push(("expired".into(), deactivated - Duration::from_secs(9)));
+        let model = state.model.clone();
+        let height = compute_height_px(&state);
+        assert!(!state.accounts.is_empty() && !state.hits.is_empty());
+        assert!(!model.devices.is_empty() && model.slots.contains(&SlotKind::Outage));
+
+        state.release_hidden_data();
+        assert_eq!(state.telemetry_cache.capacity(), 0);
+        assert_eq!(state.hits.capacity(), 0);
+        assert_eq!(state.accounts.capacity(), 0);
+        assert_eq!(state.kicking_ips.capacity(), 0);
+        assert_eq!(state.model, FlyoutModel::default());
+        assert_eq!(state.model.devices.capacity(), 0);
+        assert_eq!(state.model.slots.capacity(), 0);
+        assert!(state.vpn_confirm_target.is_none() && state.hovered.is_none());
+        assert!(!state.account_dropdown_open && !state.tracking_mouse);
+        assert_eq!(state.range, TimeRange::H24);
+        assert!(state.traffic_mode == FlyoutTrafficMode::Campus && state.traffic_user_override);
+        assert_eq!(state.last_deactivated, Some(deactivated));
+
+        refresh_flyout_state(&mut state, true, now);
+        assert_eq!(state.model, model);
+        assert_eq!(compute_height_px(&state), height);
+        let pending = ("172.16.24.100".to_owned(), Instant::now());
+        state.kicking_ips.push(pending.clone());
+        state.release_hidden_data();
+        assert_eq!(state.kicking_ips, [pending]);
+    }
+
+    #[test]
+    fn hidden_window_ignores_refresh_and_queued_input_and_paint() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SendMessageW, WM_TIMER};
+
+        let dir = tempfile::tempdir().unwrap();
+        let now = Local::now().timestamp();
+        let sources = sample_flyout_state(
+            dir.path(),
+            now,
+            false,
+            FlyoutTrafficMode::Campus,
+            true,
+            SnapshotOverlay::None,
+        )
+        .sources;
+        let point = TelemetryPoint::check(now, 48, true, "ONLINE");
+        sources.metrics_store.append(&point);
+        let mut flyout = FluentTrayFlyout::new(sources, |_| {}).unwrap();
+        let hwnd = flyout.hwnd;
+        unsafe {
+            // Test the hide notification using a zero-sized, non-activating window.
+            SetWindowPos(
+                hwnd,
+                null_mut(),
+                0,
+                0,
+                0,
+                0,
+                SWP_SHOWWINDOW | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOREDRAW,
+            );
+            assert_ne!(IsWindowVisible(hwnd), 0);
+            refresh_flyout_state(&mut *flyout.state_ptr, true, now);
+            assert_eq!((*flyout.state_ptr).telemetry_cache, [point]);
+            SendMessageW(hwnd, WM_CLOSE, 0, 0);
+            assert_eq!(IsWindowVisible(hwnd), 0);
+            flyout.refresh_if_visible();
+            for msg in [WM_MOUSEMOVE, WM_LBUTTONUP, WM_KEYDOWN, WM_TIMER, WM_PAINT] {
+                SendMessageW(hwnd, msg, 0, 0);
+            }
+            let state = &*flyout.state_ptr;
+            assert_eq!(state.telemetry_cache.capacity(), 0);
+            assert_eq!(state.hits.capacity(), 0);
+            assert_eq!(state.model, FlyoutModel::default());
+            assert!(!state.tracking_mouse);
+        }
+    }
+
+    fn sample_flyout_state(
+        app_dir: &Path,
+        now: i64,
         dark: bool,
         mode: FlyoutTrafficMode,
         two_devices: bool,
         overlay: SnapshotOverlay,
-    ) {
-        let now = Local::now().timestamp();
+    ) -> FlyoutState {
         let snap = sample_snapshot(now);
         let ss = sample_self_service(now, two_devices);
         let pts = sample_telemetry(now);
@@ -3950,7 +4052,7 @@ mod tests {
         let model = build_flyout_model(
             &pal,
             Some(&snap),
-            Some(now - 6960),
+            now,
             &TrafficSummary::default(),
             &ss,
             acct_name,
@@ -3995,17 +4097,16 @@ mod tests {
         let local_kick_ip =
             (overlay == SnapshotOverlay::LocalKickModal).then(|| "172.16.24.100".to_string());
         let dpi: u32 = 144;
-        let tmp_dir = std::env::temp_dir().join("gxnu_flyout_qa_dummy");
-        let mut state = FlyoutState {
+        FlyoutState {
             sources: FlyoutDataSources {
-                app_dir: tmp_dir.clone(),
+                app_dir: app_dir.to_path_buf(),
                 latest_snapshot: Arc::new(Mutex::new(Some(snap))),
                 online_since_unix: Arc::new(Mutex::new(Some(now - 6960))),
                 latest_traffic: Arc::new(Mutex::new(TrafficSummary::default())),
                 latest_self_service: Arc::new(Mutex::new(ss)),
                 active_account_label: Arc::new(Mutex::new(acct_name.into())),
                 active_carrier: Arc::new(Mutex::new(carrier_code.into())),
-                metrics_store: Arc::new(MetricsStore::new(&tmp_dir)),
+                metrics_store: Arc::new(MetricsStore::new(app_dir)),
             },
             on_action: Arc::new(|_| {}),
             palette: pal,
@@ -4035,7 +4136,25 @@ mod tests {
             telemetry_cache: pts,
             last_shown: None,
             last_deactivated: None,
-        };
+        }
+    }
+
+    fn render_gdi_snapshot(
+        out_path: &Path,
+        dark: bool,
+        mode: FlyoutTrafficMode,
+        two_devices: bool,
+        overlay: SnapshotOverlay,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let mut state = sample_flyout_state(
+            dir.path(),
+            Local::now().timestamp(),
+            dark,
+            mode,
+            two_devices,
+            overlay,
+        );
         state.height_px = compute_height_px(&state);
         let w = state.width_px;
         let h = state.height_px;
