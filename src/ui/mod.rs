@@ -117,6 +117,23 @@ struct AccountPreverifyJob {
     also_save_global: bool,
 }
 
+/// 选择或切换到「校园用户（校园网）」出口时的 VPN 防封禁居中模态提醒框。
+#[derive(Debug, Clone)]
+enum CampusVpnModal {
+    /// 在设置页点击选择「校园用户」出口时的即时提醒。
+    CarrierSelected,
+    /// 在主页或设置列表点击切换到某个「校园用户」账号前的确认拦截。
+    ConfirmSwitch {
+        account_id: String,
+        display_name: String,
+    },
+    /// 保存并启用某个「校园用户」账号前的确认拦截（若点选出口时已确认过则不重复弹出）。
+    ConfirmSave {
+        also_save_global: bool,
+        force_skip_verify: bool,
+    },
+}
+
 /// 保存账号前的零断网风险当场验密：
 /// - 若将设为活跃账号且当前校园网明确离线：直接请求 `yc.gxnu.edu.cn` 实测登录（验对顺带联网）；
 /// - 若当前校园网已在线（绝不调 `logout` 踢断好端端的网！）或仅添加备用账号：改用 `172.16.4.2/Self/` 独立会话无损验密；
@@ -217,6 +234,8 @@ pub struct GuardApp {
     traffic_view_mode: TrafficViewMode,
     traffic_view_user_override: bool,
     preverify_job: Option<AccountPreverifyJob>,
+    campus_vpn_modal: Option<CampusVpnModal>,
+    campus_vpn_ack_for_draft: bool,
     last_check_seq: u64,
     last_check_unix: Option<i64>,
     online_since_unix: Option<i64>,
@@ -339,6 +358,8 @@ impl GuardApp {
             traffic_view_mode: initial_traffic_view,
             traffic_view_user_override: false,
             preverify_job: None,
+            campus_vpn_modal: None,
+            campus_vpn_ack_for_draft: false,
             last_check_seq: 0,
             last_check_unix: None,
             online_since_unix: None,
@@ -597,6 +618,22 @@ impl GuardApp {
             return;
         }
 
+        let make_active = self.settings.accounts.is_empty()
+            || self.needs_setup
+            || account_id == self.settings.active_account_id;
+
+        if make_active
+            && self.form.carrier == 0
+            && !self.campus_vpn_ack_for_draft
+            && self.settings.carrier != "0"
+        {
+            self.campus_vpn_modal = Some(CampusVpnModal::ConfirmSave {
+                also_save_global,
+                force_skip_verify,
+            });
+            return;
+        }
+
         let carrier_str = self.form.carrier.to_string();
         let identity_or_pwd_changed = self.needs_setup
             || is_new
@@ -618,9 +655,6 @@ impl GuardApp {
             return;
         };
 
-        let make_active = self.settings.accounts.is_empty()
-            || self.needs_setup
-            || account_id == self.settings.active_account_id;
         let fallback_ip = self
             .latest
             .as_ref()
@@ -783,6 +817,23 @@ impl GuardApp {
             );
             return;
         }
+
+        if target.carrier == "0" {
+            self.campus_vpn_modal = Some(CampusVpnModal::ConfirmSwitch {
+                account_id: account_id.to_string(),
+                display_name: target.display_name(),
+            });
+            return;
+        }
+
+        self.perform_switch_account_to(account_id);
+    }
+
+    fn perform_switch_account_to(&mut self, account_id: &str) {
+        let Some(target) = self.settings.find_account(account_id).cloned() else {
+            self.show_toast("未找到目标账号", true);
+            return;
+        };
 
         let mut next = self.settings.clone();
         if let Err(err) = next.switch_active_account(account_id) {
@@ -1523,6 +1574,133 @@ impl GuardApp {
         String::new()
     }
 
+    fn draw_campus_vpn_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(modal) = self.campus_vpn_modal.clone() else {
+            return;
+        };
+
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("campus_vpn_modal_scrim"))
+            .fixed_pos(screen.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(screen.size(), Sense::click());
+                let alpha = if p.mode == ThemeMode::Dark { 145 } else { 105 };
+                ui.painter().rect_filled(
+                    rect,
+                    CornerRadius::ZERO,
+                    egui::Color32::from_black_alpha(alpha),
+                );
+            });
+
+        let mut confirm = false;
+        let mut cancel = false;
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::Escape) {
+                cancel = true;
+            } else if i.key_pressed(egui::Key::Enter) {
+                confirm = true;
+            }
+        });
+
+        let (title, body, primary_lbl, has_cancel) = match &modal {
+            CampusVpnModal::CarrierSelected => (
+                "「校园用户」出口防封提醒",
+                "您已选择「校园用户（校园网）」出口。使用校园网出口联网时，请务必先关闭本机 VPN、代理软件（如 Clash / Mihomo / v2rayN）或游戏加速器，避免触发校园网安全监测导致账号被封禁！".to_string(),
+                "我知道了",
+                false,
+            ),
+            CampusVpnModal::ConfirmSwitch { display_name, .. } => (
+                "切换至校园网出口安全提醒",
+                format!(
+                    "即将切换至「{display_name}」（校园用户出口）。切换前请确认已关闭本机 VPN、代理软件（如 Clash / Mihomo / v2rayN）或游戏加速器，避免触发校园网安全监测导致账号被封禁！"
+                ),
+                "已关闭 VPN，继续切换",
+                true,
+            ),
+            CampusVpnModal::ConfirmSave { .. } => (
+                "启用校园网出口安全提醒",
+                "即将保存并启用「校园用户（校园网）」出口。连接前请确认已关闭本机 VPN、代理软件（如 Clash / Mihomo / v2rayN）或游戏加速器，避免触发校园网安全监测导致账号被封禁！".to_string(),
+                "已关闭 VPN，继续保存",
+                true,
+            ),
+        };
+
+        egui::Area::new(egui::Id::new("campus_vpn_modal_dialog"))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                let card_w = 396.0_f32.min((screen.width() - 36.0).max(280.0));
+                egui::Frame::new()
+                    .fill(p.card)
+                    .stroke(Stroke::new(1.2_f32, p.warn_border))
+                    .corner_radius(CornerRadius::same(12))
+                    .shadow(egui::Shadow {
+                        offset: [0, 8],
+                        blur: 24,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha(90),
+                    })
+                    .inner_margin(egui::Margin::symmetric(18, 16))
+                    .show(ui, |ui| {
+                        ui.set_width(card_w);
+                        ui.spacing_mut().item_spacing.y = 10.0;
+
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 9.0;
+                            let (badge_r, _) =
+                                ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                            ui.painter().rect(
+                                badge_r,
+                                CornerRadius::same(8),
+                                p.warn_soft,
+                                Stroke::new(1.0_f32, p.warn_border),
+                                StrokeKind::Inside,
+                            );
+                            icons::paint(ui.painter(), badge_r.shrink(6.0), Icon::Shield, p.warn);
+                            ui.label(bold_text(title, 14.0, p.text));
+                        });
+
+                        ui.add(egui::Label::new(body_text(body, 12.0, p.text_secondary)).wrap());
+
+                        ui.add_space(4.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            if primary_button(ui, p, Some(Icon::Check), primary_lbl).clicked() {
+                                confirm = true;
+                            }
+                            if has_cancel && secondary_button(ui, p, None, "取消").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+            });
+
+        if cancel {
+            if matches!(modal, CampusVpnModal::CarrierSelected) {
+                self.campus_vpn_ack_for_draft = true;
+            }
+            self.campus_vpn_modal = None;
+        } else if confirm {
+            self.campus_vpn_modal = None;
+            match modal {
+                CampusVpnModal::CarrierSelected => {
+                    self.campus_vpn_ack_for_draft = true;
+                }
+                CampusVpnModal::ConfirmSwitch { account_id, .. } => {
+                    self.perform_switch_account_to(&account_id);
+                }
+                CampusVpnModal::ConfirmSave {
+                    also_save_global,
+                    force_skip_verify,
+                } => {
+                    self.campus_vpn_ack_for_draft = true;
+                    self.begin_save_account_profile(also_save_global, force_skip_verify, ctx);
+                }
+            }
+        }
+    }
+
     fn draw_toast(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some((message, is_error, at)) = self.toast.as_ref() else {
             return;
@@ -1774,6 +1952,12 @@ impl eframe::App for GuardApp {
                             total_h,
                         );
                     });
+                if self.form.carrier != 0 {
+                    self.campus_vpn_ack_for_draft = false;
+                }
+                if actions.selected_campus_carrier {
+                    self.campus_vpn_modal = Some(CampusVpnModal::CarrierSelected);
+                }
                 if actions.ui_prefs_changed {
                     self.ui_prefs = self.ui_prefs.clone().normalized();
                     ctx.set_zoom_factor(self.ui_prefs.zoom);
@@ -1821,6 +2005,7 @@ impl eframe::App for GuardApp {
             }
         }
 
+        self.draw_campus_vpn_modal(ctx, &p);
         self.draw_toast(ctx, &p);
 
         // 无边框窗口 1px 外描边

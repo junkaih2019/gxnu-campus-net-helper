@@ -210,6 +210,8 @@ pub struct SettingsActions {
     pub save: bool,
     pub save_profile: bool,
     pub force_save_profile: bool,
+    /// 用户在表单中刚从其他出口点击切到「校园用户」（`0`）时置为 `true`，触发防封弹窗提醒。
+    pub selected_campus_carrier: bool,
     pub switch_account: Option<String>,
     pub delete_account: Option<String>,
     pub reset: bool,
@@ -780,7 +782,17 @@ fn draw_account_page(
 
         ui.add_space(2.0);
         ui.label(body_text("运营商出口", 11.5, p.text_secondary));
-        draw_carrier_row(ui, p, &mut form.carrier);
+        if draw_carrier_row(ui, p, &mut form.carrier) && form.carrier == 0 {
+            actions.selected_campus_carrier = true;
+        }
+        if form.carrier == 0 {
+            ui.add_space(3.0);
+            ui.label(body_text(
+                "⚠ 安全提示：使用「校园用户」出口时请关闭本机 VPN / 代理软件，避免校园网账号被封禁",
+                10.5,
+                p.warn,
+            ));
+        }
 
         // 若上次点击保存时当场验密未通过，展示醒目红色原因卡片与「仍要强制保存」兜底按钮
         if let Some(err_msg) = form.verify_error.clone() {
@@ -1103,7 +1115,8 @@ fn draw_compact_action_btn(
     resp
 }
 
-fn draw_carrier_row(ui: &mut egui::Ui, p: &Palette, carrier: &mut usize) {
+fn draw_carrier_row(ui: &mut egui::Ui, p: &Palette, carrier: &mut usize) -> bool {
+    let mut changed = false;
     let labels = ["校园用户", "中国电信", "中国联通", "中国移动"];
     let gap = 8.0_f32;
     let btn_w = ((ui.available_width() - gap * 3.0) * 0.25)
@@ -1136,11 +1149,13 @@ fn draw_carrier_row(ui: &mut egui::Ui, p: &Palette, carrier: &mut usize) {
             };
             ui.painter()
                 .text(rect.center(), egui::Align2::CENTER_CENTER, *label, font, fg);
-            if resp.clicked() {
+            if resp.clicked() && *carrier != idx {
                 *carrier = idx;
+                changed = true;
             }
         }
     });
+    changed
 }
 
 fn draw_monitor_page(ui: &mut egui::Ui, p: &Palette, form: &mut SettingsForm) {
