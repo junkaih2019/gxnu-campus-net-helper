@@ -77,13 +77,13 @@
 - 👥 **Dual-Exit Setup, Multi-Account Switch & VPN Guard**: Pair Carrier + Campus (`校园网`) exits in one click, add extra exits for the same student ID without retyping credentials, and auto-sync password updates across peer exits; warns to close VPN/proxy software before switching to the Campus exit.
 - 📈 **Uptime Timeline**: Tracks `1h / 7h / 24h` connection stability in a capsule strip with hover details for outages.
 - ⬆️ **In-Place Self-Update**: Periodically checks GitHub Releases, verifies SHA-256 checksums, and replaces the `.exe` in place while preserving all credentials and startup settings.
-- 🛡️ **Proxy-Friendly & Ultra-Light**: Pierces Clash / Mihomo TUN adapters for portal probes, encrypts passwords in Windows Credential Manager, and frees all UI/GPU memory when closed to the tray.
+- 🛡️ **Proxy-Friendly & Ultra-Light**: Pierces Clash / Mihomo TUN adapters for portal probes, encrypts passwords in Windows Credential Manager, idles at **~3 MB** in the system tray, uses only **~41 MB** private memory when the dashboard is open (via zero-copy memory-mapped system fonts), and frees all UI/GPU memory when closed.
 
 ---
 
 ## 🚀 Quick Start
 
-1. **Download & Run**: Grab **`gxnu-campus-net-helper-v0.2.3.exe`** from [Releases](https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest), place it in a **permanent folder**, and run it directly (no installer or extraction needed).
+1. **Download & Run**: Grab **`gxnu-campus-net-helper-v0.2.4.exe`** from [Releases](https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest), place it in a **permanent folder**, and run it directly (no installer or extraction needed).
    > 💡 If Windows SmartScreen appears on first launch, click **More info → Run anyway** (you can verify the hash against `SHA256SUMS.txt` on the release page).
 2. **Add Account**: Enter your student ID and password on the left, select your exit (`校园网 / 电信 / 联通 / 移动 / 广电`) on the right — optionally keeping **同时生成「校园网」快捷切换项** checked to pair both exits at once — and click **验证并添加账号 (Verify & Add)**; adding extra exits for the same student ID later requires no password re-entry.
 3. **Everyday Use**:

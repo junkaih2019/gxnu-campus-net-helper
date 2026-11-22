@@ -6,14 +6,14 @@
 
 ## 1. 单文件「轻守护 + 按需界面」双模式架构
 
-在 Windows 上，任何基于 OpenGL（`eframe / glow`）的 GUI 进程一旦创建窗口，就会载入显卡 OpenGL ICD 驱动（如 Intel `igc64.dll` ~55 MB）并在进程堆中常驻中文字库（`msyh.ttc` ~19 MB），即使隐藏窗口也无法由进程自身完全卸载驱动映射。
+在 Windows 上，任何基于 OpenGL（`eframe / glow`）的 GUI 进程一旦创建窗口，就会载入显卡 OpenGL ICD 驱动（如 Intel `igc64.dll`），即使隐藏窗口也无法由进程自身完全卸载驱动映射；而直接按字节拷贝加载系统中文字库（`msyh.ttc` + `msyhbd.ttc` 约 35 MB）还会额外带来约 70 MB 的私有堆复制开销。
 
-为兼顾**全天候极低后台占用**与**现代流畅的监控界面**，`GXNU 校园网守护助手.exe` 内部采用单二进制双模式分离：
+为兼顾**全天候极低后台占用**与**现代流畅的监控界面**，`GXNU 校园网守护助手.exe` 内部采用单二进制双模式分离，并在 UI 进程中通过 Win32 只读文件映射（`CreateFileMappingW` / `MapViewOfFile` + `FontData::from_static`）实现系统字库零拷贝共享：
 
 | 运行模式 | 启动方式 | 职责 | 典型内存（Private / WS） | 后台 CPU |
 | :--- | :--- | :--- | :--- | :--- |
-| **轻守护进程（Daemon）** | `GXNU 校园网守护助手.exe` 或 `--minimized` | 持有单实例锁 `Local\GXNUCampusLoginRS`、监控线程、Toast 通知、托盘图标与 Fluent 右键菜单、本地 IPC 服务端 | **~2.9 MB / ~5.8 MB** | **0.0%** |
-| **按需界面进程（UI）** | 守护进程按需拉起 `--ui --ipc-port <P> --ipc-token <T>` | 持有 UI 锁 `Local\GXNUCampusLoginRS_UI`、连接守护 IPC、展示双主题看板与设置页；点击 `×` 即退出彻底释放全部 GPU/字库内存 | 打开时 ~114 MB / 关闭后 **0 MB** | 仅可见时 1 FPS |
+| **轻守护进程（Daemon）** | `GXNU 校园网守护助手.exe` 或 `--minimized` | 持有单实例锁 `Local\GXNUCampusLoginRS`、监控线程、Toast 通知、托盘图标与快捷浮窗/右键菜单、本地 IPC 服务端 | **~2.7–3.6 MB / ~3–8 MB** | **0.0%** |
+| **按需界面进程（UI）** | 守护进程按需拉起 `--ui --ipc-port <P> --ipc-token <T>` | 持有 UI 锁 `Local\GXNUCampusLoginRS_UI`、有界合并接收守护 IPC、展示双主题看板与设置页；点击 `×` 即退出彻底释放全部 GPU 内存 | 打开时 **~41–44 MB**（WS ~95 MB） / 关闭后 **0 MB** | 仅可见时 1 FPS |
 
 ### 生命周期流转
 
