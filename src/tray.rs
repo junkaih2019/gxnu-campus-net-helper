@@ -13,6 +13,7 @@ pub enum TrayAction {
     Show,
     OpenAccountSettings,
     SwitchAccount(String),
+    KickDevice { ip: String, is_local: bool },
     Start,
     Pause,
     Check,

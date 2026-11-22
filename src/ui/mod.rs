@@ -10,7 +10,7 @@ mod settings;
 mod theme;
 mod widgets;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
@@ -236,6 +236,8 @@ pub struct GuardApp {
     preverify_job: Option<AccountPreverifyJob>,
     campus_vpn_modal: Option<CampusVpnModal>,
     campus_vpn_ack_for_draft: bool,
+    kicking_ips: HashSet<String>,
+    local_kick_confirm_ip: Option<String>,
     last_check_seq: u64,
     last_check_unix: Option<i64>,
     online_since_unix: Option<i64>,
@@ -360,6 +362,8 @@ impl GuardApp {
             preverify_job: None,
             campus_vpn_modal: None,
             campus_vpn_ack_for_draft: false,
+            kicking_ips: HashSet::new(),
+            local_kick_confirm_ip: None,
             last_check_seq: 0,
             last_check_unix: None,
             online_since_unix: None,
@@ -941,6 +945,23 @@ impl GuardApp {
             };
             self.finish_command(pending, Err(message.into()));
         }
+        while let Ok((ip, is_local, result)) = self.ipc.kick_results.try_recv() {
+            self.kicking_ips.remove(&ip);
+            match result {
+                Ok(()) => {
+                    let msg = if is_local {
+                        format!("已注销本机连接（{ip}）并暂停自动重连守护")
+                    } else {
+                        format!("已将终端 {ip} 注销下线")
+                    };
+                    self.show_toast(msg, false);
+                }
+                Err(err) => {
+                    self.show_toast(format!("注销 {ip} 失败：{err}"), true);
+                }
+            }
+        }
+
         if self.ipc.open_account_settings.swap(false, Ordering::AcqRel) {
             self.settings = self.store.load();
             self.refresh_account_creds();
@@ -1732,6 +1753,106 @@ impl GuardApp {
         }
     }
 
+    fn draw_local_kick_modal(&mut self, ctx: &egui::Context, p: &Palette) {
+        let Some(ip) = self.local_kick_confirm_ip.clone() else {
+            return;
+        };
+
+        let screen = ctx.screen_rect();
+        egui::Area::new(egui::Id::new("local_kick_modal_scrim"))
+            .fixed_pos(screen.min)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let (rect, _) = ui.allocate_exact_size(screen.size(), Sense::click());
+                let alpha = if p.mode == ThemeMode::Dark { 145 } else { 105 };
+                ui.painter().rect_filled(
+                    rect,
+                    CornerRadius::ZERO,
+                    egui::Color32::from_black_alpha(alpha),
+                );
+            });
+
+        let mut confirm = false;
+        let mut cancel = false;
+        ctx.input(|i| {
+            if i.key_pressed(egui::Key::Escape) {
+                cancel = true;
+            } else if i.key_pressed(egui::Key::Enter) {
+                confirm = true;
+            }
+        });
+
+        egui::Area::new(egui::Id::new("local_kick_modal_dialog"))
+            .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
+            .order(egui::Order::Tooltip)
+            .show(ctx, |ui| {
+                let card_w = 384.0_f32.min((screen.width() - 36.0).max(280.0));
+                egui::Frame::new()
+                    .fill(p.card)
+                    .stroke(Stroke::new(1.2_f32, p.warn_border))
+                    .corner_radius(CornerRadius::same(12))
+                    .shadow(egui::Shadow {
+                        offset: [0, 8],
+                        blur: 24,
+                        spread: 0,
+                        color: egui::Color32::from_black_alpha(90),
+                    })
+                    .inner_margin(egui::Margin::symmetric(18, 16))
+                    .show(ui, |ui| {
+                        ui.set_width(card_w);
+                        ui.spacing_mut().item_spacing.y = 10.0;
+
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 9.0;
+                            let (badge_r, _) =
+                                ui.allocate_exact_size(Vec2::splat(28.0), Sense::hover());
+                            ui.painter().rect(
+                                badge_r,
+                                CornerRadius::same(8),
+                                p.warn_soft,
+                                Stroke::new(1.0_f32, p.warn_border),
+                                StrokeKind::Inside,
+                            );
+                            icons::paint(ui.painter(), badge_r.shrink(6.0), Icon::Pause, p.warn);
+                            ui.label(bold_text("确认注销本机校园网连接？", 14.0, p.text));
+                        });
+
+                        ui.add(
+                            egui::Label::new(body_text(
+                                format!(
+                                    "即将注销本机在线会话（{ip}）。为避免几秒后又被自动重连回来，后台自动重连守护将同步暂停；后续点击主页「开始」即可恢复联网。"
+                                ),
+                                12.0,
+                                p.text_secondary,
+                            ))
+                            .wrap(),
+                        );
+
+                        ui.add_space(4.0);
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            if primary_button(ui, p, Some(Icon::Check), "暂停守护并注销")
+                                .clicked()
+                            {
+                                confirm = true;
+                            }
+                            if secondary_button(ui, p, None, "取消").clicked() {
+                                cancel = true;
+                            }
+                        });
+                    });
+            });
+
+        if cancel {
+            self.local_kick_confirm_ip = None;
+        } else if confirm {
+            self.local_kick_confirm_ip = None;
+            self.kicking_ips.insert(ip.clone());
+            self.show_toast(format!("正在注销本机连接（{ip}）并暂停守护…"), false);
+            self.request(UiToDaemon::KickDevice { ip, is_local: true }, None);
+        }
+    }
+
     fn draw_toast(&mut self, ctx: &egui::Context, p: &Palette) {
         let Some((message, is_error, at)) = self.toast.as_ref() else {
             return;
@@ -1833,6 +1954,7 @@ impl eframe::App for GuardApp {
         self.trimmed_while_idle = false;
 
         let fast_refresh = !self.pending.is_empty()
+            || !self.kicking_ips.is_empty()
             || self.preverify_job.is_some()
             || self.toast.is_some()
             || matches!(
@@ -1909,6 +2031,7 @@ impl eframe::App for GuardApp {
                                 &campus_ip,
                                 is_online,
                                 login_rejected,
+                                &self.kicking_ips,
                                 &mut self.ui_prefs.home_traffic_split,
                                 ss_h,
                             );
@@ -1921,6 +2044,20 @@ impl eframe::App for GuardApp {
                             if actions.refresh_self_service {
                                 self.show_toast("正在刷新校园网自助服务数据…", false);
                                 self.request(UiToDaemon::RefreshSelfService { force: true }, None);
+                            }
+                            if let Some((ip, is_local_dev)) = actions.kick_device {
+                                if is_local_dev {
+                                    self.local_kick_confirm_ip = Some(ip);
+                                } else if self.kicking_ips.insert(ip.clone()) {
+                                    self.show_toast(format!("正在请求注销 {ip}…"), false);
+                                    self.request(
+                                        UiToDaemon::KickDevice {
+                                            ip,
+                                            is_local: false,
+                                        },
+                                        None,
+                                    );
+                                }
                             }
                             ui.add_space(10.0);
                         }
@@ -2037,6 +2174,7 @@ impl eframe::App for GuardApp {
         }
 
         self.draw_campus_vpn_modal(ctx, &p);
+        self.draw_local_kick_modal(ctx, &p);
         self.draw_toast(ctx, &p);
 
         // 无边框窗口 1px 外描边

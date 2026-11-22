@@ -1781,6 +1781,7 @@ mod tests {
         let dir = f._dir.path();
         let path = dir.join("config.json");
         let (server, listener) = IpcServer::bind(dir).unwrap();
+        let server = Arc::new(server);
         let opened = Arc::new(AtomicUsize::new(0));
         let shows = Arc::clone(&opened);
         let commands = crate::DaemonCommands {
@@ -1791,6 +1792,8 @@ mod tests {
             },
             control: f.monitor.control(),
             notifier: Arc::new(Mutex::new(crate::notify::ToastNotifier::new(false))),
+            ipc_server: Arc::clone(&server),
+            is_online: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             active_account_id: Arc::new(Mutex::new(String::new())),
             active_account_label: Arc::new(Mutex::new("未配置账号".into())),
             active_carrier: Arc::new(Mutex::new("2".into())),

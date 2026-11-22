@@ -538,6 +538,8 @@ fn run_daemon(
         control: monitor_ctrl.clone(),
         store,
         notifier,
+        ipc_server: Arc::clone(&ipc_server),
+        is_online: Arc::clone(&is_online),
         active_account_id: Arc::clone(&active_account_id),
         active_account_label: Arc::clone(&active_account_label),
         active_carrier: Arc::clone(&active_carrier),
@@ -583,6 +585,12 @@ fn run_daemon(
             tray::TrayAction::SwitchAccount(account_id) => {
                 if let Err(err) = tray_commands.lock().unwrap().switch_from_tray(&account_id) {
                     logging::warn(&format!("[ACCOUNT_SWITCH_FAILED] {err}"));
+                }
+                return;
+            }
+            tray::TrayAction::KickDevice { ip, is_local } => {
+                if let Err(err) = tray_commands.lock().unwrap().kick_device(ip, is_local) {
+                    logging::warn(&format!("[DEVICE_KICK_FAILED] {err}"));
                 }
                 return;
             }
@@ -691,6 +699,8 @@ struct DaemonCommands {
     control: monitor::MonitorControl,
     store: config::SettingsStore,
     notifier: Arc<Mutex<notify::ToastNotifier>>,
+    ipc_server: Arc<ipc::IpcServer>,
+    is_online: Arc<AtomicBool>,
     active_account_id: Arc<Mutex<String>>,
     active_account_label: Arc<Mutex<String>>,
     active_carrier: Arc<Mutex<String>>,
@@ -756,6 +766,54 @@ impl DaemonCommands {
         Ok(())
     }
 
+    fn kick_device(&self, ip: String, is_local: bool) -> Result<(), String> {
+        if is_local {
+            self.control.pause()?;
+            logging::info(&format!(
+                "[MONITOR_PAUSED] 用户请求注销本机（{ip}），已自动暂停自动重连守护"
+            ));
+        }
+        let ss = Arc::clone(&self.self_service);
+        let ctrl = self.control.clone();
+        let ipc = Arc::clone(&self.ipc_server);
+        let online_flag = Arc::clone(&self.is_online);
+        let main_tid = self.main_tid;
+        let _ = std::thread::Builder::new()
+            .name("kick-online-device".to_string())
+            .spawn(move || {
+                if is_local {
+                    let _ = authenticator::CampusAuthenticator::new().logout();
+                }
+                let res = ss.kick_device(&ip);
+                let ui_res = match &res {
+                    Ok(_) => {
+                        logging::info(&format!(
+                            "[SELF_SERVICE] 已通过自助服务将终端 {ip}{}注销下线",
+                            if is_local {
+                                "（本机，守护已暂停）"
+                            } else {
+                                " "
+                            }
+                        ));
+                        Ok(())
+                    }
+                    Err(err) => {
+                        logging::warn(&format!("[SELF_SERVICE] 注销终端 {ip} 失败：{err}"));
+                        Err(err.clone())
+                    }
+                };
+                ipc.broadcast_kick_result(ip, is_local, ui_res);
+                if main_tid != 0 {
+                    post_thread_msg(main_tid, WM_TRAY_REFRESH);
+                }
+                // 若本机此前因并发满额而处于未联网状态，踢掉其他占线设备后自动触发一次重连检测
+                if !is_local && res.is_ok() && !online_flag.load(Ordering::Acquire) {
+                    let _ = ctrl.force_check();
+                }
+            });
+        Ok(())
+    }
+
     fn apply(&self, cmd: ipc::UiToDaemon) -> Result<(), String> {
         use ipc::UiToDaemon::*;
         match cmd {
@@ -777,6 +835,9 @@ impl DaemonCommands {
                 } else {
                     self_service::FetchTrigger::UiOpen
                 });
+            }
+            KickDevice { ip, is_local } => {
+                self.kick_device(ip, is_local)?;
             }
             ReloadSettings {
                 start,

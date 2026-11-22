@@ -123,18 +123,44 @@ fn login(agent: &Agent, credential: &StoredCredential) -> Result<String, PortalE
 }
 
 fn login_handshake_only(agent: &Agent, credential: &StoredCredential) -> Result<(), PortalError> {
-    let response = checked_response("打开自助服务", agent.get(ENTRY).call())?;
-    require_entry_redirect(&response, DASHBOARD, "打开自助服务")?;
-    let response = checked_response("打开账户首页", agent.get(DASHBOARD).call())?;
-    require_entry_redirect(&response, LOGIN, "打开账户首页")?;
+    login_handshake_with_urls(
+        agent,
+        credential,
+        ORIGIN,
+        ENTRY,
+        LOGIN,
+        VERIFY,
+        DASHBOARD,
+        SESSION_IMAGE,
+    )
+}
 
-    let page = get_page(agent, LOGIN, "打开登录表单")?;
-    let checkcode = parse_login_page(&page)?;
+#[allow(clippy::too_many_arguments)]
+fn login_handshake_with_urls(
+    agent: &Agent,
+    credential: &StoredCredential,
+    origin: &str,
+    entry_url: &str,
+    login_url: &str,
+    verify_url: &str,
+    dash_url: &str,
+    session_image_url: &str,
+) -> Result<(), PortalError> {
+    let response = checked_response("打开自助服务", agent.get(entry_url).call())?;
+    require_entry_redirect(&response, dash_url, "打开自助服务")?;
+    let response = checked_response("打开账户首页", agent.get(dash_url).call())?;
+    require_entry_redirect(&response, login_url, "打开账户首页")?;
+
+    let page = get_page(agent, login_url, "打开登录表单")?;
+    let checkcode = parse_login_page_for(&page, login_url, verify_url)?;
 
     // 登录页加载时会请求该资源以绑定服务端会话，验证码字段保持为空。
     let image = checked_response(
         "加载登录表单资源",
-        agent.get(SESSION_IMAGE).set("Referer", LOGIN).call(),
+        agent
+            .get(session_image_url)
+            .set("Referer", login_url)
+            .call(),
     )?;
     if image.status() != 200 {
         return Err(PortalError::Unreachable(format!(
@@ -164,9 +190,9 @@ fn login_handshake_only(agent: &Agent, credential: &StoredCredential) -> Result<
     let response = checked_response(
         "提交登录",
         agent
-            .post(VERIFY)
-            .set("Origin", ORIGIN)
-            .set("Referer", LOGIN)
+            .post(verify_url)
+            .set("Origin", origin)
+            .set("Referer", login_url)
             .send_form(&[
                 ("foo", ""),
                 ("bar", ""),
@@ -180,11 +206,19 @@ fn login_handshake_only(agent: &Agent, credential: &StoredCredential) -> Result<
         let body = response.into_string().unwrap_or_default();
         return Err(classify_verify_failure_page(&body));
     }
-    verify_login_redirect(agent, &response)
+    verify_login_redirect_for(agent, &response, dash_url)
 }
 
 /// 轻量严格解析登录表单：校验 `action`、确认 `#randomDiv` 隐藏、提取隐藏 `checkcode` 与 `var md5 = true;`。
 fn parse_login_page(page: &str) -> Result<String, PortalError> {
+    parse_login_page_for(page, LOGIN, VERIFY)
+}
+
+fn parse_login_page_for(
+    page: &str,
+    login_url: &str,
+    verify_url: &str,
+) -> Result<String, PortalError> {
     let mut form_ok = false;
     let mut random_div_hidden = false;
     let mut checkcode: Option<String> = None;
@@ -196,7 +230,7 @@ fn parse_login_page(page: &str) -> Result<String, PortalError> {
             let action = tag.attr("action").unwrap_or_default();
             if method.eq_ignore_ascii_case("post")
                 && !action.is_empty()
-                && matches_destination(LOGIN, action, VERIFY)
+                && matches_destination(login_url, action, verify_url)
             {
                 form_ok = true;
             }
@@ -301,23 +335,166 @@ struct RawOnlineSession {
     terminal_type: Option<String>,
     #[serde(rename = "useTime", default, deserialize_with = "de_opt_u64")]
     use_time: Option<u64>,
+    #[serde(rename = "downFlow", default, deserialize_with = "de_opt_u64")]
+    down_flow: Option<u64>,
+    #[serde(rename = "upFlow", default, deserialize_with = "de_opt_u64")]
+    up_flow: Option<u64>,
+    #[serde(rename = "sessionId", default)]
+    session_id: Option<String>,
+    #[serde(default)]
+    mac: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawToOfflineReply {
+    #[serde(default)]
+    success: bool,
 }
 
 fn fetch_online_devices(agent: &Agent) -> Result<Vec<OnlineDevice>, PortalError> {
     let raw: Vec<RawOnlineSession> = dashboard_json(agent, "getOnlineList", "读取在线设备")?;
-    Ok(raw
-        .into_iter()
-        .map(|item| {
-            let login_unix = parse_local_datetime(&item.login_time);
-            OnlineDevice {
-                ip: item.ip.to_string(),
+    Ok(dedup_online_sessions(raw))
+}
+
+/// 将门户返回的在线会话按相同 IP 合并去重（解决师大双 BRAS 同一秒产生镜像会话导致同 IP 重复显示及 `4/3` 虚高问题）。
+fn dedup_online_sessions(raw: Vec<RawOnlineSession>) -> Vec<OnlineDevice> {
+    let mut devices: Vec<OnlineDevice> = Vec::with_capacity(raw.len());
+    for item in raw {
+        let ip_str = item.ip.to_string();
+        let login_unix = parse_local_datetime(&item.login_time);
+        let term = normalize_terminal_type(item.terminal_type.as_deref());
+        let flow_kb = item
+            .down_flow
+            .unwrap_or(0)
+            .saturating_add(item.up_flow.unwrap_or(0));
+
+        if let Some(existing) = devices.iter_mut().find(|d| d.ip == ip_str) {
+            if let Some(u) = item.use_time {
+                existing.use_time_secs = Some(existing.use_time_secs.unwrap_or(0).max(u));
+            }
+            if let Some(ts) = login_unix {
+                if existing.login_unix.is_none_or(|old| ts < old) {
+                    existing.login_unix = Some(ts);
+                    existing.login_time = item.login_time;
+                }
+            }
+            if (existing.terminal_type.is_empty() || existing.terminal_type == "终端")
+                && !term.is_empty()
+            {
+                existing.terminal_type = term;
+            }
+            // 镜像会话汇报同一份流量，取 max 避免翻倍
+            existing.campus_flow_kb = existing.campus_flow_kb.max(flow_kb);
+        } else {
+            devices.push(OnlineDevice {
+                ip: ip_str,
                 login_time: item.login_time,
                 login_unix,
-                terminal_type: normalize_terminal_type(item.terminal_type.as_deref()),
+                terminal_type: term,
                 use_time_secs: item.use_time,
+                campus_flow_kb: flow_kb,
+            });
+        }
+    }
+    devices
+}
+
+/// 在内存中登录自助服务并将指定 IP 关联的全部活跃 `sessionId`（含双 BRAS 镜像会话）强制注销下线。
+/// 绝不落盘任何 `sessionId` 或 `mac`。
+pub fn kick_ip_sessions(
+    credential: &StoredCredential,
+    target_ip: &str,
+) -> Result<usize, PortalError> {
+    kick_ip_sessions_with_base(ORIGIN, credential, target_ip)
+}
+
+fn kick_ip_sessions_with_base(
+    origin: &str,
+    credential: &StoredCredential,
+    target_ip: &str,
+) -> Result<usize, PortalError> {
+    let agent = http::no_redirect_agent(8);
+    let entry_url = format!("{origin}/Self/");
+    let login_url = format!("{origin}/Self/login/?302=LI");
+    let verify_url = format!("{origin}/Self/login/verify");
+    let dash_url = format!("{origin}/Self/dashboard");
+    let img_url = format!("{origin}/Self/login/randomCode");
+
+    login_handshake_with_urls(
+        &agent,
+        credential,
+        origin,
+        &entry_url,
+        &login_url,
+        &verify_url,
+        &dash_url,
+        &img_url,
+    )?;
+
+    let list_body = get_page(
+        &agent,
+        &format!("{dash_url}/getOnlineList"),
+        "读取待注销设备列表",
+    )?;
+    let raw: Vec<RawOnlineSession> = serde_json::from_str(&list_body)
+        .map_err(|_| PortalError::ParseError("读取待注销设备列表时收到无法识别的数据".into()))?;
+
+    let matched: Vec<RawOnlineSession> = raw
+        .into_iter()
+        .filter(|s| s.ip.to_string() == target_ip.trim())
+        .collect();
+    if matched.is_empty() {
+        return Ok(0);
+    }
+
+    let mut kicked = 0usize;
+    let mut last_err: Option<String> = None;
+    for s in matched {
+        let sid = s.session_id.unwrap_or_default();
+        if sid.trim().is_empty() {
+            continue;
+        }
+        let clean_mac = s.mac.unwrap_or_default().replace(['-', ':'], "");
+        let url = Url::parse_with_params(
+            &format!("{dash_url}/tooffline"),
+            &[
+                ("sessionid", sid.as_str()),
+                ("ip", target_ip.trim()),
+                ("mac", clean_mac.as_str()),
+            ],
+        )
+        .map_err(|e| PortalError::ParseError(format!("构造注销地址失败：{e}")))?;
+
+        let resp = checked_response(
+            "提交设备注销请求",
+            agent
+                .get(url.as_str())
+                .set("Referer", &dash_url)
+                .set("X-Requested-With", "XMLHttpRequest")
+                .call(),
+        )?;
+        if resp.status() != 200 {
+            last_err = Some(format!("服务端返回 HTTP {}", resp.status()));
+            continue;
+        }
+        let body = resp.into_string().unwrap_or_default();
+        match serde_json::from_str::<RawToOfflineReply>(&body) {
+            Ok(rep) if rep.success => {
+                kicked += 1;
             }
-        })
-        .collect())
+            _ => {
+                last_err = Some("自助服务返回注销失败".into());
+            }
+        }
+    }
+
+    if kicked > 0 {
+        Ok(kicked)
+    } else {
+        Err(PortalError::Unreachable(
+            last_err.unwrap_or_else(|| "未找到可注销的会话标识".into()),
+        ))
+    }
 }
 
 #[derive(Deserialize)]
@@ -530,11 +707,14 @@ fn require_entry_redirect(
 }
 
 /// 校验 `POST /Self/login/verify` 后的重定向目标，将跳回登录页、强制改密页等场景直接翻译为大白话中文。
-fn verify_login_redirect(agent: &Agent, response: &Response) -> Result<(), PortalError> {
+fn verify_login_redirect_for(
+    agent: &Agent,
+    response: &Response,
+    dash_url: &str,
+) -> Result<(), PortalError> {
     let status = response.status();
     let destination = response.header("Location").unwrap_or_default();
-    if matches!(status, 302 | 303)
-        && matches_destination(response.get_url(), destination, DASHBOARD)
+    if matches!(status, 302 | 303) && matches_destination(response.get_url(), destination, dash_url)
     {
         return Ok(());
     }
@@ -669,24 +849,35 @@ fn normalize_user_group_name(raw: Option<&str>) -> String {
         .to_string()
 }
 
+/// 将门户终端类型统一精简为最多 2 个字符（如 `#移动终端` → `手机`），杜绝压盖 IP 列。
 fn normalize_terminal_type(raw: Option<&str>) -> String {
-    let trimmed = raw.unwrap_or("").trim().trim_start_matches('#');
+    let trimmed = raw.unwrap_or("").trim().trim_start_matches('#').trim();
     if trimmed.is_empty() {
-        return String::new();
+        return "终端".to_string();
     }
     let upper = trimmed.to_ascii_uppercase();
-    if upper.contains("PC") || upper.contains("WIN") || upper.contains("MAC") {
-        "PC".to_string()
-    } else if upper.contains("PAD") || upper.contains("TABLET") {
+    if upper.contains("PAD") || upper.contains("TABLET") || trimmed.contains("平板") {
         "平板".to_string()
     } else if upper.contains("PHONE")
         || upper.contains("MOBILE")
         || upper.contains("ANDROID")
         || upper.contains("IOS")
+        || trimmed.contains("移动")
+        || trimmed.contains("手机")
     {
         "手机".to_string()
+    } else if upper.contains("ROUTER") || upper.contains("OPENWRT") || trimmed.contains("路由") {
+        "路由".to_string()
+    } else if upper.contains("PC")
+        || upper.contains("WIN")
+        || upper.contains("MAC")
+        || upper.contains("LINUX")
+        || trimmed.contains("电脑")
+        || trimmed.contains("桌面")
+    {
+        "PC".to_string()
     } else {
-        trimmed.chars().take(6).collect()
+        trimmed.chars().take(2).collect()
     }
 }
 
@@ -881,6 +1072,7 @@ type CredLookup = Arc<dyn Fn(&str, &str) -> Option<StoredCredential> + Send + Sy
 pub struct SelfServiceManager {
     inner: Arc<Mutex<ManagerState>>,
     tx: mpsc::Sender<FetchTrigger>,
+    cred_lookup: CredLookup,
     broadcast: StateBroadcast,
 }
 
@@ -909,18 +1101,20 @@ impl SelfServiceManager {
         let (tx, rx) = mpsc::channel::<FetchTrigger>();
 
         let worker_inner = Arc::clone(&inner);
+        let worker_cred = Arc::clone(&cred_lookup);
         let worker_broadcast = Arc::clone(&broadcast);
         let _ = std::thread::Builder::new()
             .name("self-service-worker".to_string())
             .spawn(move || {
                 while let Ok(trigger) = rx.recv() {
-                    run_single_fetch(&worker_inner, &cred_lookup, &worker_broadcast, trigger);
+                    run_single_fetch(&worker_inner, &worker_cred, &worker_broadcast, trigger);
                 }
             });
 
         Self {
             inner,
             tx,
+            cred_lookup,
             broadcast,
         }
     }
@@ -967,6 +1161,60 @@ impl SelfServiceManager {
     pub fn notify_account_switching(&self) {
         let mut guard = self.inner.lock().unwrap();
         guard.last_attempt_mono = None;
+    }
+
+    /// 强制将当前学号下的指定在线 IP 注销下线（支持同 IP 多 BRAS 镜像会话一并清理），
+    /// 成功后立即从内存列表移除并广播，同时安排一次后台状态复核。
+    pub fn kick_device(&self, target_ip: &str) -> Result<usize, String> {
+        let ip = target_ip.trim();
+        if ip.is_empty() {
+            return Err("目标 IP 不能为空".to_string());
+        }
+        let target = {
+            let guard = self.inner.lock().unwrap();
+            if guard.target.student_id.trim().is_empty() {
+                return Err("请先保存校园网学号与密码".to_string());
+            }
+            guard.target.clone()
+        };
+
+        let Some(cred) = (self.cred_lookup)(&target.account_id, &target.student_id)
+            .filter(|c| c.matches_account(&target.student_id))
+        else {
+            return Err("当前账号尚未保存密码".to_string());
+        };
+
+        match kick_ip_sessions(&cred, ip) {
+            Ok(kicked_count) => {
+                let updated_state = {
+                    let mut guard = self.inner.lock().unwrap();
+                    guard.last_attempt_mono = None;
+                    if let Some(data) = guard.public.data.as_mut() {
+                        data.online_devices.retain(|d| d.ip != ip);
+                    }
+                    guard.public.clone()
+                };
+                (self.broadcast)(updated_state);
+                self.trigger(FetchTrigger::SessionEstablished);
+                Ok(kicked_count)
+            }
+            Err(err) => {
+                if err == PortalError::CaptchaRequired {
+                    let now_unix = Local::now().timestamp();
+                    let until = now_unix + CAPTCHA_COOLDOWN_SECS;
+                    let mut guard = self.inner.lock().unwrap();
+                    guard.captcha_until_unix = Some(until);
+                    guard.last_captcha_at_unix = Some(now_unix);
+                    guard.public.status = SelfServiceStatus::CaptchaCooldown;
+                    guard.public.cooldown_until_unix = Some(until);
+                    guard.public.message = "门户要求验证码，已静默冷却 30 分钟".to_string();
+                    let st = guard.public.clone();
+                    drop(guard);
+                    (self.broadcast)(st);
+                }
+                Err(err.summary())
+            }
+        }
     }
 
     /// 按触发策略决定是否发起异步同步；返回给调用方的提示文案（手动刷新被节流时返回 Ok，不报错）。
@@ -1369,6 +1617,7 @@ mod tests {
                     login_unix: Some(1_000),
                     terminal_type: "PC".into(),
                     use_time_secs: Some(600),
+                    campus_flow_kb: 0,
                 },
                 OnlineDevice {
                     ip: "192.0.2.2".into(),
@@ -1376,6 +1625,7 @@ mod tests {
                     login_unix: Some(500),
                     terminal_type: "手机".into(),
                     use_time_secs: Some(1100),
+                    campus_flow_kb: 0,
                 },
             ],
             recent_sessions: Vec::new(),
@@ -1412,6 +1662,7 @@ mod tests {
             login_unix: Some(1_540),
             terminal_type: "PC".into(),
             use_time_secs: Some(60),
+            campus_flow_kb: 0,
         });
         let (warn, msg) = build_trigger_diagnosis(
             &FetchTrigger::LoginRejected {
@@ -1422,5 +1673,124 @@ mod tests {
         )
         .unwrap();
         assert!(warn && msg.contains("在线终端已满") && msg.contains("192.0.2.3"));
+    }
+
+    #[test]
+    fn terminal_type_shrinks_to_two_chars_and_duplicate_bras_ips_merge() {
+        assert_eq!(normalize_terminal_type(Some("#移动终端")), "手机");
+        assert_eq!(normalize_terminal_type(Some("#PC")), "PC");
+        assert_eq!(normalize_terminal_type(Some("#平板电脑")), "平板");
+        assert_eq!(normalize_terminal_type(Some("自定义超长设备")), "自定");
+        assert_eq!(normalize_terminal_type(None), "终端");
+
+        let raw_json = r##"[
+            {"ip":"172.18.134.16","loginTime":"2026-11-22 20:57:42","terminalType":"#移动终端","useTime":"636","downFlow":"0","upFlow":"0","sessionId":"10001","mac":"aa-bb-cc-dd-ee-01"},
+            {"ip":"172.18.116.13","loginTime":"2026-11-22 20:56:01","terminalType":"#PC","useTime":"738","downFlow":"89","upFlow":"0","sessionId":"10002","mac":"aa-bb-cc-dd-ee-02"},
+            {"ip":"172.18.116.13","loginTime":"2026-11-22 20:56:01","terminalType":"#PC","useTime":"737","downFlow":"89","upFlow":"0","sessionId":"998","mac":"aa-bb-cc-dd-ee-02"}
+        ]"##;
+        let raw: Vec<RawOnlineSession> = serde_json::from_str(raw_json).unwrap();
+        let merged = dedup_online_sessions(raw);
+        assert_eq!(merged.len(), 2);
+        assert_eq!(merged[0].terminal_type, "手机");
+        assert_eq!(merged[1].ip, "172.18.116.13");
+        assert_eq!(merged[1].use_time_secs, Some(738));
+        assert_eq!(merged[1].campus_flow_kb, 89);
+    }
+
+    #[test]
+    fn kick_ip_sessions_calls_tooffline_for_all_sessions_of_target_ip() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let origin = format!("http://127.0.0.1:{port}");
+
+        let server = std::thread::spawn(move || {
+            let mut kicked_reqs = Vec::new();
+            while kicked_reqs.len() < 2 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut data = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = stream.read(&mut buf).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    data.extend_from_slice(&buf[..n]);
+                    if let Some(hdr_end) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let body_start = hdr_end + 4;
+                        let hdr_str = String::from_utf8_lossy(&data[..hdr_end]);
+                        let content_len = hdr_str
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.trim()
+                                    .eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        if data.len() >= body_start + content_len {
+                            break;
+                        }
+                    }
+                }
+                let req = String::from_utf8_lossy(&data).to_string();
+                let first_line = req.lines().next().unwrap_or("");
+                let resp = if first_line.starts_with("GET /Self/ ") {
+                    "HTTP/1.1 302 Found\r\nLocation: /Self/dashboard\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                        .to_string()
+                } else if first_line.starts_with("GET /Self/dashboard ") {
+                    "HTTP/1.1 302 Found\r\nLocation: /Self/login/?302=LI\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                        .to_string()
+                } else if first_line.starts_with("GET /Self/login/?302=LI ") {
+                    let body = r#"<html><body><form method="post" action="/Self/login/verify"><input type="hidden" name="checkcode" value="4321"/><div id="randomDiv" class="form-group hide"></div></form><script>var md5 = true;</script></body></html>"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else if first_line.starts_with("GET /Self/login/randomCode") {
+                    "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 2\r\n\r\nOK"
+                        .to_string()
+                } else if first_line.starts_with("POST /Self/login/verify ") {
+                    "HTTP/1.1 302 Found\r\nLocation: /Self/dashboard\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                        .to_string()
+                } else if first_line.starts_with("GET /Self/dashboard/getOnlineList ") {
+                    let body = r##"[
+                        {"ip":"172.18.116.13","loginTime":"2026-11-22 20:56:01","terminalType":"#PC","sessionId":"S1","mac":"AA-BB-CC-11-22-33"},
+                        {"ip":"172.18.116.13","loginTime":"2026-11-22 20:56:01","terminalType":"#PC","sessionId":"S2","mac":"AA-BB-CC-11-22-33"}
+                    ]"##;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else if first_line.starts_with("GET /Self/dashboard/tooffline?") {
+                    kicked_reqs.push(first_line.to_string());
+                    let body = r#"{"success":true}"#;
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    )
+                } else {
+                    "HTTP/1.1 404 Not Found\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
+                        .to_string()
+                };
+                stream.write_all(resp.as_bytes()).unwrap();
+                let _ = stream.flush();
+            }
+            kicked_reqs
+        });
+
+        let cred = StoredCredential {
+            username: "20240001".into(),
+            password: "secret".into(),
+        };
+        let count = kick_ip_sessions_with_base(&origin, &cred, "172.18.116.13").unwrap();
+        let reqs = server.join().unwrap();
+        assert_eq!(count, 2);
+        assert_eq!(reqs.len(), 2);
+        assert!(reqs[0].contains("sessionid=S1&ip=172.18.116.13&mac=AABBCC112233"));
+        assert!(reqs[1].contains("sessionid=S2&ip=172.18.116.13&mac=AABBCC112233"));
     }
 }

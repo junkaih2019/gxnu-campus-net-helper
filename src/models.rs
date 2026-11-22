@@ -273,7 +273,7 @@ impl SelfServiceTraffic {
     }
 }
 
-/// 门户当前在线的一台终端会话（仅保留非敏感白名单字段）。
+/// 门户当前在线的一台终端会话（已按同 IP 合并多 BRAS 镜像记录，仅保留非敏感白名单字段）。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OnlineDevice {
     pub ip: String,
@@ -282,12 +282,15 @@ pub struct OnlineDevice {
     /// 解析后的 Unix 秒时间戳（用于界面实时计算已在线时长）。
     #[serde(default)]
     pub login_unix: Option<i64>,
-    /// 终端类型标签（如 `PC`、`手机`、`平板`）。
+    /// 终端类型两字标签（如 `PC`、`手机`、`平板`）。
     #[serde(default)]
     pub terminal_type: String,
     /// 门户服务端返回的当前会话已在线秒数（规避本地时钟偏差）。
     #[serde(default)]
     pub use_time_secs: Option<u64>,
+    /// 当前会话已产生的校园网计费流量（KB，源自 `downFlow + upFlow`）。
+    #[serde(default)]
+    pub campus_flow_kb: u64,
 }
 
 /// 门户近期上网记录单条会话（来自 `/Self/bill/getUserOnlineLog`，含真实运营商流量）。

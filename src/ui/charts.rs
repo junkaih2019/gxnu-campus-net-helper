@@ -62,6 +62,7 @@ pub struct HomeVisualActions {
     pub split_changed: bool,
     pub refresh_self_service: bool,
     pub traffic_view_changed: bool,
+    pub kick_device: Option<(String, bool)>,
 }
 
 /// Tier 2：账号流量（左） + 在线设备（右）双栏卡片（可左右拖拽调整比例）。
@@ -75,6 +76,7 @@ pub fn draw_self_service_row(
     local_campus_ip: &str,
     is_monitor_online: bool,
     login_rejected: bool,
+    kicking_ips: &std::collections::HashSet<String>,
     split_ratio: &mut f32,
     target_height: f32,
 ) -> HomeVisualActions {
@@ -126,16 +128,21 @@ pub fn draw_self_service_row(
             Vec2::new(right_w, target_height),
             egui::Layout::top_down(egui::Align::LEFT),
             |ui| {
-                if draw_online_devices_card(
+                let (refresh, kick) = draw_online_devices_card(
                     ui,
                     p,
                     self_service,
                     local_campus_ip,
                     is_monitor_online,
                     login_rejected,
+                    kicking_ips,
                     target_height,
-                ) {
+                );
+                if refresh {
                     actions.refresh_self_service = true;
+                }
+                if kick.is_some() {
+                    actions.kick_device = kick;
                 }
             },
         );
@@ -827,7 +834,8 @@ fn paint_ring_center_text(
     );
 }
 
-/// 右卡：在线设备（聚焦当前在线终端、并发配额与清晰状态说明，悬停页脚入口可按需查看近期上网记录）。
+/// 右卡：在线设备（聚焦当前在线终端、并发配额、一键注销与清晰状态说明）。
+#[allow(clippy::too_many_arguments)]
 fn draw_online_devices_card(
     ui: &mut egui::Ui,
     p: &Palette,
@@ -835,9 +843,11 @@ fn draw_online_devices_card(
     local_campus_ip: &str,
     is_monitor_online: bool,
     login_rejected: bool,
+    kicking_ips: &std::collections::HashSet<String>,
     target_height: f32,
-) -> bool {
+) -> (bool, Option<(String, bool)>) {
     let mut refresh_clicked = false;
+    let mut kick_target: Option<(String, bool)> = None;
     let now_unix = Local::now().timestamp();
 
     card_padded(ui, p, 12, |ui| {
@@ -944,6 +954,7 @@ fn draw_online_devices_card(
         let local_present = devices.iter().any(|(_, is_local)| *is_local);
         let other_count = devices.iter().filter(|(_, is_local)| !*is_local).count();
         let at_limit = data.max_online_devices.is_some_and(|m| count >= m as usize);
+        let warn_dot = at_limit || login_rejected;
 
         // 2. 在线终端列表区（默认 58px：1 台舒展双行卡片 / 2 台两行齐平直出 / 3+ 台平滑滚动）
         let footer_total_h = 24.0_f32;
@@ -958,28 +969,34 @@ fn draw_online_devices_card(
                     draw_empty_devices_box(ui, p, card_w, dev_area_h.min(54.0));
                 } else if devices.len() == 1 {
                     let (dev, is_local) = devices[0];
-                    draw_featured_device_card(
+                    if draw_featured_device_card(
                         ui,
                         p,
                         dev,
                         is_local,
-                        at_limit || login_rejected,
+                        warn_dot,
+                        kicking_ips.contains(&dev.ip),
                         data.fetched_at_unix,
                         now_unix,
                         card_w,
                         dev_area_h.min(56.0),
-                    );
+                    ) {
+                        kick_target = Some((dev.ip.clone(), is_local));
+                    }
                 } else if devices.len() == 2 && dev_area_h >= 56.0 {
                     for (dev, is_local) in &devices {
-                        draw_online_device_row(
+                        if draw_online_device_row(
                             ui,
                             p,
                             dev,
                             *is_local,
-                            at_limit || login_rejected,
+                            warn_dot,
+                            kicking_ips.contains(&dev.ip),
                             data.fetched_at_unix,
                             now_unix,
-                        );
+                        ) {
+                            kick_target = Some((dev.ip.clone(), *is_local));
+                        }
                     }
                 } else {
                     egui::ScrollArea::vertical()
@@ -991,15 +1008,18 @@ fn draw_online_devices_card(
                             ui.set_width(card_w);
                             ui.spacing_mut().item_spacing.y = 4.0;
                             for (dev, is_local) in &devices {
-                                draw_online_device_row(
+                                if draw_online_device_row(
                                     ui,
                                     p,
                                     dev,
                                     *is_local,
-                                    at_limit || login_rejected,
+                                    warn_dot,
+                                    kicking_ips.contains(&dev.ip),
                                     data.fetched_at_unix,
                                     now_unix,
-                                );
+                                ) {
+                                    kick_target = Some((dev.ip.clone(), *is_local));
+                                }
                             }
                         });
                 }
@@ -1017,7 +1037,7 @@ fn draw_online_devices_card(
 
         let (summary_text, summary_color) = if login_rejected && count > 0 {
             (
-                "认证被拒 · 检测到占线设备，请检查并发上限".to_string(),
+                "认证被拒 · 可点击右侧「注销」释放占线终端".to_string(),
                 p.danger,
             )
         } else if let Some(max) = data.max_online_devices {
@@ -1025,7 +1045,7 @@ fn draw_online_devices_card(
             let rem = max_u.saturating_sub(count);
             if count >= max_u {
                 (
-                    format!("已达并发上限（{count}/{max}），再登新设备可能挤线"),
+                    format!("已达并发上限（{count}/{max}），可点击「注销」释放占线终端"),
                     p.warn,
                 )
             } else if other_count > 0 {
@@ -1120,7 +1140,7 @@ fn draw_online_devices_card(
         }
     });
 
-    refresh_clicked
+    (refresh_clicked, kick_target)
 }
 
 fn draw_empty_devices_box(ui: &mut egui::Ui, p: &Palette, width: f32, height: f32) {
@@ -1151,24 +1171,23 @@ fn draw_empty_devices_box(ui: &mut egui::Ui, p: &Palette, width: f32, height: f3
     );
 }
 
-/// 仅 1 台终端在线时的舒展双行卡片（充分利用空间，杜绝空洞感）。
+/// 仅 1 台终端在线时的舒展双行卡片（充分利用空间，右侧对齐「注销」按钮）。
 #[allow(clippy::too_many_arguments)]
 fn draw_featured_device_card(
     ui: &mut egui::Ui,
     p: &Palette,
     dev: &OnlineDevice,
     is_local: bool,
-    highlight_conflict: bool,
+    login_rejected: bool,
+    kicking: bool,
     fetched_at_unix: i64,
     now_unix: i64,
     width: f32,
     height: f32,
-) {
+) -> bool {
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(width, height), Sense::hover());
     let (fill, stroke) = if resp.hovered() {
         (p.card_hover, Stroke::new(1.0_f32, p.border_strong))
-    } else if !is_local && highlight_conflict {
-        (p.warn_soft, Stroke::new(1.0_f32, p.warn_border))
     } else {
         (p.subtle, Stroke::new(1.0_f32, p.divider))
     };
@@ -1180,14 +1199,29 @@ fn draw_featured_device_card(
         StrokeKind::Inside,
     );
 
-    let painter = ui.painter();
     let top_y = rect.top() + height * 0.34;
     let bot_y = rect.top() + height * 0.72;
+
+    let kick_w = 38.0_f32;
+    let kick_rect = Rect::from_min_size(
+        Pos2::new(rect.right() - 10.0 - kick_w, top_y - 9.5),
+        Vec2::new(kick_w, 19.0),
+    );
+    let kick_clicked = draw_kick_button(
+        ui,
+        p,
+        kick_rect,
+        ui.id().with(("kick_featured", &dev.ip)),
+        is_local,
+        kicking,
+    );
+
+    let painter = ui.painter();
     let mut x = rect.left() + 11.0;
 
     let dot_c = if is_local {
         p.ok
-    } else if highlight_conflict {
+    } else if login_rejected {
         p.warn
     } else {
         p.accent
@@ -1195,20 +1229,22 @@ fn draw_featured_device_card(
     painter.circle_filled(Pos2::new(x + 3.0, top_y), 3.3, dot_c);
     x += 12.0;
 
-    if !dev.terminal_type.is_empty() {
-        x = paint_mini_pill(
-            painter,
-            x,
-            top_y,
-            34.0,
-            &dev.terminal_type,
-            p.text_secondary,
-            p.card,
-            p.border,
-        ) + 7.0;
-    }
+    let term_label = if dev.terminal_type.is_empty() {
+        "终端"
+    } else {
+        dev.terminal_type.as_str()
+    };
+    x = paint_mini_pill(
+        painter,
+        x,
+        top_y,
+        34.0,
+        term_label,
+        p.text_secondary,
+        p.card,
+        p.border,
+    ) + 7.0;
 
-    // 统一使用微软雅黑字族绘制 IP 与中文，确保数字、图标与汉字基线严格对齐
     let ip_galley = painter.layout_no_wrap(
         dev.ip.clone(),
         egui::FontId::new(11.8, crate::ui::theme::bold_family()),
@@ -1219,46 +1255,43 @@ fn draw_featured_device_card(
         ip_galley.clone(),
         p.text,
     );
-    x += ip_galley.size().x + 7.0;
+    x += ip_galley.size().x + 6.0;
 
-    let (id_lbl, id_fg, id_bg, id_bd) = if is_local {
-        ("本机", p.ok, p.ok_soft, p.ok_border)
-    } else if highlight_conflict {
-        ("占线终端", p.warn, p.warn_soft, p.warn_border)
-    } else {
-        (
-            "其他终端",
-            p.text_secondary,
-            p.neutral_soft,
-            p.neutral_border,
-        )
-    };
-    let _ = paint_mini_pill(painter, x, top_y, 34.0, id_lbl, id_fg, id_bg, id_bd);
+    if is_local {
+        let _ = paint_mini_pill(
+            painter,
+            x,
+            top_y,
+            32.0,
+            "本机",
+            p.ok,
+            p.ok_soft,
+            p.ok_border,
+        );
+    }
 
     let elapsed_secs = device_elapsed_secs(dev, fetched_at_unix, now_unix);
     if elapsed_secs > 0 {
         let dur_g = painter.layout_no_wrap(
             format!("已在线 {}", format_duration_short(elapsed_secs)),
-            egui::FontId::new(10.8, crate::ui::theme::bold_family()),
-            p.text_secondary,
+            egui::FontId::proportional(10.5),
+            p.text_muted,
         );
         painter.galley(
             Pos2::new(
-                rect.right() - 11.0 - dur_g.size().x,
+                kick_rect.left() - 9.0 - dur_g.size().x,
                 top_y - dur_g.size().y * 0.5,
             ),
             dur_g,
-            p.text_secondary,
+            p.text_muted,
         );
     }
 
     let start_hm = device_start_hm(dev);
     let sub_text = if is_local {
         format!("{start_hm} 上线 · 自助服务已核验本机活跃会话")
-    } else if highlight_conflict {
-        format!("{start_hm} 上线 · 其他终端占线，若登录被拒请排查并发名额")
     } else {
-        format!("{start_hm} 上线 · 同账号另一终端当前在线")
+        format!("{start_hm} 上线 · 同账号其他在线终端")
     };
     let sub_g = painter.layout_no_wrap(sub_text, egui::FontId::proportional(10.0), p.text_muted);
     painter.galley(
@@ -1267,11 +1300,12 @@ fn draw_featured_device_card(
         p.text_muted,
     );
 
-    if resp.hovered() {
+    if resp.hovered() && !ui.rect_contains_pointer(kick_rect) {
         resp.on_hover_ui(|ui| {
             draw_device_detail_tooltip(ui, p, dev, is_local, elapsed_secs);
         });
     }
+    kick_clicked
 }
 
 fn draw_devices_placeholder(
@@ -1315,22 +1349,32 @@ fn draw_devices_placeholder(
         });
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_online_device_row(
     ui: &mut egui::Ui,
     p: &Palette,
     dev: &OnlineDevice,
     is_local: bool,
-    highlight_conflict: bool,
+    login_rejected: bool,
+    kicking: bool,
     fetched_at_unix: i64,
     now_unix: i64,
-) {
+) -> bool {
     let row_w = ui.available_width();
     let row_h = 27.0_f32;
     let (rect, resp) = ui.allocate_exact_size(Vec2::new(row_w, row_h), Sense::hover());
-    let (fill, stroke) = if resp.hovered() {
+
+    let cy = rect.center().y;
+    let kick_w = 38.0_f32;
+    let kick_h = 18.0_f32;
+    let kick_rect = Rect::from_min_size(
+        Pos2::new(rect.right() - 8.0 - kick_w, cy - kick_h * 0.5),
+        Vec2::new(kick_w, kick_h),
+    );
+    let over_kick = ui.rect_contains_pointer(kick_rect);
+
+    let (fill, stroke) = if resp.hovered() && !over_kick {
         (p.card_hover, Stroke::new(1.0_f32, p.border_strong))
-    } else if !is_local && highlight_conflict {
-        (p.warn_soft, Stroke::new(1.0_f32, p.warn_border))
     } else {
         (p.subtle, Stroke::new(1.0_f32, p.divider))
     };
@@ -1342,20 +1386,28 @@ fn draw_online_device_row(
         StrokeKind::Inside,
     );
 
-    let cy = rect.center().y;
+    let kick_clicked = draw_kick_button(
+        ui,
+        p,
+        kick_rect,
+        ui.id().with(("kick_row", &dev.ip)),
+        is_local,
+        kicking,
+    );
+
     let painter = ui.painter();
 
-    // 固定栅格列坐标：保证多行间圆点、终端标签、IP 数字、身份徽章与右侧时刻/时长纵向严格对齐
+    // 左侧固定栅格：状态圆点 + 34px 两字终端胶囊 + IP + 紧贴 IP 右侧的「本机」绿标
     let dot_c = if is_local {
         p.ok
-    } else if highlight_conflict {
+    } else if login_rejected {
         p.warn
     } else {
         p.accent
     };
-    painter.circle_filled(Pos2::new(rect.left() + 12.0, cy), 3.0, dot_c);
+    painter.circle_filled(Pos2::new(rect.left() + 11.0, cy), 3.0, dot_c);
 
-    let term_x = rect.left() + 21.0;
+    let term_x = rect.left() + 20.0;
     let term_col_w = 34.0_f32;
     let term_label = if dev.terminal_type.is_empty() {
         "终端"
@@ -1385,70 +1437,121 @@ fn draw_online_device_row(
         p.text,
     );
 
-    // 固定 IP 列宽（90px，足以容纳最长 IPv4），保证每行「本机 / 其他」徽章严格竖直齐平
-    let badge_x = ip_x + ip_galley.size().x.max(90.0) + 6.0;
-    let (id_lbl, id_fg, id_bg, id_bd) = if is_local {
-        ("本机", p.ok, p.ok_soft, p.ok_border)
-    } else if highlight_conflict {
-        ("占线", p.warn, p.warn_soft, p.warn_border)
-    } else {
-        ("其他", p.text_secondary, p.neutral_soft, p.neutral_border)
-    };
-    let _ = paint_mini_pill(painter, badge_x, cy, 34.0, id_lbl, id_fg, id_bg, id_bd);
-
-    // 右侧分列对齐：「06:29 上线」 + 固定居中「·」 + 固定右列「42m46s / 1h30m」
-    let start_hm = device_start_hm(dev);
-    let elapsed_secs = device_elapsed_secs(dev, fetched_at_unix, now_unix);
-    let meta_font = egui::FontId::proportional(10.2);
-    let right_edge = rect.right() - 10.0;
-
-    if elapsed_secs > 0 {
-        let dur_col_w = 40.0_f32;
-        let dur_x = right_edge - dur_col_w;
-        let dur_g = painter.layout_no_wrap(
-            format_duration_short(elapsed_secs),
-            meta_font.clone(),
-            p.text_muted,
-        );
-        painter.galley(
-            Pos2::new(dur_x, cy - dur_g.size().y * 0.5),
-            dur_g,
-            p.text_muted,
-        );
-
-        let dot_cx = dur_x - 5.0;
-        let dot_g = painter.layout_no_wrap("·".to_string(), meta_font.clone(), p.text_muted);
-        painter.galley(
-            Pos2::new(dot_cx - dot_g.size().x * 0.5, cy - dot_g.size().y * 0.5),
-            dot_g,
-            p.text_muted,
-        );
-
-        let time_txt = if row_w >= 316.0 {
-            format!("{start_hm} 上线")
-        } else {
-            start_hm.to_string()
-        };
-        let time_g = painter.layout_no_wrap(time_txt, meta_font, p.text_muted);
-        painter.galley(
-            Pos2::new(dot_cx - 5.0 - time_g.size().x, cy - time_g.size().y * 0.5),
-            time_g,
-            p.text_muted,
-        );
-    } else {
-        let time_g = painter.layout_no_wrap(format!("{start_hm} 上线"), meta_font, p.text_muted);
-        painter.galley(
-            Pos2::new(right_edge - time_g.size().x, cy - time_g.size().y * 0.5),
-            time_g,
-            p.text_muted,
+    let mut left_end_x = ip_x + ip_galley.size().x;
+    if is_local {
+        left_end_x = paint_mini_pill(
+            painter,
+            left_end_x + 6.0,
+            cy,
+            32.0,
+            "本机",
+            p.ok,
+            p.ok_soft,
+            p.ok_border,
         );
     }
 
-    if resp.hovered() {
+    // 右侧紧靠「注销」按钮左缘对齐上线时刻与在线时长
+    let start_hm = device_start_hm(dev);
+    let elapsed_secs = device_elapsed_secs(dev, fetched_at_unix, now_unix);
+    let meta_font = egui::FontId::proportional(10.0);
+    let right_meta_edge = kick_rect.left() - 8.0;
+    let avail_meta_w = right_meta_edge - left_end_x - 8.0;
+
+    if avail_meta_w > 24.0 {
+        let meta_txt = if elapsed_secs > 0 {
+            let dur = format_duration_short(elapsed_secs);
+            let full = format!("{start_hm} 上线 · {dur}");
+            let compact = format!("{start_hm} · {dur}");
+            let full_g = painter.layout_no_wrap(full.clone(), meta_font.clone(), p.text_muted);
+            if full_g.size().x <= avail_meta_w {
+                full
+            } else {
+                let comp_g =
+                    painter.layout_no_wrap(compact.clone(), meta_font.clone(), p.text_muted);
+                if comp_g.size().x <= avail_meta_w {
+                    compact
+                } else {
+                    dur
+                }
+            }
+        } else {
+            format!("{start_hm} 上线")
+        };
+        let meta_g = painter.layout_no_wrap(meta_txt, meta_font, p.text_muted);
+        if meta_g.size().x <= avail_meta_w + 4.0 {
+            painter.galley(
+                Pos2::new(
+                    right_meta_edge - meta_g.size().x,
+                    cy - meta_g.size().y * 0.5,
+                ),
+                meta_g,
+                p.text_muted,
+            );
+        }
+    }
+
+    if resp.hovered() && !over_kick {
         resp.on_hover_ui(|ui| {
             draw_device_detail_tooltip(ui, p, dev, is_local, elapsed_secs);
         });
     }
+    kick_clicked
+}
+
+fn draw_kick_button(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    rect: Rect,
+    id: egui::Id,
+    is_local: bool,
+    kicking: bool,
+) -> bool {
+    let sense = if kicking {
+        Sense::hover()
+    } else {
+        Sense::click()
+    };
+    let resp = ui.interact(rect, id, sense);
+    if !kicking && resp.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    let (label, fg, bg, bd) = if kicking {
+        ("注销…", p.text_muted, p.card, p.divider)
+    } else if resp.hovered() {
+        ("注销", p.danger, p.danger_soft, p.danger_border)
+    } else {
+        ("注销", p.text_secondary, p.card, p.border)
+    };
+    ui.painter().rect(
+        rect,
+        CornerRadius::same(4),
+        bg,
+        Stroke::new(1.0_f32, bd),
+        StrokeKind::Inside,
+    );
+    let g = ui.painter().layout_no_wrap(
+        label.to_string(),
+        egui::FontId::new(9.8, crate::ui::theme::bold_family()),
+        fg,
+    );
+    ui.painter().galley(
+        Pos2::new(
+            rect.center().x - g.size().x * 0.5,
+            rect.center().y - g.size().y * 0.5,
+        ),
+        g,
+        fg,
+    );
+    let tip = if kicking {
+        "正在向自助服务请求注销该会话…"
+    } else if is_local {
+        "注销本机校园网会话（需二次确认，并同步暂停自动重连守护）"
+    } else {
+        "从校园网自助服务强制注销该终端会话"
+    };
+    resp.clone().on_hover_text(tip);
+    !kicking && resp.clicked()
 }
 
 fn device_start_hm(dev: &OnlineDevice) -> &str {
@@ -1494,6 +1597,14 @@ fn draw_device_detail_tooltip(
     detail_kv_row(ui, p, "上线时间", &dev.login_time);
     if elapsed_secs > 0 {
         detail_kv_row(ui, p, "已在线时长", &format_duration_short(elapsed_secs));
+    }
+    if dev.campus_flow_kb > 0 {
+        let flow_txt = if dev.campus_flow_kb >= 1024 {
+            format_mb_compact(dev.campus_flow_kb as f64 / 1024.0)
+        } else {
+            format!("{} KB", dev.campus_flow_kb)
+        };
+        detail_kv_row(ui, p, "本会话计费流量", &flow_txt);
     }
 }
 

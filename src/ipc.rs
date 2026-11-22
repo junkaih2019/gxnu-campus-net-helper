@@ -41,8 +41,18 @@ pub struct SnapshotEnvelope {
 #[serde(tag = "type")]
 pub enum DaemonToUi {
     Snapshot(Box<SnapshotEnvelope>),
-    LogLine { line: String },
-    CommandResult { id: u64, result: Result<(), String> },
+    LogLine {
+        line: String,
+    },
+    CommandResult {
+        id: u64,
+        result: Result<(), String>,
+    },
+    KickResult {
+        ip: String,
+        is_local: bool,
+        result: Result<(), String>,
+    },
     OpenAccountSettings,
     Shutdown,
 }
@@ -56,6 +66,10 @@ pub enum UiToDaemon {
     ForceCheck,
     RefreshSelfService {
         force: bool,
+    },
+    KickDevice {
+        ip: String,
+        is_local: bool,
     },
     ReloadSettings {
         start: bool,
@@ -231,6 +245,17 @@ impl IpcServer {
             .broadcast(DaemonToUi::OpenAccountSettings);
     }
 
+    pub fn broadcast_kick_result(&self, ip: String, is_local: bool, result: Result<(), String>) {
+        self.subscribers
+            .lock()
+            .unwrap()
+            .broadcast(DaemonToUi::KickResult {
+                ip,
+                is_local,
+                result,
+            });
+    }
+
     pub fn broadcast_shutdown(&self) {
         let mut hub = self.subscribers.lock().unwrap();
         if hub.closed {
@@ -333,6 +358,7 @@ pub struct IpcClient {
     writer: TcpStream,
     next_id: u64,
     pub replies: Receiver<(u64, Result<(), String>)>,
+    pub kick_results: Receiver<(String, bool, Result<(), String>)>,
     pub daemon_closed: Arc<AtomicBool>,
     pub connection_lost: Arc<AtomicBool>,
     pub open_account_settings: Arc<AtomicBool>,
@@ -366,6 +392,7 @@ impl IpcClient {
         let daemon_closed = Arc::new(AtomicBool::new(false));
         let open_account_settings = Arc::new(AtomicBool::new(false));
         let (reply_tx, replies) = mpsc::channel();
+        let (kick_tx, kick_results) = mpsc::channel();
         let connection_lost = Arc::new(AtomicBool::new(false));
         let lost_ref = Arc::clone(&connection_lost);
         let closed_ref = Arc::clone(&daemon_closed);
@@ -395,6 +422,13 @@ impl IpcClient {
                                     DaemonToUi::CommandResult { id, result } => {
                                         let _ = reply_tx.send((id, result));
                                     }
+                                    DaemonToUi::KickResult {
+                                        ip,
+                                        is_local,
+                                        result,
+                                    } => {
+                                        let _ = kick_tx.send((ip, is_local, result));
+                                    }
                                     DaemonToUi::OpenAccountSettings => {
                                         open_acct_ref.store(true, Ordering::Release);
                                     }
@@ -415,6 +449,7 @@ impl IpcClient {
                 writer: stream,
                 next_id: 1,
                 replies,
+                kick_results,
                 daemon_closed,
                 connection_lost,
                 open_account_settings,

@@ -212,6 +212,9 @@ enum HitTarget {
     DismissOverlay,
     ConfirmVpnSwitch,
     CancelVpnSwitch,
+    KickDevice(usize),
+    ConfirmLocalKick,
+    CancelLocalKick,
     TrafficCarrier,
     TrafficCampus,
     Range7h,
@@ -312,6 +315,8 @@ struct FlyoutState {
     accounts: Vec<FlyoutAccountItem>,
     account_dropdown_open: bool,
     vpn_confirm_target: Option<FlyoutAccountItem>,
+    local_kick_confirm_ip: Option<String>,
+    kicking_ips: Vec<(String, Instant)>,
     range: TimeRange,
     dpi: u32,
     width_px: i32,
@@ -382,6 +387,8 @@ impl FluentTrayFlyout {
                 accounts: Vec::new(),
                 account_dropdown_open: false,
                 vpn_confirm_target: None,
+                local_kick_confirm_ip: None,
+                kicking_ips: Vec::new(),
                 range: TimeRange::H7,
                 dpi: 96,
                 width_px: 326,
@@ -479,6 +486,7 @@ impl FluentTrayFlyout {
         state.tracking_mouse = false;
         state.account_dropdown_open = false;
         state.vpn_confirm_target = None;
+        state.local_kick_confirm_ip = None;
         refresh_flyout_state(state, true);
 
         let dark_val: u32 = if state.palette.dark { 1 } else { 0 };
@@ -528,6 +536,7 @@ impl Drop for FluentTrayFlyout {
 unsafe fn hide_flyout_window(hwnd: HWND, state: &mut FlyoutState) {
     state.account_dropdown_open = false;
     state.vpn_confirm_target = None;
+    state.local_kick_confirm_ip = None;
     state.hovered = None;
     ShowWindow(hwnd, SW_HIDE);
 }
@@ -689,6 +698,14 @@ fn refresh_flyout_state(state: &mut FlyoutState, reload_telemetry: bool) {
     if reload_telemetry || state.telemetry_cache.is_empty() {
         state.telemetry_cache = MetricsStore::history(&state.sources.app_dir);
     }
+
+    state.kicking_ips.retain(|(ip, started)| {
+        started.elapsed() < Duration::from_secs(8)
+            && ss
+                .data
+                .as_ref()
+                .is_some_and(|d| d.online_devices.iter().any(|dev| &dev.ip == ip))
+    });
 
     state.model = build_flyout_model(
         &state.palette,
@@ -1216,6 +1233,7 @@ unsafe extern "system" fn flyout_wnd_proc(
                             cb(TrayAction::OpenAccountSettings);
                         } else {
                             state.vpn_confirm_target = None;
+                            state.local_kick_confirm_ip = None;
                             state.account_dropdown_open = !state.account_dropdown_open;
                             state.hovered = None;
                             sync_flyout_height(hwnd, state);
@@ -1246,6 +1264,7 @@ unsafe extern "system" fn flyout_wnd_proc(
                                 cb(TrayAction::OpenAccountSettings);
                             } else if acc.carrier == "0" {
                                 state.account_dropdown_open = false;
+                                state.local_kick_confirm_ip = None;
                                 state.vpn_confirm_target = Some(acc);
                                 state.hovered = None;
                                 sync_flyout_height(hwnd, state);
@@ -1263,6 +1282,45 @@ unsafe extern "system" fn flyout_wnd_proc(
                     HitTarget::ConfirmVpnSwitch => {
                         if let Some(acc) = state.vpn_confirm_target.take() {
                             execute_flyout_account_switch(hwnd, state, acc);
+                        }
+                    }
+                    HitTarget::KickDevice(idx) => {
+                        if let Some(dev) = state.model.devices.get(idx).cloned() {
+                            if dev.is_local {
+                                state.account_dropdown_open = false;
+                                state.vpn_confirm_target = None;
+                                state.local_kick_confirm_ip = Some(dev.ip);
+                                state.hovered = None;
+                                sync_flyout_height(hwnd, state);
+                                InvalidateRect(hwnd, null(), 0);
+                            } else {
+                                if !state.kicking_ips.iter().any(|(ip, _)| ip == &dev.ip) {
+                                    state.kicking_ips.push((dev.ip.clone(), Instant::now()));
+                                }
+                                state.hovered = None;
+                                InvalidateRect(hwnd, null(), 0);
+                                let cb = Arc::clone(&state.on_action);
+                                cb(TrayAction::KickDevice {
+                                    ip: dev.ip,
+                                    is_local: false,
+                                });
+                            }
+                        }
+                    }
+                    HitTarget::CancelLocalKick => {
+                        state.local_kick_confirm_ip = None;
+                        state.hovered = None;
+                        InvalidateRect(hwnd, null(), 0);
+                    }
+                    HitTarget::ConfirmLocalKick => {
+                        if let Some(ip) = state.local_kick_confirm_ip.take() {
+                            if !state.kicking_ips.iter().any(|(k, _)| k == &ip) {
+                                state.kicking_ips.push((ip.clone(), Instant::now()));
+                            }
+                            state.hovered = None;
+                            InvalidateRect(hwnd, null(), 0);
+                            let cb = Arc::clone(&state.on_action);
+                            cb(TrayAction::KickDevice { ip, is_local: true });
                         }
                     }
                     HitTarget::TrafficCarrier => {
@@ -1321,7 +1379,11 @@ unsafe extern "system" fn flyout_wnd_proc(
         WM_KEYDOWN => {
             let key = wparam as u16;
             if key == VK_ESCAPE {
-                if state.vpn_confirm_target.is_some() {
+                if state.local_kick_confirm_ip.is_some() {
+                    state.local_kick_confirm_ip = None;
+                    state.hovered = None;
+                    InvalidateRect(hwnd, null(), 0);
+                } else if state.vpn_confirm_target.is_some() {
                     state.vpn_confirm_target = None;
                     state.hovered = None;
                     InvalidateRect(hwnd, null(), 0);
@@ -1334,7 +1396,15 @@ unsafe extern "system" fn flyout_wnd_proc(
                     hide_flyout_window(hwnd, state);
                 }
             } else if key == VK_RETURN {
-                if let Some(acc) = state.vpn_confirm_target.take() {
+                if let Some(ip) = state.local_kick_confirm_ip.take() {
+                    if !state.kicking_ips.iter().any(|(k, _)| k == &ip) {
+                        state.kicking_ips.push((ip.clone(), Instant::now()));
+                    }
+                    state.hovered = None;
+                    InvalidateRect(hwnd, null(), 0);
+                    let cb = Arc::clone(&state.on_action);
+                    cb(TrayAction::KickDevice { ip, is_local: true });
+                } else if let Some(acc) = state.vpn_confirm_target.take() {
                     execute_flyout_account_switch(hwnd, state, acc);
                 }
             }
@@ -1372,6 +1442,7 @@ unsafe fn execute_flyout_account_switch(
 ) {
     state.account_dropdown_open = false;
     state.vpn_confirm_target = None;
+    state.local_kick_confirm_ip = None;
     state.hovered = None;
     state.traffic_user_override = false;
     state.traffic_mode = if acc.carrier == "0" {
@@ -1543,8 +1614,9 @@ unsafe fn draw_flyout_contents(
         DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
     );
 
-    let chip_hovered =
-        state.hovered == Some(HitTarget::AccountChip) && state.vpn_confirm_target.is_none();
+    let chip_hovered = state.hovered == Some(HitTarget::AccountChip)
+        && state.vpn_confirm_target.is_none()
+        && state.local_kick_confirm_ip.is_none();
     let (chip_bg, chip_bd) = if state.account_dropdown_open {
         (p.accent_soft, p.accent)
     } else if chip_hovered {
@@ -1898,6 +1970,9 @@ unsafe fn draw_flyout_contents(
     } else {
         let row_h = scale(26, d);
         let row_gap = scale(5, d);
+        let overlay_active = state.account_dropdown_open
+            || state.vpn_confirm_target.is_some()
+            || state.local_kick_confirm_ip.is_some();
         for (idx, dev) in state.model.devices.iter().enumerate() {
             if idx > 0 {
                 y += row_gap;
@@ -1908,12 +1983,7 @@ unsafe fn draw_flyout_contents(
                 right,
                 bottom: y + row_h,
             };
-            let (row_bg, row_bd) = if dev.is_conflict {
-                (p.warn_soft, p.warn_border)
-            } else {
-                (p.subtle, p.divider)
-            };
-            fill_round_rect(hdc, r, scale(6, d), row_bg, row_bd);
+            fill_round_rect(hdc, r, scale(6, d), p.subtle, p.divider);
 
             let cy = y + row_h / 2;
             let dot_c = if dev.is_local {
@@ -1925,7 +1995,7 @@ unsafe fn draw_flyout_contents(
             };
             fill_circle(hdc, left + scale(11, d), cy, scale(3, d), dot_c, dot_c);
 
-            // 固定 32px 终端类型胶囊
+            // 固定 32px 两字终端胶囊（PC / 手机 / 平板 / 路由）
             let term_x = left + scale(20, d);
             let term_w = scale(32, d);
             let term_r = RECT {
@@ -1944,9 +2014,9 @@ unsafe fn draw_flyout_contents(
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
 
-            // 固定 90px IP 列
+            // IP 列 + 紧贴 IP 右侧的「本机」绿标（非本机行留白，不再正中悬空徽章）
             let ip_x = term_x + term_w + scale(7, d);
-            let ip_w = scale(90, d);
+            let ip_actual_w = measure_text_width(hdc, f_ip, &dev.ip).min(scale(96, d));
             draw_text_line(
                 hdc,
                 f_ip,
@@ -1954,53 +2024,88 @@ unsafe fn draw_flyout_contents(
                 RECT {
                     left: ip_x,
                     top: y,
-                    right: ip_x + ip_w,
+                    right: ip_x + ip_actual_w + scale(2, d),
                     bottom: y + row_h,
                 },
                 p.text,
                 DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
 
-            // 固定 34px 身份胶囊
-            let id_x = ip_x + ip_w + scale(4, d);
-            let id_w = scale(34, d);
-            let (id_lbl, id_fg, id_bg, id_bd) = if dev.is_local {
-                ("本机", p.ok, p.ok_soft, p.ok_border)
-            } else if dev.is_conflict {
-                ("占线", p.warn, p.warn_soft, p.warn_border)
+            let mut left_end_x = ip_x + ip_actual_w;
+            if dev.is_local {
+                let id_x = left_end_x + scale(6, d);
+                let id_w = scale(32, d);
+                let id_r = RECT {
+                    left: id_x,
+                    top: cy - scale(8, d),
+                    right: id_x + id_w,
+                    bottom: cy + scale(8, d),
+                };
+                fill_round_rect(hdc, id_r, scale(4, d), p.ok_soft, p.ok_border);
+                draw_text_line(
+                    hdc,
+                    f_bold_sm,
+                    "本机",
+                    id_r,
+                    p.ok,
+                    DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                );
+                left_end_x = id_r.right;
+            }
+
+            // 最右端统一灰底「注销」按钮（仅鼠标悬停时泛红）
+            let is_kicking = state.kicking_ips.iter().any(|(ip, _)| ip == &dev.ip);
+            let kick_w = scale(36, d);
+            let kick_h = scale(18, d);
+            let kick_r = RECT {
+                left: right - scale(6, d) - kick_w,
+                top: cy - kick_h / 2,
+                right: right - scale(6, d),
+                bottom: cy + kick_h / 2,
+            };
+            let kick_hov =
+                !is_kicking && !overlay_active && state.hovered == Some(HitTarget::KickDevice(idx));
+            let (kick_lbl, kick_fg, kick_bg, kick_bd) = if is_kicking {
+                ("注销…", p.text_muted, p.pill_bg, p.pill_border)
+            } else if kick_hov {
+                ("注销", p.danger, p.danger_soft, p.danger_border)
             } else {
-                ("其他", p.text_muted, p.pill_bg, p.pill_border)
+                ("注销", p.text_sec, p.pill_bg, p.pill_border)
             };
-            let id_r = RECT {
-                left: id_x,
-                top: cy - scale(8, d),
-                right: id_x + id_w,
-                bottom: cy + scale(8, d),
-            };
-            fill_round_rect(hdc, id_r, scale(4, d), id_bg, id_bd);
+            fill_round_rect(hdc, kick_r, scale(4, d), kick_bg, kick_bd);
             draw_text_line(
                 hdc,
                 f_bold_sm,
-                id_lbl,
-                id_r,
-                id_fg,
+                kick_lbl,
+                kick_r,
+                kick_fg,
                 DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
             );
+            if !is_kicking {
+                state.hits.push(HitBox {
+                    target: HitTarget::KickDevice(idx),
+                    rect: kick_r,
+                });
+            }
 
-            // 右侧时长
-            draw_text_line(
-                hdc,
-                f_sm,
-                &dev.duration,
-                RECT {
-                    left: id_x + id_w + scale(4, d),
-                    top: y,
-                    right: right - scale(8, d),
-                    bottom: y + row_h,
-                },
-                p.text_muted,
-                DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
-            );
+            // 紧贴「注销」按钮左缘对齐在线时长
+            let dur_left = left_end_x + scale(6, d);
+            let dur_right = kick_r.left - scale(7, d);
+            if dur_right > dur_left + scale(18, d) {
+                draw_text_line(
+                    hdc,
+                    f_sm,
+                    &dev.duration,
+                    RECT {
+                        left: dur_left,
+                        top: y,
+                        right: dur_right,
+                        bottom: y + row_h,
+                    },
+                    p.text_muted,
+                    DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+                );
+            }
 
             y += row_h;
         }
@@ -2260,8 +2365,11 @@ unsafe fn draw_flyout_contents(
         rect: r_open,
     });
 
-    // ── 6. 顶层交互叠层：一键切号下拉面板 / 校园网 VPN 防封确认弹窗 ───
-    if state.account_dropdown_open && state.vpn_confirm_target.is_none() {
+    // ── 6. 顶层交互叠层：一键切号下拉面板 / 校园网 VPN 防封确认 / 本机注销二次确认 ───
+    if state.account_dropdown_open
+        && state.vpn_confirm_target.is_none()
+        && state.local_kick_confirm_ip.is_none()
+    {
         draw_account_dropdown_overlay(
             hdc,
             pixels.as_deref_mut(),
@@ -2276,7 +2384,19 @@ unsafe fn draw_flyout_contents(
         );
     }
     if state.vpn_confirm_target.is_some() {
-        draw_campus_vpn_modal_overlay(hdc, pixels, state, w, h, f_sec, f_body, f_bold_sm);
+        draw_campus_vpn_modal_overlay(
+            hdc,
+            pixels.as_deref_mut(),
+            state,
+            w,
+            h,
+            f_sec,
+            f_body,
+            f_bold_sm,
+        );
+    }
+    if state.local_kick_confirm_ip.is_some() {
+        draw_local_kick_modal_overlay(hdc, pixels, state, w, h, f_sec, f_body, f_bold_sm);
     }
 
     DeleteObject(f_title);
@@ -2716,6 +2836,168 @@ unsafe fn draw_campus_vpn_modal_overlay(
     });
     state.hits.push(HitBox {
         target: HitTarget::CancelVpnSwitch,
+        rect: r_cancel,
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_local_kick_modal_overlay(
+    hdc: windows_sys::Win32::Graphics::Gdi::HDC,
+    mut pixels: Option<&mut [u8]>,
+    state: &mut FlyoutState,
+    w: i32,
+    h: i32,
+    f_title: windows_sys::Win32::Graphics::Gdi::HFONT,
+    f_body: windows_sys::Win32::Graphics::Gdi::HFONT,
+    f_bold_sm: windows_sys::Win32::Graphics::Gdi::HFONT,
+) {
+    let Some(ip) = state.local_kick_confirm_ip.clone() else {
+        return;
+    };
+    let d = state.dpi;
+    let p = state.palette;
+
+    dim_bgra_rect(
+        pixels.as_deref_mut(),
+        w,
+        h,
+        RECT {
+            left: 0,
+            top: 0,
+            right: w,
+            bottom: h,
+        },
+        if p.dark { 72 } else { 142 },
+    );
+
+    let card_l = scale(14, d);
+    let card_r = w - scale(14, d);
+    let pad_x = scale(14, d);
+    let pad_y = scale(13, d);
+    let body_w = (card_r - card_l) - pad_x * 2;
+    let body_text = format!(
+        "即将下线本机校园网会话（{ip}）。为避免几秒后又被自动重连回来，注销将同时暂停自动重连守护；需要恢复联网时点击「恢复守护」或「立即检测」即可。"
+    );
+    let body_h = measure_wrapped_height(hdc, f_body, &body_text, body_w).max(scale(50, d));
+    let hdr_h = scale(26, d);
+    let btn_h = scale(28, d);
+    let card_h = pad_y + hdr_h + scale(8, d) + body_h + scale(12, d) + btn_h + pad_y;
+    let card_top = ((h - card_h) / 2).max(scale(12, d));
+    let card_rect = RECT {
+        left: card_l,
+        top: card_top,
+        right: card_r,
+        bottom: (card_top + card_h).min(h - scale(12, d)),
+    };
+
+    draw_soft_shadow(pixels, w, h, card_rect, d, p.dark);
+
+    let card_bg = if p.dark {
+        rgb(0x21, 0x26, 0x31)
+    } else {
+        rgb(0xFF, 0xFF, 0xFF)
+    };
+    fill_round_rect(hdc, card_rect, scale(14, d), card_bg, p.danger_border);
+
+    let inner_l = card_rect.left + pad_x;
+    let inner_r = card_rect.right - pad_x;
+    let mut cy = card_rect.top + pad_y;
+
+    let badge_s = scale(26, d);
+    let badge_r = RECT {
+        left: inner_l,
+        top: cy,
+        right: inner_l + badge_s,
+        bottom: cy + badge_s,
+    };
+    fill_round_rect(hdc, badge_r, scale(8, d), p.danger_soft, p.danger_border);
+    draw_shield_alert_icon(hdc, inner_l + badge_s / 2, cy + badge_s / 2, d, p.danger);
+    draw_text_line(
+        hdc,
+        f_title,
+        "确认注销本机校园网连接？",
+        RECT {
+            left: badge_r.right + scale(9, d),
+            top: cy,
+            right: inner_r,
+            bottom: cy + badge_s,
+        },
+        p.text,
+        DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+    cy += hdr_h + scale(8, d);
+
+    draw_text_line(
+        hdc,
+        f_body,
+        &body_text,
+        RECT {
+            left: inner_l,
+            top: cy,
+            right: inner_r,
+            bottom: cy + body_h + scale(4, d),
+        },
+        p.text_sec,
+        DT_LEFT | DT_WORDBREAK_FLAG | DT_NOPREFIX,
+    );
+
+    let btn_y = card_rect.bottom - pad_y - btn_h;
+    let confirm_lbl = "暂停守护并注销";
+    let confirm_w = measure_text_width(hdc, f_bold_sm, confirm_lbl) + scale(22, d);
+    let r_confirm = RECT {
+        left: inner_r - confirm_w,
+        top: btn_y,
+        right: inner_r,
+        bottom: btn_y + btn_h,
+    };
+    let confirm_hov = state.hovered == Some(HitTarget::ConfirmLocalKick);
+    let confirm_bg = if confirm_hov {
+        rgb(0xDC, 0x26, 0x26)
+    } else {
+        p.danger
+    };
+    fill_round_rect(hdc, r_confirm, scale(8, d), confirm_bg, confirm_bg);
+    draw_text_line(
+        hdc,
+        f_bold_sm,
+        confirm_lbl,
+        r_confirm,
+        rgb(0xFF, 0xFF, 0xFF),
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+
+    let cancel_lbl = "取消";
+    let cancel_w = measure_text_width(hdc, f_body, cancel_lbl) + scale(22, d);
+    let r_cancel = RECT {
+        left: r_confirm.left - scale(8, d) - cancel_w,
+        top: btn_y,
+        right: r_confirm.left - scale(8, d),
+        bottom: btn_y + btn_h,
+    };
+    let cancel_hov = state.hovered == Some(HitTarget::CancelLocalKick);
+    fill_round_rect(
+        hdc,
+        r_cancel,
+        scale(8, d),
+        if cancel_hov { p.btn_hover } else { p.btn_bg },
+        p.btn_border,
+    );
+    draw_text_line(
+        hdc,
+        f_body,
+        cancel_lbl,
+        r_cancel,
+        if cancel_hov { p.text } else { p.text_sec },
+        DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX,
+    );
+
+    state.hits.clear();
+    state.hits.push(HitBox {
+        target: HitTarget::ConfirmLocalKick,
+        rect: r_confirm,
+    });
+    state.hits.push(HitBox {
+        target: HitTarget::CancelLocalKick,
         rect: r_cancel,
     });
 }
@@ -3448,6 +3730,7 @@ mod tests {
             login_unix: Some(now - 6960),
             terminal_type: "PC".into(),
             use_time_secs: Some(6960),
+            campus_flow_kb: 0,
         }];
         if two_devices {
             devices.push(OnlineDevice {
@@ -3456,6 +3739,7 @@ mod tests {
                 login_unix: Some(now - 5400),
                 terminal_type: "手机".into(),
                 use_time_secs: Some(5400),
+                campus_flow_kb: 0,
             });
         }
         SelfServiceState {
@@ -3614,6 +3898,13 @@ mod tests {
                 SnapshotOverlay::VpnModal,
             );
             render_gdi_snapshot(
+                &out_dir.join("flyout-local-kick-modal.bgra"),
+                true,
+                FlyoutTrafficMode::Carrier,
+                true,
+                SnapshotOverlay::LocalKickModal,
+            );
+            render_gdi_snapshot(
                 &out_dir.join("flyout-light.bgra"),
                 false,
                 FlyoutTrafficMode::Campus,
@@ -3628,6 +3919,7 @@ mod tests {
         None,
         Dropdown,
         VpnModal,
+        LocalKickModal,
     }
 
     fn render_gdi_snapshot(
@@ -3697,6 +3989,8 @@ mod tests {
             },
         ];
         let vpn_target = (overlay == SnapshotOverlay::VpnModal).then(|| mock_accounts[1].clone());
+        let local_kick_ip =
+            (overlay == SnapshotOverlay::LocalKickModal).then(|| "172.16.24.100".to_string());
         let dpi: u32 = 144;
         let tmp_dir = std::env::temp_dir().join("gxnu_flyout_qa_dummy");
         let mut state = FlyoutState {
@@ -3719,6 +4013,8 @@ mod tests {
             accounts: mock_accounts,
             account_dropdown_open: overlay == SnapshotOverlay::Dropdown,
             vpn_confirm_target: vpn_target,
+            local_kick_confirm_ip: local_kick_ip,
+            kicking_ips: Vec::new(),
             range: TimeRange::H7,
             dpi,
             width_px: scale(326, dpi),
@@ -3727,7 +4023,8 @@ mod tests {
             hovered: match overlay {
                 SnapshotOverlay::Dropdown => Some(HitTarget::SelectAccount(1)),
                 SnapshotOverlay::VpnModal => Some(HitTarget::ConfirmVpnSwitch),
-                SnapshotOverlay::None if dark => Some(HitTarget::AccountChip),
+                SnapshotOverlay::LocalKickModal => Some(HitTarget::ConfirmLocalKick),
+                SnapshotOverlay::None if dark => Some(HitTarget::KickDevice(1)),
                 SnapshotOverlay::None => None,
             },
             tracking_mouse: false,
