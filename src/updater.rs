@@ -448,8 +448,9 @@ fn check_for_updates_with_bases(
         {
             Ok(resp) if resp.status() == 200 => {
                 saw_network_ok = true;
-                if let Ok(body) = resp.into_string() {
-                    if let Ok(manifest) = serde_json::from_str::<LatestManifest>(&body) {
+                if let Ok(raw_body) = resp.into_string() {
+                    let body = raw_body.trim_start_matches('\u{feff}');
+                    if let Ok(manifest) = serde_json::from_str::<LatestManifest>(body) {
                         if let Some(info) = release_from_manifest(
                             current_version,
                             manifest,
@@ -458,7 +459,7 @@ fn check_for_updates_with_bases(
                         ) {
                             return Ok(Some(info));
                         }
-                        let ver = normalize_version_str(&body_version_hint(&body));
+                        let ver = normalize_version_str(&body_version_hint(body));
                         if !ver.is_empty() && !is_newer_stable_version(current_version, &ver) {
                             return Ok(None);
                         }

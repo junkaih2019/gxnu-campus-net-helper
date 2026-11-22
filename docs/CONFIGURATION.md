@@ -12,6 +12,7 @@
 | `metrics.jsonl` | 最近 48 小时（上限 5000 条）通断与诊断遥测记录；首次启动自动从 `app.log` 回填历史 |
 | `traffic.json` | 按账号与日期记录的近 90 天物理网卡增量流量统计 |
 | `ui_prefs.json` | 界面偏好（浅/深色主题、缩放比例、窗口大小、是否展示主页流量卡与分隔条比例） |
+| `update_cache.json` | 自动更新最近检查时间戳与远端新版本元数据缓存 |
 | `daemon.json` | 轻守护进程运行期间的本地 IPC 端口与会话令牌（退出时自动清理） |
 
 ---
@@ -32,6 +33,8 @@
   "notify_wechat": false,
   "notify_quiet_minutes": 3,
   "monthly_quota_gb": 0,
+  "auto_check_updates": true,
+  "skipped_update_version": "",
   "accounts": [
     {
       "id": "default",
@@ -56,6 +59,8 @@
 | `confirm_failures` | integer | `1` ~ `5` | `2` | 连续失败达到此次数后才判定离线并触发自动重连 |
 | `auto_start_monitoring` | boolean | — | `false` | 启动程序后是否自动进入监控状态 |
 | `auto_boot` | boolean | — | `false` | 开机自动启动到系统托盘（以注册表 `HKCU\...\Run\GXNUCampusLoginRS` 为准） |
+| `auto_check_updates` | boolean | — | `true` | 联网状态下每 12 小时静默检查 GitHub Release 新版本 |
+| `skipped_update_version` | string | — | `""` | 用户选择跳过提醒的版本号；为空表示不跳过 |
 | `notify_toast` | boolean | — | `true` | 断网与自动恢复时弹出 Windows 系统通知 |
 | `notify_wechat` | boolean | — | `false` | 企业微信推送预留开关 |
 | `notify_quiet_minutes` | integer | `1` ~ `60` | `3` | 远程推送预留的静默时间（分钟） |

@@ -2,17 +2,17 @@
   <img src="docs/images/app-icon.png" width="88" height="88" alt="GXNU Campus Network Helper icon">
 </p>
 <h1 align="center">GXNU Campus Network Helper</h1>
-<p align="center">A lightweight Windows tray app for Guangxi Normal University’s Dr.COM campus network — auto-reconnect, live traffic & device sync, and 1-click multi-account switching</p>
+<p align="center">A lightweight Windows tray app for Guangxi Normal University’s Dr.COM campus network — auto-reconnect, live traffic & device management, and 1-click multi-account switching</p>
 <p align="center"><a href="README.md">简体中文</a> · <strong>English</strong></p>
 <p align="center">
-  <a href="https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest"><strong>⬇️ Download Portable Windows x64</strong></a>
+  <a href="https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest"><strong>⬇️ Download Portable Windows x64 (.exe)</strong></a>
   &nbsp;·&nbsp; <a href="CHANGELOG.md">Changelog</a>
   &nbsp;·&nbsp; <a href="docs/CONFIGURATION.md">Configuration</a>
   &nbsp;·&nbsp; <a href="docs/ARCHITECTURE.md">Architecture</a>
   &nbsp;·&nbsp; <a href="LICENSE">MIT License</a>
 </p>
 <p align="center">
-  <sub>Windows 10 / 11 x64 · Single portable executable · No installer or admin rights · Built with Rust</sub>
+  <sub>Windows 10 / 11 x64 · Single portable executable · Built-in auto-update · Built with Rust</sub>
 </p>
 
 ---
@@ -33,7 +33,7 @@
 
 <table>
   <tr>
-    <th align="center">🖱️ Left-click · Quick Flyout</th>
+    <th align="center">🖱️ Left-click · Quick Flyout (Switch Account & Sign Out Devices)</th>
     <th align="center">🖱️ Right-click · Context Menu</th>
   </tr>
   <tr>
@@ -61,7 +61,7 @@
 | :---: | :---: |
 | [![Light dashboard](docs/images/main-window-light.png)](docs/images/main-window-light.png) | [![Dark dashboard](docs/images/main-window.png)](docs/images/main-window.png) |
 
-| Campus Quota & Multi-device View | Settings Center (Multi-account) |
+| Campus Quota & Multi-device Management | Settings Center (Multi-account) |
 | :---: | :---: |
 | [![Campus quota & multi-device view](docs/images/main-window-campus.png)](docs/images/main-window-campus.png) | [![Settings Center multi-account](docs/images/settings-dark.png)](docs/images/settings-dark.png) |
 
@@ -71,24 +71,24 @@
 
 ## 💡 Key Features
 
-- 🔄 **Seamless Auto-Reconnect**: Automatically detects drops and signs back in after sleep/wake, Wi-Fi switches, or session timeouts.
-- 📊 **Live Traffic & Online Devices**: Syncs read-only with GXNU Self-Service to show **Carrier throughput / Campus quota**, active terminals, and your real campus IP.
-- ⚡ **Instant Left-click Tray Flyout**: Single-click the tray icon for a native rounded flyout combining traffic, devices, and stability at a glance.
-- 👥 **1-Click Multi-Account Switch**: Save multiple accounts with custom remarks and switch atomically from the top status bar.
-- 📈 **Uptime Timeline**: Tracks `1h / 7h / 24h` connection stability in a high-density capsule strip with outage hover cards.
-- 🛡️ **Proxy-Friendly & Secure**: Works cleanly alongside Clash / Mihomo (TUN mode); encrypts passwords in Windows Credential Manager.
-- 🪶 **Ultra-Light Background Daemon**: Single native Rust `.exe`; closing the window frees all UI/GPU memory while the Win32 tray monitor stays active.
+- 🔄 **Seamless Auto-Reconnect**: Automatically detects drops and signs back in after sleep/wake, Wi-Fi switches, or session timeouts, with clear human-readable diagnostics.
+- 📊 **Live Traffic & Device Sign-Out**: Syncs with GXNU Self-Service to toggle **Carrier throughput / Campus quota**, deduplicate dual-BRAS sessions, and **sign out (`注销`) occupying devices** in one click.
+- ⚡ **Instant Left-click Tray Flyout**: Single-click the tray icon for a minimalist native flyout to switch accounts, inspect traffic, sign out devices, and check stability without opening the main window.
+- 👥 **Multi-Account Switch & VPN Guard**: Save multiple accounts with non-disruptive pre-save password verification; automatically warns to close VPN/proxy software before switching to the Campus (`校园网`) exit.
+- 📈 **Uptime Timeline**: Tracks `1h / 7h / 24h` connection stability in a capsule strip with hover details for outages.
+- ⬆️ **In-Place Self-Update**: Periodically checks GitHub Releases, verifies SHA-256 checksums, and replaces the `.exe` in place while preserving all credentials and startup settings.
+- 🛡️ **Proxy-Friendly & Ultra-Light**: Pierces Clash / Mihomo TUN adapters for portal probes, encrypts passwords in Windows Credential Manager, and frees all UI/GPU memory when closed to the tray.
 
 ---
 
 ## 🚀 Quick Start
 
-1. **Download & Run**: Grab the latest ZIP from [Releases](https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest), extract it to a **permanent folder**, and launch `GXNU 校园网守护助手.exe`.
-   > 💡 If Windows SmartScreen appears on first launch, click **More info → Run anyway** (you can verify the `.sha256` checksum from the release page).
-2. **Add Account**: Enter your student ID, password, and carrier exit in **设置 → 账号管理 (Settings → Accounts)**, then click **保存并开始守护 (Save & Start)**.
+1. **Download & Run**: Grab **`gxnu-campus-net-helper-v0.2.2.exe`** from [Releases](https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest), place it in a **permanent folder**, and run it directly (no installer or extraction needed).
+   > 💡 If Windows SmartScreen appears on first launch, click **More info → Run anyway** (you can verify the hash against `SHA256SUMS.txt` on the release page).
+2. **Add Account**: Enter your student ID, password, and exit (`校园网` / Telecom / Unicom / Mobile) in **设置 → 账号管理 (Settings → Accounts)**, then click **保存并开始守护 (Save & Start)**.
 3. **Everyday Use**:
    - **Close the main window (`×`)** anytime to keep monitoring silently in the tray with minimal RAM;
-   - **Left-click** the tray icon for the quick flyout, **double-click** for the main window, or **right-click** for the compact menu;
+   - **Left-click** the tray icon for the quick flyout, **double-click** for the main window, or **right-click** for the context menu;
    - Enable **Start at sign-in** under **设置 → 监控与自启** if needed.
 
 ### Tray Status Indicators
@@ -102,11 +102,11 @@
 ## ❓ FAQ
 
 - **Why are there both "Carrier" (`运营商`) and "Campus" (`校园网`) traffic views?**  
-  Carrier broadband exits (Telecom / Unicom / Mobile) are unmetered, whereas the self-service package quota only applies to the Campus exit. The app defaults to your active exit and lets you toggle anytime.
+  Carrier broadband exits (Telecom / Unicom / Mobile) are unmetered, whereas the self-service package quota only applies to the Campus (`校园网`) exit. The app defaults to your active exit and lets you toggle anytime.
 - **Does it conflict with Clash / Mihomo (TUN mode)?**  
-  No. All probes, portal logins, and self-service queries bypass system proxies and pierce virtual TUN adapters to identify your real campus IP.
+  Not on Carrier exits — probes, portal logins, and self-service queries bypass system proxies and pierce virtual TUN adapters. When using the **Campus (`校园网`)** exit, please close VPN/proxy tools first as prompted to avoid campus anti-proxy account suspension.
 - **Where is my data stored, and how do I upgrade or uninstall?**  
-  Passwords are encrypted in Windows Credential Manager; config and logs live in `%LOCALAPPDATA%\GXNUCampusLogin\`. To upgrade, quit the running tray app and replace the `.exe`. To uninstall, disable auto-start, quit the app, and delete the `.exe` and data folder.
+  Passwords are encrypted in Windows Credential Manager; config and logs live in `%LOCALAPPDATA%\GXNUCampusLogin\`. **To upgrade**, click the new-version badge in the titlebar (or **设置 → 监控与自启 → 检查更新**) for 1-click in-place self-update. **To uninstall**, disable auto-start, quit from the tray, and delete the `.exe` and data folder.
 
 ---
 

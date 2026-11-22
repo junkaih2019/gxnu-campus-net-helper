@@ -4024,7 +4024,6 @@ mod tests {
                 SnapshotOverlay::Dropdown => Some(HitTarget::SelectAccount(1)),
                 SnapshotOverlay::VpnModal => Some(HitTarget::ConfirmVpnSwitch),
                 SnapshotOverlay::LocalKickModal => Some(HitTarget::ConfirmLocalKick),
-                SnapshotOverlay::None if dark => Some(HitTarget::KickDevice(1)),
                 SnapshotOverlay::None => None,
             },
             tracking_mouse: false,

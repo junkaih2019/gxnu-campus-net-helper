@@ -92,13 +92,15 @@ jobs:
             notes        = $notes
           }
           $manifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 "dist/latest.json"
+          $notes | Set-Content -Encoding utf8 "dist/RELEASE_NOTES.md"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.meta.outputs.tag }}
-          name: "GXNU Campus Net Helper ${{ steps.meta.outputs.tag }}"
-          generate_release_notes: true
+          name: "GXNU 校园网守护助手 ${{ steps.meta.outputs.tag }}"
+          body_path: dist/RELEASE_NOTES.md
+          generate_release_notes: false
           files: |
             dist/${{ steps.meta.outputs.asset }}
             dist/latest.json

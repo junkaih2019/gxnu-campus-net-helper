@@ -269,14 +269,19 @@ impl GuardApp {
         let palette = Palette::of(ui_prefs.theme);
         theme::apply_theme(&cc.egui_ctx, &palette);
 
+        #[cfg(debug_assertions)]
+        let mock_creds = std::env::var_os("GXNU_SCREENSHOT_OUT").is_some();
+        #[cfg(not(debug_assertions))]
+        let mock_creds = false;
+
         let mut account_creds = HashMap::new();
         for acc in &deps.settings.accounts {
             account_creds.insert(
                 acc.id.clone(),
-                credentials::has_credential_for(&acc.id, &acc.student_id),
+                mock_creds || credentials::has_credential_for(&acc.id, &acc.student_id),
             );
         }
-        let legacy_cred_account = if deps.settings.accounts.is_empty() {
+        let legacy_cred_account = if !mock_creds && deps.settings.accounts.is_empty() {
             credentials::load(credentials::LEGACY_CREDENTIAL_TARGET)
                 .ok()
                 .flatten()
@@ -538,11 +543,16 @@ impl GuardApp {
     }
 
     fn refresh_account_creds(&mut self) {
+        #[cfg(debug_assertions)]
+        let mock_creds = self.qa_shot_out.is_some();
+        #[cfg(not(debug_assertions))]
+        let mock_creds = false;
+
         self.account_creds.clear();
         for acc in &self.settings.accounts {
             self.account_creds.insert(
                 acc.id.clone(),
-                credentials::has_credential_for(&acc.id, &acc.student_id),
+                mock_creds || credentials::has_credential_for(&acc.id, &acc.student_id),
             );
         }
     }

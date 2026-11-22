@@ -38,14 +38,15 @@ impl SettingsStore {
     }
 
     pub fn load_strict(&self) -> io::Result<Settings> {
-        let text = std::fs::read_to_string(&self.path)?;
+        let raw = std::fs::read_to_string(&self.path)?;
+        let text = raw.trim_start_matches('\u{feff}');
         if !text.trim_start().starts_with('{') {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "配置应为 JSON 对象",
             ));
         }
-        Ok(serde_json::from_str::<Settings>(&text)?.normalized())
+        Ok(serde_json::from_str::<Settings>(text)?.normalized())
     }
 
     fn stage(&self, settings: &Settings) -> io::Result<tempfile::NamedTempFile> {
