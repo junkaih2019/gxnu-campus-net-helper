@@ -47,10 +47,22 @@ impl SettingsTab {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewAccountMode {
+    /// 复用当前活跃学号与已存密码，一键点选新出口。
+    QuickExit,
+    /// 填写新学号、密码、出口与选填备注的完整双栏表单。
+    FullAccount,
+}
+
 pub struct SettingsForm {
     pub tab: SettingsTab,
     /// 当前正在编辑的账号 ID；`None` 表示正在创建新账号。
     pub editing_account_id: Option<String>,
+    /// 新增账号时的子视图模式（为当前学号加出口 vs 添加其他学号）。
+    pub new_account_mode: NewAccountMode,
+    /// 进入完整新增表单时自动聚焦学号输入框。
+    pub request_student_id_focus: bool,
     pub remark: String,
     pub student_id: String,
     pub password: String,
@@ -92,15 +104,18 @@ impl SettingsForm {
                 settings.monthly_quota_gb,
             ),
         };
+        let is_empty = settings.accounts.is_empty();
         Self {
             tab: SettingsTab::Account,
             editing_account_id,
+            new_account_mode: NewAccountMode::FullAccount,
+            request_student_id_focus: is_empty && settings.student_id.trim().is_empty(),
             remark,
             student_id,
             password: String::new(),
             show_password: false,
             carrier,
-            also_create_campus_exit: settings.accounts.is_empty(),
+            also_create_campus_exit: is_empty,
             verify_error: None,
             check_interval: settings.check_interval,
             heartbeat_minutes: (settings.heartbeat_interval / 60).clamp(1, 1440),
@@ -124,6 +139,8 @@ impl SettingsForm {
 
     pub fn load_account_draft(&mut self, profile: &AccountProfile) {
         self.editing_account_id = Some(profile.id.clone());
+        self.new_account_mode = NewAccountMode::FullAccount;
+        self.request_student_id_focus = false;
         self.remark = profile.remark.clone();
         self.student_id = profile.student_id.clone();
         self.password.clear();
@@ -136,6 +153,8 @@ impl SettingsForm {
 
     pub fn start_new_account(&mut self) {
         self.editing_account_id = None;
+        self.new_account_mode = NewAccountMode::FullAccount;
+        self.request_student_id_focus = true;
         self.remark.clear();
         self.student_id.clear();
         self.password.clear();
@@ -146,24 +165,40 @@ impl SettingsForm {
         self.monthly_quota_gb = 0;
     }
 
-    /// 从已有账号派生新出口草稿：默认带入当前活跃学号（可免重输密码），并自动选中尚未配置的「校园网」或下一运营商出口。
-    pub fn start_new_from_existing(&mut self, saved: &Settings) {
+    /// 从已有账号派生新出口草稿：若当前学号具备可复用凭据且仍有未添加出口，默认进入极简「为当前学号新增出口」视图；否则进入完整双栏新增表单。
+    pub fn start_new_from_existing_with_creds(
+        &mut self,
+        saved: &Settings,
+        has_cred: impl Fn(&str) -> bool,
+    ) {
         if let Some(base) = saved
             .active_account()
             .filter(|a| !a.student_id.trim().is_empty())
         {
-            self.editing_account_id = None;
-            self.remark.clear();
-            self.student_id = base.student_id.clone();
-            self.password.clear();
-            self.show_password = false;
-            self.carrier = saved.suggest_next_carrier_for(&base.student_id);
-            self.also_create_campus_exit = !saved.has_carrier_for_student(&base.student_id, "0");
-            self.verify_error = None;
-            self.monthly_quota_gb = 0;
-        } else {
-            self.start_new_account();
+            let sid = base.student_id.trim();
+            let has_reusable_pwd = saved.reusable_cred_account_id(sid, has_cred).is_some();
+            let has_missing_exit =
+                (0..=4).any(|c| !saved.has_carrier_for_student(sid, &c.to_string()));
+            if has_reusable_pwd && has_missing_exit {
+                self.editing_account_id = None;
+                self.new_account_mode = NewAccountMode::QuickExit;
+                self.request_student_id_focus = false;
+                self.remark.clear();
+                self.student_id = sid.to_string();
+                self.password.clear();
+                self.show_password = false;
+                self.carrier = saved.suggest_next_carrier_for(sid);
+                self.also_create_campus_exit = false;
+                self.verify_error = None;
+                self.monthly_quota_gb = 0;
+                return;
+            }
         }
+        self.start_new_account();
+    }
+
+    pub fn start_new_from_existing(&mut self, saved: &Settings) {
+        self.start_new_from_existing_with_creds(saved, |_| true);
     }
 
     /// 将全局监控/自启/通知参数合并回给定配置，保留已有账号列表与活跃账号。
@@ -221,10 +256,17 @@ impl SettingsForm {
                 None => true,
             }
         } else {
-            !self.remark.trim().is_empty()
-                || !self.student_id.trim().is_empty()
-                || !self.password.is_empty()
-                || self.monthly_quota_gb != 0
+            match self.new_account_mode {
+                NewAccountMode::QuickExit => {
+                    !self.remark.trim().is_empty() || self.monthly_quota_gb != 0
+                }
+                NewAccountMode::FullAccount => {
+                    !self.remark.trim().is_empty()
+                        || !self.student_id.trim().is_empty()
+                        || !self.password.is_empty()
+                        || self.monthly_quota_gb != 0
+                }
+            }
         }
     }
 
@@ -427,12 +469,6 @@ pub fn draw_settings_view(
                 const PANE_PAD_F: f32 = 16.0;
                 const TOP_PAD: i8 = 14;
                 const TOP_PAD_F: f32 = 14.0;
-                let target_bottom_y = if show_floating_bar {
-                    None
-                } else {
-                    Some(pane_rect.bottom() - PANE_PAD_F)
-                };
-
                 egui::Frame::new()
                     .fill(p.bg)
                     .inner_margin(egui::Margin {
@@ -463,7 +499,6 @@ pub fn draw_settings_view(
                                         saved,
                                         account_creds,
                                         verifying_account,
-                                        target_bottom_y,
                                         &mut actions,
                                     ),
                                     SettingsTab::Monitor => {
@@ -601,14 +636,13 @@ fn draw_account_page(
     saved: &Settings,
     account_creds: &HashMap<String, bool>,
     verifying_account: bool,
-    target_bottom_y: Option<f32>,
     actions: &mut SettingsActions,
 ) {
     page_header(
         ui,
         p,
         "账号管理",
-        "支持保存多个校园网账号与备注名，主页及托盘浮窗可一键切号；各账号密码独立加密存储于 Windows 凭据管理器。",
+        "管理多个校园网账号与联网出口，主页顶栏与托盘浮窗可一键切换。",
     );
 
     // 1. 已保存账号目录卡
@@ -634,11 +668,13 @@ fn draw_account_page(
                         .on_hover_text(if saved.accounts.is_empty() {
                             "添加校园网账号"
                         } else {
-                            "新增其他出口（默认带入当前学号并复用已存密码）或添加新学号"
+                            "为当前学号新增出口，或添加其他校园网账号"
                         })
                         .clicked()
                     {
-                        form.start_new_from_existing(saved);
+                        form.start_new_from_existing_with_creds(saved, |id| {
+                            account_creds.get(id).copied().unwrap_or(false)
+                        });
                     }
                 });
             },
@@ -653,7 +689,7 @@ fn draw_account_page(
                 .show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(body_text(
-                        "尚未保存校园网账号，请在下方填写备注名、学号与密码后保存。",
+                        "尚未保存校园网账号，请在下方填写学号与密码后添加。",
                         11.5,
                         p.text_muted,
                     ));
@@ -674,7 +710,7 @@ fn draw_account_page(
 
     ui.add_space(10.0);
 
-    // 2. 账号编辑 / 新增表单卡
+    // 2. 账号新增 / 编辑表单卡（融合「为当前学号新增出口」极简视图与「左右双栏」对称表单）
     let is_new = form.editing_account_id.is_none();
     let editing_saved = form
         .editing_account_id
@@ -684,383 +720,783 @@ fn draw_account_page(
         account_creds.get(&acc.id).copied().unwrap_or(false)
             && acc.student_id.trim() == form.student_id.trim()
     });
+    let can_offer_quick_exit = saved.active_account().is_some_and(|acc| {
+        let sid = acc.student_id.trim();
+        !sid.is_empty()
+            && saved
+                .reusable_cred_account_id(sid, |id| account_creds.get(id).copied().unwrap_or(false))
+                .is_some()
+    });
+    let quick_exit_active =
+        is_new && can_offer_quick_exit && form.new_account_mode == NewAccountMode::QuickExit;
     let reusable_peer_cred = is_new
         && saved
             .reusable_cred_account_id(&form.student_id, |id| {
                 account_creds.get(id).copied().unwrap_or(false)
             })
             .is_some();
-    let same_sid_peer_count = {
-        let sid = form.student_id.trim();
-        if sid.is_empty() {
-            0usize
-        } else {
-            saved
-                .accounts
-                .iter()
-                .filter(|a| {
-                    Some(a.id.as_str()) != form.editing_account_id.as_deref()
-                        && a.student_id.trim() == sid
-                })
-                .count()
-        }
-    };
     let draft_dirty = form.is_account_draft_dirty(saved);
 
     group_card(ui, p, |ui| {
-        ui.spacing_mut().item_spacing.y = 8.0;
-        ui.allocate_ui_with_layout(
-            Vec2::new(ui.available_width(), 24.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                ui.spacing_mut().item_spacing.x = 6.0;
-                let heading = match editing_saved {
-                    Some(acc) => format!("编辑账号 · {}", saved.account_display_name(acc)),
-                    None if reusable_peer_cred => "新增出口（复用当前学号）".to_string(),
-                    None => "新增校园网账号".to_string(),
-                };
-                ui.label(bold_text(heading, 12.5, p.text));
-                if let Some(acc) = editing_saved {
-                    if acc.id == saved.active_account_id {
-                        badge(ui, p.ok, p.ok_soft, p.ok_border, "当前活跃");
-                    }
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 6.0;
-                    if is_new && !saved.accounts.is_empty() {
-                        if draw_compact_action_btn(ui, p, None, "取消新增", false).clicked() {
-                            if let Some(active) = saved.active_account() {
-                                form.load_account_draft(active);
-                            }
-                        }
-                        if !form.student_id.trim().is_empty() && same_sid_peer_count > 0 {
-                            if draw_compact_action_btn(ui, p, None, "改填新学号", false)
-                                .on_hover_text("清空当前学号，填写另一个人的校园网账号")
-                                .clicked()
-                            {
+        ui.spacing_mut().item_spacing.y = 10.0;
+
+        if is_new {
+            // ── 新增卡片顶栏：有可复用学号时提供双模式分段切换，否则显示干净单标题 ──
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), 26.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    if can_offer_quick_exit {
+                        let mut seg_idx = match form.new_account_mode {
+                            NewAccountMode::QuickExit => 0,
+                            NewAccountMode::FullAccount => 1,
+                        };
+                        if segmented_control(
+                            ui,
+                            p,
+                            "account_new_mode_seg",
+                            &mut seg_idx,
+                            &["为当前学号新增出口", "添加其他学号"],
+                        ) {
+                            if seg_idx == 0 {
+                                form.start_new_from_existing_with_creds(saved, |id| {
+                                    account_creds.get(id).copied().unwrap_or(false)
+                                });
+                                form.new_account_mode = NewAccountMode::QuickExit;
+                            } else {
                                 form.start_new_account();
                             }
-                        } else if form.student_id.trim().is_empty()
-                            && draw_compact_action_btn(ui, p, None, "复用当前学号", true)
-                                .on_hover_text("带入当前活跃学号并自动复用已存密码")
-                                .clicked()
-                        {
-                            form.start_new_from_existing(saved);
                         }
+                    } else {
+                        ui.label(bold_text("添加校园网账号", 13.0, p.text));
                     }
-                });
-            },
-        );
 
-        let full_w = ui.available_width();
-        let col_gap = 12.0_f32;
-        let left_col_w = ((full_w - col_gap) * 0.5).floor().max(120.0);
-        let right_col_w = (full_w - col_gap - left_col_w).max(120.0);
-
-        // 第一行：校园网学号（左，与下方登录密码上下对齐） | 备注名称（右）
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = col_gap;
-            ui.allocate_ui_with_layout(
-                Vec2::new(left_col_w, 52.0),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-                    ui.label(body_text("校园网学号", 11.5, p.text_secondary));
-                    ui.add_space(4.0);
-                    styled_text_box(
-                        ui,
-                        p,
-                        left_col_w,
-                        &mut form.student_id,
-                        "输入校园网学号",
-                        false,
-                        None,
-                    );
-                },
-            );
-
-            ui.allocate_ui_with_layout(
-                Vec2::new(right_col_w, 52.0),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-                    ui.label(body_text(
-                        "备注名称（选填，优先显示）",
-                        11.5,
-                        p.text_secondary,
-                    ));
-                    ui.add_space(4.0);
-                    styled_text_box(
-                        ui,
-                        p,
-                        right_col_w,
-                        &mut form.remark,
-                        "如：宿舍联通、实验室电信",
-                        false,
-                        None,
-                    );
-                },
-            );
-        });
-
-        ui.add_space(2.0);
-
-        // 第二行：登录密码 | 独立凭据隔离状态
-        ui.horizontal_top(|ui| {
-            ui.spacing_mut().item_spacing.x = col_gap;
-            ui.allocate_ui_with_layout(
-                Vec2::new(left_col_w, 52.0),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-                    ui.label(body_text("登录密码", 11.5, p.text_secondary));
-                    ui.add_space(4.0);
-                    let hint = if editing_has_cred {
-                        "已保存，留空不修改"
-                    } else if reusable_peer_cred {
-                        "留空直接复用该学号已存密码"
-                    } else {
-                        "输入校园网密码"
-                    };
-                    let editing_password = !form.password.is_empty();
-                    if !editing_password {
-                        form.show_password = false;
-                    }
-                    let mask_password = !form.show_password;
-                    let eye = if editing_password {
-                        Some(&mut form.show_password)
-                    } else {
-                        None
-                    };
-                    styled_text_box(
-                        ui,
-                        p,
-                        left_col_w,
-                        &mut form.password,
-                        hint,
-                        mask_password,
-                        eye,
-                    );
-                },
-            );
-
-            ui.allocate_ui_with_layout(
-                Vec2::new(right_col_w, 52.0),
-                egui::Layout::top_down(egui::Align::LEFT),
-                |ui| {
-                    ui.label(body_text("凭据安全存储", 11.5, p.text_secondary));
-                    ui.add_space(4.0);
-                    let (fg, bg, border, status_txt) = if !form.password.is_empty() {
-                        if same_sid_peer_count > 0 {
-                            (
-                                p.accent,
-                                p.accent_soft,
-                                p.accent_border,
-                                "保存后将加密更新并同步同号出口",
-                            )
-                        } else {
-                            (
-                                p.accent,
-                                p.accent_soft,
-                                p.accent_border,
-                                "保存后将加密更新 DPAPI 凭据",
-                            )
-                        }
-                    } else if editing_has_cred {
-                        (
-                            p.ok,
-                            p.ok_soft,
-                            p.ok_border,
-                            "已加密保存在 Windows 凭据管理器",
-                        )
-                    } else if reusable_peer_cred {
-                        (
-                            p.ok,
-                            p.ok_soft,
-                            p.ok_border,
-                            "自动复用同学号已加密保存的密码",
-                        )
-                    } else {
-                        (
-                            p.warn,
-                            p.warn_soft,
-                            p.warn_border,
-                            "尚未保存密码，请输入后保存",
-                        )
-                    };
-                    let (box_rect, _) =
-                        ui.allocate_exact_size(Vec2::new(right_col_w, 30.0), Sense::hover());
-                    ui.painter().rect(
-                        box_rect,
-                        CornerRadius::same(RADIUS_SM),
-                        bg,
-                        Stroke::new(1.0_f32, border),
-                        StrokeKind::Inside,
-                    );
-                    let ico_r = Rect::from_center_size(
-                        Pos2::new(box_rect.left() + 15.0, box_rect.center().y),
-                        Vec2::splat(12.5),
-                    );
-                    icons::paint(ui.painter(), ico_r, Icon::Key, fg);
-                    let font = egui::FontId::proportional(11.0);
-                    let galley = ui
-                        .painter()
-                        .layout_no_wrap(status_txt.to_string(), font, fg);
-                    ui.painter().galley(
-                        Pos2::new(
-                            box_rect.left() + 27.0,
-                            box_rect.center().y - galley.size().y * 0.5,
-                        ),
-                        galley,
-                        fg,
-                    );
-                },
-            );
-        });
-
-        ui.add_space(2.0);
-        ui.label(body_text("运营商出口", 11.5, p.text_secondary));
-        if draw_carrier_row(ui, p, &mut form.carrier) && form.carrier == 0 {
-            actions.selected_campus_carrier = true;
-        }
-        let can_pair_campus = is_new
-            && form.carrier != 0
-            && (form.student_id.trim().is_empty()
-                || !saved.has_carrier_for_student(&form.student_id, "0"));
-        if form.carrier == 0 {
-            ui.add_space(3.0);
-            ui.label(body_text(
-                "⚠ 安全提示：使用「校园网」出口时请关闭本机 VPN / 代理软件，避免校园网账号被封禁",
-                10.5,
-                p.warn,
-            ));
-        } else if can_pair_campus {
-            ui.add_space(2.0);
-            draw_inline_checkbox_row(
-                ui,
-                p,
-                &mut form.also_create_campus_exit,
-                "同时为该学号生成「校园网」快捷切换项（共享密码，顶栏与托盘可一键互切）",
-            );
-        }
-
-        // 若上次点击保存时当场验密未通过，展示醒目红色原因卡片与「仍要强制保存」兜底按钮
-        if let Some(err_msg) = form.verify_error.clone() {
-            ui.add_space(4.0);
-            egui::Frame::new()
-                .fill(p.danger_soft)
-                .stroke(Stroke::new(1.0_f32, p.danger_border))
-                .corner_radius(CornerRadius::same(RADIUS_SM))
-                .inner_margin(egui::Margin::symmetric(12, 9))
-                .show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.horizontal(|ui| {
-                        ui.spacing_mut().item_spacing.x = 8.0;
-                        let (ir, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
-                        icons::paint(ui.painter(), ir, Icon::Close, p.danger);
-                        let text_w = (ui.available_width() - 96.0).max(140.0);
-                        ui.allocate_ui_with_layout(
-                            Vec2::new(text_w, 32.0),
-                            egui::Layout::top_down(egui::Align::LEFT),
-                            |ui| {
-                                ui.spacing_mut().item_spacing.y = 2.0;
-                                ui.add(
-                                    egui::Label::new(bold_text(
-                                        format!("登录校验未通过：{err_msg}"),
-                                        11.5,
-                                        p.danger,
-                                    ))
-                                    .wrap(),
-                                );
-                                ui.label(body_text(
-                                    "请核对上方学号、密码（点密码框右侧眼睛可查看）与运营商后重新点击保存",
-                                    10.5,
-                                    p.text_secondary,
-                                ));
-                            },
-                        );
+                    if let Some(active) = saved.active_account() {
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if !verifying_account
-                                && draw_compact_action_btn(ui, p, None, "仍要强制保存", false)
-                                    .on_hover_text(
-                                        "若确认运营商宽带密码与自助服务密码不同，可跳过预检强制保存",
-                                    )
-                                    .clicked()
-                            {
-                                actions.force_save_profile = true;
+                            if draw_compact_action_btn(ui, p, None, "取消", false).clicked() {
+                                form.load_account_draft(active);
                             }
                         });
-                    });
-                });
-        }
+                    }
+                },
+            );
 
-        // 当页面无需滚动且底部剩余少量余量时，将底部操作行自然贴底，使卡片下边距与左右边距严格等宽
-        if let Some(target_y) = target_bottom_y {
-            let tail_h = 62.0_f32;
-            let extra = target_y - (ui.cursor().top() + tail_h);
-            if (0.5..=80.0).contains(&extra) {
-                ui.add_space(extra);
+            if quick_exit_active {
+                draw_quick_exit_body(ui, p, form, saved, verifying_account, actions);
+            } else {
+                draw_full_new_account_dual_body(
+                    ui,
+                    p,
+                    form,
+                    saved,
+                    reusable_peer_cred,
+                    verifying_account,
+                    actions,
+                );
             }
-        }
-
-        row_divider(ui, p);
-
-        // 卡片底部操作行：左安全隔离说明 + 右还原/保存账号按钮
-        let foot_w = ui.available_width();
-        let show_card_reset = draft_dirty && !is_new && !verifying_account;
-        let right_reserve = if show_card_reset {
-            216.0_f32
         } else {
-            136.0_f32
-        };
-        ui.allocate_ui_with_layout(
-            Vec2::new(foot_w, 30.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                let note_w = (foot_w - right_reserve).max(120.0);
+            // ── 编辑已有账号卡片：与新增同源的对称左右双栏（左填学号密码 · 右选出口与备注） ──
+            let disp_name = editing_saved
+                .map(|acc| saved.account_display_name(acc))
+                .unwrap_or_else(|| "账号".to_string());
+            ui.allocate_ui_with_layout(
+                Vec2::new(ui.available_width(), 24.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.label(bold_text(format!("编辑账号 · {disp_name}"), 12.5, p.text));
+                    if draft_dirty && !verifying_account {
+                        if let Some(acc) = editing_saved {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if draw_compact_action_btn(ui, p, None, "还原", false).clicked()
+                                    {
+                                        form.load_account_draft(acc);
+                                    }
+                                },
+                            );
+                        }
+                    }
+                },
+            );
+
+            draw_edit_account_dual_body(
+                ui,
+                p,
+                form,
+                editing_has_cred,
+                draft_dirty,
+                verifying_account,
+                actions,
+            );
+        }
+    });
+}
+
+fn draw_verify_error_banner(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    form: &SettingsForm,
+    verifying_account: bool,
+    actions: &mut SettingsActions,
+) {
+    let Some(err_msg) = form.verify_error.clone() else {
+        return;
+    };
+    egui::Frame::new()
+        .fill(p.danger_soft)
+        .stroke(Stroke::new(1.0_f32, p.danger_border))
+        .corner_radius(CornerRadius::same(RADIUS_SM))
+        .inner_margin(egui::Margin::symmetric(12, 9))
+        .show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let (ir, _) = ui.allocate_exact_size(Vec2::splat(14.0), Sense::hover());
+                icons::paint(ui.painter(), ir, Icon::Close, p.danger);
+                let text_w = (ui.available_width() - 96.0).max(140.0);
                 ui.allocate_ui_with_layout(
-                    Vec2::new(note_w, 30.0),
-                    egui::Layout::left_to_right(egui::Align::Center),
+                    Vec2::new(text_w, 32.0),
+                    egui::Layout::top_down(egui::Align::LEFT),
                     |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
                         ui.add(
-                            egui::Label::new(body_text(
-                                "保存时将自动无损核验学号与密码；密码按账号 ID 独立加密存储，绝不明文落盘",
-                                10.5,
-                                p.text_muted,
+                            egui::Label::new(bold_text(
+                                format!("登录校验未通过：{err_msg}"),
+                                11.5,
+                                p.danger,
                             ))
-                            .truncate(),
+                            .wrap(),
                         );
+                        ui.label(body_text(
+                            "请核对学号、密码与联网出口后重试",
+                            10.5,
+                            p.text_secondary,
+                        ));
                     },
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.spacing_mut().item_spacing.x = 8.0;
-                    let btn_label = if verifying_account {
-                        "正在核验账号…"
-                    } else if is_new {
-                        "验证并添加账号"
-                    } else {
-                        "验证并保存账号"
-                    };
-                    let clicked = ui
-                        .add_enabled_ui(!verifying_account, |ui| {
-                            if is_new || draft_dirty {
-                                primary_button(ui, p, Some(Icon::Check), btn_label).clicked()
-                            } else {
-                                secondary_button(ui, p, Some(Icon::Check), btn_label).clicked()
-                            }
-                        })
-                        .inner;
-                    if clicked {
-                        actions.save_profile = true;
-                    }
-                    if show_card_reset && secondary_button(ui, p, None, "还原").clicked() {
-                        if let Some(id) = form.editing_account_id.clone() {
-                            if let Some(acc) = saved.find_account(&id) {
-                                form.load_account_draft(acc);
-                            }
-                        }
+                    if !verifying_account
+                        && draw_compact_action_btn(ui, p, None, "仍要强制保存", false)
+                            .on_hover_text(
+                                "若确认运营商宽带密码与自助服务密码不同，可跳过预检强制保存",
+                            )
+                            .clicked()
+                    {
+                        actions.force_save_profile = true;
                     }
                 });
+            });
+        });
+}
+
+fn draw_quick_exit_body(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    form: &mut SettingsForm,
+    saved: &Settings,
+    verifying_account: bool,
+    actions: &mut SettingsActions,
+) {
+    let base_sid = saved
+        .active_account()
+        .map(|a| a.student_id.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| form.student_id.trim())
+        .to_string();
+    if form.student_id.trim() != base_sid && !base_sid.is_empty() {
+        form.student_id = base_sid.clone();
+    }
+    form.also_create_campus_exit = false;
+
+    let all_exits_added = (0..=4).all(|c| saved.has_carrier_for_student(&base_sid, &c.to_string()));
+    if !all_exits_added && saved.has_carrier_for_student(&base_sid, &form.carrier.to_string()) {
+        form.carrier = saved.suggest_next_carrier_for(&base_sid);
+    }
+
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), 18.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 6.0;
+            ui.label(body_text("选择新出口", 11.5, p.text_secondary));
+            ui.label(body_text(
+                if all_exits_added {
+                    format!("· 学号 {base_sid} 的全部出口均已添加")
+                } else {
+                    format!("· 复用学号 {base_sid}")
+                },
+                11.0,
+                p.text_muted,
+            ));
+            if !all_exits_added && form.carrier == 0 {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(body_text(
+                        "使用「校园网」出口时请关闭 VPN / 代理",
+                        10.5,
+                        p.warn,
+                    ));
+                });
+            }
+        },
+    );
+
+    let labels = ["校园网", "中国电信", "中国联通", "中国移动", "广电网络"];
+    let n = labels.len();
+    let gap = 7.0_f32;
+    let usable = (ui.available_width() - gap * (n as f32 - 1.0)).max(300.0);
+    let base_w = (usable / n as f32).floor();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        for (idx, name) in labels.iter().enumerate() {
+            let w = if idx + 1 == n {
+                (usable - base_w * (n as f32 - 1.0)).max(base_w)
+            } else {
+                base_w
+            };
+            let existed = saved.has_carrier_for_student(&base_sid, &idx.to_string());
+            let selected = !existed && form.carrier == idx;
+            if existed {
+                let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::hover());
+                ui.painter().rect(
+                    r,
+                    CornerRadius::same(RADIUS_SM),
+                    with_alpha(p.subtle, 140),
+                    Stroke::new(1.0_f32, p.divider),
+                    StrokeKind::Inside,
+                );
+                ui.painter().text(
+                    Pos2::new(r.center().x, r.top() + 12.5),
+                    egui::Align2::CENTER_CENTER,
+                    *name,
+                    egui::FontId::proportional(11.2),
+                    p.text_muted,
+                );
+                ui.painter().text(
+                    Pos2::new(r.center().x, r.bottom() - 9.5),
+                    egui::Align2::CENTER_CENTER,
+                    "已添加",
+                    egui::FontId::proportional(9.5),
+                    with_alpha(p.text_muted, 175),
+                );
+                resp.on_hover_text("该学号已存在此出口");
+            } else {
+                let (r, resp) = ui.allocate_exact_size(Vec2::new(w, 36.0), Sense::click());
+                let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+                let (fill, stroke, fg) = if selected {
+                    (p.accent_soft, Stroke::new(1.3_f32, p.accent), p.accent)
+                } else if resp.hovered() {
+                    (p.card_hover, Stroke::new(1.0_f32, p.border_strong), p.text)
+                } else {
+                    (p.subtle, Stroke::new(1.0_f32, p.border), p.text_secondary)
+                };
+                ui.painter().rect(
+                    r,
+                    CornerRadius::same(RADIUS_SM),
+                    fill,
+                    stroke,
+                    StrokeKind::Inside,
+                );
+                let font = if selected {
+                    egui::FontId::new(11.5, crate::ui::theme::bold_family())
+                } else {
+                    egui::FontId::proportional(11.5)
+                };
+                let g = ui.painter().layout_no_wrap((*name).to_string(), font, fg);
+                if selected {
+                    let tot = 12.5 + g.size().x;
+                    let sx = r.center().x - tot * 0.5;
+                    let ck = Rect::from_center_size(
+                        Pos2::new(sx + 4.8, r.center().y),
+                        Vec2::splat(10.0),
+                    );
+                    icons::paint(ui.painter(), ck, Icon::Check, fg);
+                    ui.painter().galley(
+                        Pos2::new(sx + 12.5, r.center().y - g.size().y * 0.5),
+                        g,
+                        fg,
+                    );
+                } else {
+                    ui.painter().galley(
+                        Pos2::new(
+                            r.center().x - g.size().x * 0.5,
+                            r.center().y - g.size().y * 0.5,
+                        ),
+                        g,
+                        fg,
+                    );
+                }
+                if resp.clicked() && form.carrier != idx {
+                    form.carrier = idx;
+                    if idx == 0 {
+                        actions.selected_campus_carrier = true;
+                    }
+                }
+            }
+        }
+    });
+
+    draw_verify_error_banner(ui, p, form, verifying_account, actions);
+    row_divider(ui, p);
+
+    let remark_hint = format!("留空显示「{}」", carrier_label(&form.carrier.to_string()));
+    let mut no_focus = false;
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), 30.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.spacing_mut().item_spacing.x = 8.0;
+            ui.label(body_text("备注（选填）", 11.2, p.text_secondary));
+            styled_text_box(
+                ui,
+                p,
+                220.0,
+                None,
+                &mut form.remark,
+                &remark_hint,
+                false,
+                None,
+                &mut no_focus,
+            );
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let lbl = if verifying_account {
+                    "正在核验…"
+                } else {
+                    "添加出口"
+                };
+                if ui
+                    .add_enabled_ui(!verifying_account && !all_exits_added, |ui| {
+                        primary_button(ui, p, Some(Icon::Check), lbl).clicked()
+                    })
+                    .inner
+                {
+                    actions.save_profile = true;
+                }
+            });
+        },
+    );
+}
+
+fn draw_full_new_account_dual_body(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    form: &mut SettingsForm,
+    saved: &Settings,
+    reusable_peer_cred: bool,
+    verifying_account: bool,
+    actions: &mut SettingsActions,
+) {
+    let total_w = ui.available_width();
+    let sep_pad = 12.0_f32;
+    let left_w = ((total_w - sep_pad * 2.0 - 1.0) * 0.45).floor().max(160.0);
+    let right_w = (total_w - left_w - sep_pad * 2.0 - 1.0).max(180.0);
+    let body_h = 156.0_f32;
+
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+
+        // 左栏：学号 → 密码 → 备注（三行垂直登录流）
+        ui.allocate_ui_with_layout(
+            Vec2::new(left_w, body_h),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
+                ui.label(body_text("校园网学号", 11.2, p.text_secondary));
+                styled_text_box(
+                    ui,
+                    p,
+                    left_w,
+                    Some(Icon::User),
+                    &mut form.student_id,
+                    "输入校园网学号",
+                    false,
+                    None,
+                    &mut form.request_student_id_focus,
+                );
+
+                ui.add_space(5.0);
+                ui.label(body_text("登录密码", 11.2, p.text_secondary));
+                let pwd_hint = if reusable_peer_cred {
+                    "留空直接复用该学号已存密码"
+                } else {
+                    "输入校园网密码"
+                };
+                let editing_password = !form.password.is_empty();
+                if !editing_password {
+                    form.show_password = false;
+                }
+                let mask_password = !form.show_password;
+                let eye = if editing_password {
+                    Some(&mut form.show_password)
+                } else {
+                    None
+                };
+                let mut no_focus = false;
+                styled_text_box(
+                    ui,
+                    p,
+                    left_w,
+                    Some(Icon::Key),
+                    &mut form.password,
+                    pwd_hint,
+                    mask_password,
+                    eye,
+                    &mut no_focus,
+                );
+
+                ui.add_space(5.0);
+                ui.label(body_text("备注名称（选填）", 11.2, p.text_secondary));
+                styled_text_box(
+                    ui,
+                    p,
+                    left_w,
+                    None,
+                    &mut form.remark,
+                    "如：宿舍联通（留空按出口显示）",
+                    false,
+                    None,
+                    &mut no_focus,
+                );
+            },
+        );
+
+        // 中间 1px 竖向分隔线
+        let (sep_r, _) =
+            ui.allocate_exact_size(Vec2::new(sep_pad * 2.0 + 1.0, body_h), Sense::hover());
+        ui.painter().line_segment(
+            [
+                Pos2::new(sep_r.center().x, sep_r.top() + 2.0),
+                Pos2::new(sep_r.center().x, sep_r.bottom() - 2.0),
+            ],
+            Stroke::new(1.0_f32, p.divider),
+        );
+
+        // 右栏：单行 5 等分对称出口胶囊 + 固定高度联动说明卡 + 右下角主操作按钮
+        ui.allocate_ui_with_layout(
+            Vec2::new(right_w, body_h),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
+                ui.label(body_text("运营商出口", 11.2, p.text_secondary));
+                if draw_symmetric_carrier_row(ui, p, right_w, &mut form.carrier)
+                    && form.carrier == 0
+                {
+                    actions.selected_campus_carrier = true;
+                }
+
+                ui.add_space(8.0);
+                let campus_already_saved = !form.student_id.trim().is_empty()
+                    && saved.has_carrier_for_student(&form.student_id, "0");
+                draw_exit_companion_or_vpn_card(
+                    ui,
+                    p,
+                    right_w,
+                    form.carrier == 0,
+                    campus_already_saved,
+                    &mut form.also_create_campus_exit,
+                );
+
+                let used = ui.cursor().top();
+                let target_btn_top = sep_r.bottom() - 30.0;
+                if target_btn_top > used {
+                    ui.add_space(target_btn_top - used);
+                }
+                ui.allocate_ui_with_layout(
+                    Vec2::new(right_w, 30.0),
+                    egui::Layout::right_to_left(egui::Align::Center),
+                    |ui| {
+                        let btn_label = if verifying_account {
+                            "正在核验账号…"
+                        } else {
+                            "验证并添加账号"
+                        };
+                        if ui
+                            .add_enabled_ui(!verifying_account, |ui| {
+                                primary_button(ui, p, Some(Icon::Check), btn_label).clicked()
+                            })
+                            .inner
+                        {
+                            actions.save_profile = true;
+                        }
+                    },
+                );
             },
         );
     });
+
+    draw_verify_error_banner(ui, p, form, verifying_account, actions);
+}
+
+fn draw_edit_account_dual_body(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    form: &mut SettingsForm,
+    editing_has_cred: bool,
+    draft_dirty: bool,
+    verifying_account: bool,
+    actions: &mut SettingsActions,
+) {
+    let total_w = ui.available_width();
+    let sep_pad = 12.0_f32;
+    let left_w = ((total_w - sep_pad * 2.0 - 1.0) * 0.45).floor().max(160.0);
+    let right_w = (total_w - left_w - sep_pad * 2.0 - 1.0).max(180.0);
+    let cols_h = 104.0_f32;
+    let mut no_focus = false;
+
+    ui.horizontal_top(|ui| {
+        ui.spacing_mut().item_spacing.x = 0.0;
+
+        ui.allocate_ui_with_layout(
+            Vec2::new(left_w, cols_h),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
+                ui.label(body_text("校园网学号", 11.2, p.text_secondary));
+                styled_text_box(
+                    ui,
+                    p,
+                    left_w,
+                    Some(Icon::User),
+                    &mut form.student_id,
+                    "输入校园网学号",
+                    false,
+                    None,
+                    &mut no_focus,
+                );
+
+                ui.add_space(6.0);
+                ui.label(body_text("登录密码", 11.2, p.text_secondary));
+                let pwd_hint = if editing_has_cred {
+                    "留空不修改"
+                } else {
+                    "输入校园网密码"
+                };
+                let editing_password = !form.password.is_empty();
+                if !editing_password {
+                    form.show_password = false;
+                }
+                let mask_password = !form.show_password;
+                let eye = if editing_password {
+                    Some(&mut form.show_password)
+                } else {
+                    None
+                };
+                styled_text_box(
+                    ui,
+                    p,
+                    left_w,
+                    Some(Icon::Key),
+                    &mut form.password,
+                    pwd_hint,
+                    mask_password,
+                    eye,
+                    &mut no_focus,
+                );
+            },
+        );
+
+        let (sep_r, _) =
+            ui.allocate_exact_size(Vec2::new(sep_pad * 2.0 + 1.0, cols_h), Sense::hover());
+        ui.painter().line_segment(
+            [
+                Pos2::new(sep_r.center().x, sep_r.top() + 2.0),
+                Pos2::new(sep_r.center().x, sep_r.bottom() - 2.0),
+            ],
+            Stroke::new(1.0_f32, p.divider),
+        );
+
+        ui.allocate_ui_with_layout(
+            Vec2::new(right_w, cols_h),
+            egui::Layout::top_down(egui::Align::LEFT),
+            |ui| {
+                ui.spacing_mut().item_spacing.y = 3.0;
+                ui.label(body_text("运营商出口", 11.2, p.text_secondary));
+                if draw_symmetric_carrier_row(ui, p, right_w, &mut form.carrier)
+                    && form.carrier == 0
+                {
+                    actions.selected_campus_carrier = true;
+                }
+
+                ui.add_space(6.0);
+                ui.label(body_text("备注名称（选填）", 11.2, p.text_secondary));
+                styled_text_box(
+                    ui,
+                    p,
+                    right_w,
+                    None,
+                    &mut form.remark,
+                    "如：宿舍联通（留空按出口显示）",
+                    false,
+                    None,
+                    &mut no_focus,
+                );
+            },
+        );
+    });
+
+    draw_verify_error_banner(ui, p, form, verifying_account, actions);
+    row_divider(ui, p);
+
+    ui.allocate_ui_with_layout(
+        Vec2::new(ui.available_width(), 30.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            if form.carrier == 0 {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (ir, _) = ui.allocate_exact_size(Vec2::splat(13.5), Sense::hover());
+                icons::paint(ui.painter(), ir, Icon::Shield, p.warn);
+                ui.label(body_text(
+                    "使用「校园网」出口时请关闭本机 VPN / 代理软件",
+                    10.8,
+                    p.warn,
+                ));
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let btn_label = if verifying_account {
+                    "正在核验账号…"
+                } else {
+                    "保存修改"
+                };
+                let clicked = ui
+                    .add_enabled_ui(!verifying_account, |ui| {
+                        if draft_dirty {
+                            primary_button(ui, p, Some(Icon::Check), btn_label).clicked()
+                        } else {
+                            secondary_button(ui, p, Some(Icon::Check), btn_label).clicked()
+                        }
+                    })
+                    .inner;
+                if clicked {
+                    actions.save_profile = true;
+                }
+            });
+        },
+    );
+}
+
+fn draw_exit_companion_or_vpn_card(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    width: f32,
+    campus_selected: bool,
+    campus_already_saved: bool,
+    also_create_campus: &mut bool,
+) {
+    if campus_selected {
+        let (box_r, _) = ui.allocate_exact_size(Vec2::new(width, 48.0), Sense::hover());
+        ui.painter().rect(
+            box_r,
+            CornerRadius::same(RADIUS_SM),
+            p.warn_soft,
+            Stroke::new(1.0_f32, p.warn_border),
+            StrokeKind::Inside,
+        );
+        let ic_r = Rect::from_center_size(
+            Pos2::new(box_r.left() + 17.0, box_r.top() + 16.5),
+            Vec2::splat(13.5),
+        );
+        icons::paint(ui.painter(), ic_r, Icon::Shield, p.warn);
+        ui.painter().text(
+            Pos2::new(ic_r.right() + 7.0, box_r.top() + 16.5),
+            egui::Align2::LEFT_CENTER,
+            "使用「校园网」出口时请关闭 VPN / 代理",
+            egui::FontId::proportional(11.0),
+            p.warn,
+        );
+        ui.painter().text(
+            Pos2::new(ic_r.right() + 7.0, box_r.bottom() - 13.0),
+            egui::Align2::LEFT_CENTER,
+            "内网出口下开启代理工具易触发学校防共享封禁",
+            egui::FontId::proportional(10.0),
+            p.text_secondary,
+        );
+    } else if campus_already_saved {
+        let (box_r, _) = ui.allocate_exact_size(Vec2::new(width, 48.0), Sense::hover());
+        ui.painter().rect(
+            box_r,
+            CornerRadius::same(RADIUS_SM),
+            p.subtle,
+            Stroke::new(1.0_f32, p.divider),
+            StrokeKind::Inside,
+        );
+        let ic_r = Rect::from_center_size(
+            Pos2::new(box_r.left() + 17.0, box_r.top() + 16.5),
+            Vec2::splat(13.0),
+        );
+        icons::paint(ui.painter(), ic_r, Icon::Check, p.ok);
+        ui.painter().text(
+            Pos2::new(ic_r.right() + 7.0, box_r.top() + 16.5),
+            egui::Align2::LEFT_CENTER,
+            "该学号已存在「校园网」切换项",
+            egui::FontId::proportional(11.0),
+            p.text_secondary,
+        );
+        ui.painter().text(
+            Pos2::new(ic_r.right() + 7.0, box_r.bottom() - 13.0),
+            egui::Align2::LEFT_CENTER,
+            "保存后将自动同步并共享最新密码",
+            egui::FontId::proportional(10.0),
+            p.text_muted,
+        );
+    } else {
+        let (box_r, resp) = ui.allocate_exact_size(Vec2::new(width, 48.0), Sense::click());
+        let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+        if resp.clicked() {
+            *also_create_campus = !*also_create_campus;
+        }
+        let border = if resp.hovered() {
+            p.border_strong
+        } else {
+            p.divider
+        };
+        ui.painter().rect(
+            box_r,
+            CornerRadius::same(RADIUS_SM),
+            p.subtle,
+            Stroke::new(1.0_f32, border),
+            StrokeKind::Inside,
+        );
+        let ck_r = Rect::from_center_size(
+            Pos2::new(box_r.left() + 17.0, box_r.top() + 16.5),
+            Vec2::splat(14.5),
+        );
+        let (ck_fill, ck_stroke) = if *also_create_campus {
+            (p.accent, Stroke::NONE)
+        } else if resp.hovered() {
+            (p.card_hover, Stroke::new(1.0_f32, p.accent))
+        } else {
+            (p.input_bg, Stroke::new(1.0_f32, p.border_strong))
+        };
+        ui.painter().rect(
+            ck_r,
+            CornerRadius::same(4),
+            ck_fill,
+            ck_stroke,
+            StrokeKind::Inside,
+        );
+        if *also_create_campus {
+            icons::paint(ui.painter(), ck_r.shrink(2.2), Icon::Check, p.on_accent);
+        }
+        let title_c = if *also_create_campus || resp.hovered() {
+            p.text
+        } else {
+            p.text_secondary
+        };
+        ui.painter().text(
+            Pos2::new(ck_r.right() + 7.0, box_r.top() + 16.5),
+            egui::Align2::LEFT_CENTER,
+            "同时生成「校园网」快捷切换项（共享密码）",
+            egui::FontId::proportional(11.0),
+            title_c,
+        );
+        ui.painter().text(
+            Pos2::new(ck_r.right() + 7.0, box_r.bottom() - 13.0),
+            egui::Align2::LEFT_CENTER,
+            "主页顶栏与托盘菜单可一键在宽带与校园网间互切",
+            egui::FontId::proportional(10.0),
+            p.text_muted,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1104,7 +1540,17 @@ fn draw_saved_account_row(
     }
 
     let inner = row_rect.shrink2(Vec2::new(10.0, 5.0));
-    let right_reserved = if is_active { 122.0_f32 } else { 174.0_f32 };
+    let right_reserved = if !has_cred {
+        if is_active {
+            104.0_f32
+        } else {
+            156.0_f32
+        }
+    } else if is_active {
+        44.0_f32
+    } else {
+        98.0_f32
+    };
     let left_w = (inner.width() - right_reserved).max(140.0);
 
     // 左侧可点击信息区（点击选中该账号到下方表单编辑）
@@ -1241,9 +1687,7 @@ fn draw_saved_account_row(
         actions.switch_account = Some(acc.id.clone());
     }
 
-    if has_cred {
-        badge(&mut right_ui, p.ok, p.ok_soft, p.ok_border, "已加密");
-    } else {
+    if !has_cred {
         badge(&mut right_ui, p.warn, p.warn_soft, p.warn_border, "缺密码");
     }
 }
@@ -1299,60 +1743,28 @@ fn draw_compact_action_btn(
     resp
 }
 
-fn draw_inline_checkbox_row(ui: &mut egui::Ui, p: &Palette, checked: &mut bool, label: &str) {
-    let row_w = ui.available_width();
-    let (rect, resp) = ui.allocate_exact_size(Vec2::new(row_w, 20.0), Sense::click());
-    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-    if resp.clicked() {
-        *checked = !*checked;
-    }
-    let cy = rect.center().y;
-    let box_r = Rect::from_center_size(Pos2::new(rect.left() + 8.0, cy), Vec2::splat(14.5));
-    let (fill, stroke) = if *checked {
-        (p.accent, Stroke::NONE)
-    } else if resp.hovered() {
-        (p.card_hover, Stroke::new(1.0_f32, p.accent))
-    } else {
-        (p.input_bg, Stroke::new(1.0_f32, p.border_strong))
-    };
-    ui.painter().rect(
-        box_r,
-        CornerRadius::same(4),
-        fill,
-        stroke,
-        StrokeKind::Inside,
-    );
-    if *checked {
-        icons::paint(ui.painter(), box_r.shrink(2.2), Icon::Check, p.on_accent);
-    }
-    let text_c = if *checked || resp.hovered() {
-        p.text_secondary
-    } else {
-        p.text_muted
-    };
-    let g =
-        ui.painter()
-            .layout_no_wrap(label.to_string(), egui::FontId::proportional(10.8), text_c);
-    let clip = Rect::from_min_max(Pos2::new(box_r.right() + 6.0, rect.top()), rect.max);
-    ui.painter().with_clip_rect(clip).galley(
-        Pos2::new(box_r.right() + 6.0, cy - g.size().y * 0.5),
-        g,
-        text_c,
-    );
-}
-
-fn draw_carrier_row(ui: &mut egui::Ui, p: &Palette, carrier: &mut usize) -> bool {
+/// 右栏单行 5 等分对称出口选择器（与师大门户 `R3 = "0".."4"` 严格一一对应）。
+fn draw_symmetric_carrier_row(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    total_w: f32,
+    carrier: &mut usize,
+) -> bool {
     let mut changed = false;
-    // 与师大认证门户 `yc.gxnu.edu.cn` (`ISP_select` value="0".."4") 严格一一对应
-    let labels = ["校园网", "中国电信", "中国联通", "中国移动", "广电网络"];
-    let n = labels.len();
-    let gap = 7.0_f32;
-    let total_w = ui.available_width();
-    let usable_w = (total_w - gap * (n.saturating_sub(1) as f32)).max(310.0);
+    let items: &[(&str, &str)] = &[
+        ("校园网", "校园网（内网出口）"),
+        ("电信", "中国电信"),
+        ("联通", "中国联通"),
+        ("移动", "中国移动"),
+        ("广电", "广电网络"),
+    ];
+    let n = items.len();
+    let gap = 5.0_f32;
+    let usable_w = (total_w - gap * (n.saturating_sub(1) as f32)).max(220.0);
     let base_w = (usable_w / n as f32).floor();
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = gap;
-        for (idx, label) in labels.iter().enumerate() {
+        for (idx, (short_lbl, full_tip)) in items.iter().enumerate() {
             let active = *carrier == idx;
             let btn_w = if idx + 1 == n {
                 (usable_w - base_w * (n.saturating_sub(1) as f32)).max(base_w)
@@ -1362,7 +1774,7 @@ fn draw_carrier_row(ui: &mut egui::Ui, p: &Palette, carrier: &mut usize) -> bool
             let (rect, resp) = ui.allocate_exact_size(Vec2::new(btn_w, 30.0), Sense::click());
             let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
             let (fill, stroke, fg) = if active {
-                (p.accent_soft, Stroke::new(1.2_f32, p.accent), p.accent)
+                (p.accent_soft, Stroke::new(1.3_f32, p.accent), p.accent)
             } else if resp.hovered() {
                 (p.card_hover, Stroke::new(1.0_f32, p.border_strong), p.text)
             } else {
@@ -1376,13 +1788,18 @@ fn draw_carrier_row(ui: &mut egui::Ui, p: &Palette, carrier: &mut usize) -> bool
                 StrokeKind::Inside,
             );
             let font = if active {
-                egui::FontId::new(12.0, crate::ui::theme::bold_family())
+                egui::FontId::new(11.5, crate::ui::theme::bold_family())
             } else {
-                egui::FontId::proportional(12.0)
+                egui::FontId::proportional(11.5)
             };
-            ui.painter()
-                .text(rect.center(), egui::Align2::CENTER_CENTER, *label, font, fg);
-            if resp.clicked() && *carrier != idx {
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                *short_lbl,
+                font,
+                fg,
+            );
+            if resp.on_hover_text(*full_tip).clicked() && *carrier != idx {
                 *carrier = idx;
                 changed = true;
             }
@@ -1975,25 +2392,27 @@ fn fluent_toggle_row(
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn styled_text_box(
     ui: &mut egui::Ui,
     p: &Palette,
     width: f32,
+    leading_icon: Option<Icon>,
     value: &mut String,
     hint: &str,
     password: bool,
     eye_toggle: Option<&mut bool>,
-) {
+    request_focus: &mut bool,
+) -> egui::Response {
     let (box_rect, _) = ui.allocate_exact_size(Vec2::new(width, 30.0), Sense::hover());
-    ui.painter().rect(
-        box_rect,
-        CornerRadius::same(RADIUS_SM),
-        p.input_bg,
-        Stroke::new(1.0_f32, p.border),
-        StrokeKind::Inside,
-    );
+    let glow_idx = ui.painter().add(egui::Shape::Noop);
+    let bg_idx = ui.painter().add(egui::Shape::Noop);
 
-    let inner_rect = box_rect.shrink2(Vec2::new(9.0, 4.0));
+    let icon_pad = if leading_icon.is_some() { 19.0 } else { 0.0 };
+    let inner_rect = Rect::from_min_max(
+        Pos2::new(box_rect.left() + 9.0 + icon_pad, box_rect.top() + 4.0),
+        Pos2::new(box_rect.right() - 9.0, box_rect.bottom() - 4.0),
+    );
     let mut child = ui.new_child(
         egui::UiBuilder::new()
             .max_rect(inner_rect)
@@ -2001,11 +2420,11 @@ fn styled_text_box(
     );
     child.spacing_mut().item_spacing.x = 4.0;
     let edit_w = if eye_toggle.is_some() {
-        (inner_rect.width() - 24.0).max(60.0)
+        (inner_rect.width() - 24.0).max(50.0)
     } else {
-        inner_rect.width()
+        inner_rect.width().max(50.0)
     };
-    child.add_sized(
+    let edit_resp = child.add_sized(
         [edit_w, 20.0],
         egui::TextEdit::singleline(value)
             .password(password)
@@ -2014,6 +2433,52 @@ fn styled_text_box(
             .margin(egui::Margin::ZERO)
             .frame(false),
     );
+    if *request_focus {
+        edit_resp.request_focus();
+        *request_focus = false;
+    }
+
+    let focused = edit_resp.has_focus();
+    let hovered = ui.rect_contains_pointer(box_rect);
+    let border_stroke = if focused {
+        Stroke::new(1.3_f32, p.accent)
+    } else if hovered {
+        Stroke::new(1.0_f32, p.border_strong)
+    } else {
+        Stroke::new(1.0_f32, p.border)
+    };
+    ui.painter().set(
+        bg_idx,
+        egui::epaint::RectShape::new(
+            box_rect,
+            CornerRadius::same(RADIUS_SM),
+            p.input_bg,
+            border_stroke,
+            StrokeKind::Inside,
+        ),
+    );
+    if focused {
+        ui.painter().set(
+            glow_idx,
+            egui::epaint::RectShape::new(
+                box_rect.expand(1.5),
+                CornerRadius::same(RADIUS_SM + 1),
+                egui::Color32::TRANSPARENT,
+                Stroke::new(2.0_f32, with_alpha(p.accent, 30)),
+                StrokeKind::Outside,
+            ),
+        );
+    }
+
+    if let Some(ic) = leading_icon {
+        let ic_col = if focused { p.accent } else { p.text_muted };
+        let ir = Rect::from_center_size(
+            Pos2::new(box_rect.left() + 15.0, box_rect.center().y),
+            Vec2::splat(13.0),
+        );
+        icons::paint(ui.painter(), ir, ic, ic_col);
+    }
+
     if let Some(show) = eye_toggle {
         let (rect, resp) = child.allocate_exact_size(Vec2::splat(20.0), Sense::click());
         let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
@@ -2029,6 +2494,8 @@ fn styled_text_box(
             "显示密码"
         });
     }
+
+    edit_resp
 }
 
 fn row_divider(ui: &mut egui::Ui, p: &Palette) {
@@ -2092,5 +2559,52 @@ mod tests {
         assert_eq!(merged.check_interval, 60);
         assert_eq!(merged.accounts.len(), 2);
         assert_eq!(merged.active_account_id, "acc-1");
+    }
+
+    #[test]
+    fn quick_exit_mode_reuses_student_id_without_false_dirty_and_falls_back_when_all_exits_exist() {
+        let mut saved = Settings::default();
+        saved.upsert_account(
+            AccountProfile {
+                id: "acc-unicom".into(),
+                remark: "联通宽带".into(),
+                student_id: "2024010615".into(),
+                carrier: "2".into(),
+                monthly_quota_gb: 0,
+            },
+            true,
+        );
+
+        let mut form = SettingsForm::from_settings(&saved);
+        form.start_new_from_existing_with_creds(&saved, |_| true);
+        assert_eq!(form.editing_account_id, None);
+        assert_eq!(form.new_account_mode, NewAccountMode::QuickExit);
+        assert_eq!(form.student_id, "2024010615");
+        assert_eq!(form.carrier, 0);
+        assert!(!form.also_create_campus_exit);
+        assert!(!form.is_account_draft_dirty(&saved));
+
+        form.remark = "宿舍校园网".into();
+        assert!(form.is_account_draft_dirty(&saved));
+
+        // 当同一学号已配齐全部 5 个出口（0..=4）时，自动回退到完整新增表单
+        for c in ["0", "1", "3", "4"] {
+            saved.upsert_account(
+                AccountProfile {
+                    id: format!("acc-{c}"),
+                    remark: String::new(),
+                    student_id: "2024010615".into(),
+                    carrier: c.into(),
+                    monthly_quota_gb: 0,
+                },
+                false,
+            );
+        }
+        form.start_new_from_existing_with_creds(&saved, |_| true);
+        assert_eq!(form.new_account_mode, NewAccountMode::FullAccount);
+        assert!(form.student_id.is_empty());
+        assert!(form.also_create_campus_exit);
+        assert!(form.request_student_id_focus);
+        assert!(!form.is_account_draft_dirty(&saved));
     }
 }
