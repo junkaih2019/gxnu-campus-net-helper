@@ -12,7 +12,7 @@
   &nbsp;·&nbsp; <a href="LICENSE">MIT License</a>
 </p>
 <p align="center">
-  <sub>Windows 10 / 11 x64 · Single portable executable · Built-in auto-update · Built with Rust</sub>
+  <sub>Windows 10 / 11 x64 · Single portable executable · Built-in auto-update · Supports Campus / Telecom / Unicom / Mobile / Broadnet exits</sub>
 </p>
 
 ---
@@ -72,9 +72,9 @@
 ## 💡 Key Features
 
 - 🔄 **Seamless Auto-Reconnect**: Automatically detects drops and signs back in after sleep/wake, Wi-Fi switches, or session timeouts, with clear human-readable diagnostics.
-- 📊 **Live Traffic & Device Sign-Out**: Syncs with GXNU Self-Service to toggle **Carrier throughput / Campus quota**, deduplicate dual-BRAS sessions, and **sign out (`注销`) occupying devices** in one click.
+- 📊 **Live Traffic & Device Sign-Out**: Syncs with GXNU Self-Service to toggle **Carrier throughput / Campus quota**, inspect recent session history, deduplicate dual-BRAS sessions, and **sign out (`注销`) occupying devices** in one click.
 - ⚡ **Instant Left-click Tray Flyout**: Single-click the tray icon for a minimalist native flyout to switch accounts, inspect traffic, sign out devices, and check stability without opening the main window.
-- 👥 **Multi-Account Switch & VPN Guard**: Save multiple accounts with non-disruptive pre-save password verification; automatically warns to close VPN/proxy software before switching to the Campus (`校园网`) exit.
+- 👥 **Dual-Exit Setup, Multi-Account Switch & VPN Guard**: Pair Carrier + Campus (`校园网`) exits in one click, add extra exits for the same student ID without retyping credentials, and auto-sync password updates across peer exits; warns to close VPN/proxy software before switching to the Campus exit.
 - 📈 **Uptime Timeline**: Tracks `1h / 7h / 24h` connection stability in a capsule strip with hover details for outages.
 - ⬆️ **In-Place Self-Update**: Periodically checks GitHub Releases, verifies SHA-256 checksums, and replaces the `.exe` in place while preserving all credentials and startup settings.
 - 🛡️ **Proxy-Friendly & Ultra-Light**: Pierces Clash / Mihomo TUN adapters for portal probes, encrypts passwords in Windows Credential Manager, and frees all UI/GPU memory when closed to the tray.
@@ -83,9 +83,9 @@
 
 ## 🚀 Quick Start
 
-1. **Download & Run**: Grab **`gxnu-campus-net-helper-v0.2.2.exe`** from [Releases](https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest), place it in a **permanent folder**, and run it directly (no installer or extraction needed).
+1. **Download & Run**: Grab **`gxnu-campus-net-helper-v0.2.3.exe`** from [Releases](https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest), place it in a **permanent folder**, and run it directly (no installer or extraction needed).
    > 💡 If Windows SmartScreen appears on first launch, click **More info → Run anyway** (you can verify the hash against `SHA256SUMS.txt` on the release page).
-2. **Add Account**: Enter your student ID, password, and exit (`校园网` / Telecom / Unicom / Mobile / Broadnet) in **设置 → 账号管理 (Settings → Accounts)**, then click **保存并开始守护 (Save & Start)**.
+2. **Add Account**: Enter your student ID and password on the left, select your exit (`校园网 / 电信 / 联通 / 移动 / 广电`) on the right — optionally keeping **同时生成「校园网」快捷切换项** checked to pair both exits at once — and click **验证并添加账号 (Verify & Add)**; adding extra exits for the same student ID later requires no password re-entry.
 3. **Everyday Use**:
    - **Close the main window (`×`)** anytime to keep monitoring silently in the tray with minimal RAM;
    - **Left-click** the tray icon for the quick flyout, **double-click** for the main window, or **right-click** for the context menu;

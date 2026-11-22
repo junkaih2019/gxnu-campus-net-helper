@@ -101,7 +101,20 @@ jobs:
             notes        = $notes
           }
           $manifest | ConvertTo-Json -Depth 4 | Set-Content -Encoding utf8 "dist/latest.json"
-          $notes | Set-Content -Encoding utf8 "dist/RELEASE_NOTES.md"
+          $releaseBody = @"
+### ✨ 更新内容
+
+$notes
+
+---
+
+### 📦 下载与使用
+
+- 直接下载下方 **``$env:ASSET``** 放入固定文件夹双击运行即可（绿色单文件，免安装免解压）。
+- 若已安装 ``v0.2.2+``：可直接在主窗口顶栏或「设置 → 监控与自启 → 检查更新」中一键原位自动升级，原有账号密码与自启配置均自动无损保留。
+- **SHA-256**：``$hash`` ($env:ASSET)
+"@
+          $releaseBody | Set-Content -Encoding utf8 "dist/RELEASE_NOTES.md"
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
