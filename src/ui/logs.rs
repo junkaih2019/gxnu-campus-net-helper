@@ -17,7 +17,7 @@ use crate::ui::icons::{self, Icon};
 use crate::ui::theme::{body_text, bold_text, reason_label, with_alpha, Palette};
 use crate::ui::widgets::{badge, card_padded, icon_button, section_heading, segmented_control};
 
-const MAX_LOG_LINES: usize = 4000;
+use crate::ipc::MAX_LOG_LINES;
 
 pub(super) struct LogLines {
     rows: VecDeque<String>,

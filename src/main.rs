@@ -1056,7 +1056,7 @@ fn run_ui_process(args: &[String]) -> ExitCode {
     let mut settings = store.load();
     settings.auto_boot = startup::is_enabled();
 
-    let (ipc_client, snap_rx, log_rx) = match ipc::IpcClient::connect(port, &token) {
+    let ipc_client = match ipc::IpcClient::connect(port, &token) {
         Ok(res) => res,
         Err(err) => {
             eprintln!("{err}");
@@ -1077,8 +1077,6 @@ fn run_ui_process(args: &[String]) -> ExitCode {
         store,
         settings,
         ipc: ipc_client,
-        snapshots: snap_rx,
-        logs: log_rx,
         log_path,
         initial_logs,
         initial_telemetry,

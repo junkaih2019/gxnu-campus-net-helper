@@ -1,12 +1,14 @@
 //! 本地回环 IPC（127.0.0.1 临时端口 + 随机会话令牌）：
 //! 用于「轻守护进程（~5–8MB）」与「按需拉起的 GUI 进程」之间双向实时同步。
 
+mod inbox;
+pub use inbox::{CheckResult, ClientInbox, UpdateCheckResult, MAX_LOG_LINES};
+
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -379,20 +381,11 @@ where
 pub struct IpcClient {
     writer: TcpStream,
     next_id: u64,
-    pub replies: Receiver<(u64, Result<(), String>)>,
-    pub kick_results: Receiver<(String, bool, Result<(), String>)>,
-    pub update_states: Receiver<UpdateState>,
-    pub daemon_closed: Arc<AtomicBool>,
-    pub connection_lost: Arc<AtomicBool>,
-    pub open_account_settings: Arc<AtomicBool>,
-    pub open_update_modal: Arc<AtomicBool>,
+    pub inbox: Arc<ClientInbox>,
 }
 
 impl IpcClient {
-    pub fn connect(
-        port: u16,
-        token: &str,
-    ) -> Result<(Self, Receiver<SnapshotEnvelope>, Receiver<String>), String> {
+    pub fn connect(port: u16, token: &str) -> Result<Self, String> {
         let addr: SocketAddr = ([127, 0, 0, 1], port).into();
         let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(2))
             .map_err(|err| format!("连接守护进程失败：{err}"))?;
@@ -411,20 +404,8 @@ impl IpcClient {
             .map_err(|err| format!("握手失败：{err}"))?;
 
         let reader_stream = stream.try_clone().map_err(|err| err.to_string())?;
-        let (snap_tx, snap_rx) = mpsc::channel::<SnapshotEnvelope>();
-        let (log_tx, log_rx) = mpsc::channel::<String>();
-        let daemon_closed = Arc::new(AtomicBool::new(false));
-        let open_account_settings = Arc::new(AtomicBool::new(false));
-        let open_update_modal = Arc::new(AtomicBool::new(false));
-        let (reply_tx, replies) = mpsc::channel();
-        let (kick_tx, kick_results) = mpsc::channel();
-        let (upd_tx, update_states) = mpsc::channel();
-        let connection_lost = Arc::new(AtomicBool::new(false));
-        let lost_ref = Arc::clone(&connection_lost);
-        let closed_ref = Arc::clone(&daemon_closed);
-        let open_acct_ref = Arc::clone(&open_account_settings);
-        let open_upd_ref = Arc::clone(&open_update_modal);
-
+        let inbox = Arc::new(ClientInbox::default());
+        let incoming = Arc::clone(&inbox);
         std::thread::Builder::new()
             .name("ipc-ui-reader".to_string())
             .spawn(move || {
@@ -434,41 +415,15 @@ impl IpcClient {
                     buf.clear();
                     match reader.read_line(&mut buf) {
                         Ok(0) | Err(_) => {
-                            lost_ref.store(true, Ordering::Release);
+                            incoming.disconnect();
                             break;
                         }
                         Ok(_) => {
-                            if let Ok(msg) = serde_json::from_str::<DaemonToUi>(buf.trim()) {
-                                match msg {
-                                    DaemonToUi::Snapshot(env) => {
-                                        let _ = snap_tx.send(*env);
-                                    }
-                                    DaemonToUi::LogLine { line } => {
-                                        let _ = log_tx.send(line);
-                                    }
-                                    DaemonToUi::CommandResult { id, result } => {
-                                        let _ = reply_tx.send((id, result));
-                                    }
-                                    DaemonToUi::KickResult {
-                                        ip,
-                                        is_local,
-                                        result,
-                                    } => {
-                                        let _ = kick_tx.send((ip, is_local, result));
-                                    }
-                                    DaemonToUi::UpdateState(st) => {
-                                        let _ = upd_tx.send(*st);
-                                    }
-                                    DaemonToUi::OpenAccountSettings => {
-                                        open_acct_ref.store(true, Ordering::Release);
-                                    }
-                                    DaemonToUi::OpenUpdateModal => {
-                                        open_upd_ref.store(true, Ordering::Release);
-                                    }
-                                    DaemonToUi::Shutdown => {
-                                        closed_ref.store(true, Ordering::SeqCst);
-                                        break;
-                                    }
+                            if let Ok(msg) = serde_json::from_str::<DaemonToUi>(&buf) {
+                                let shutdown = matches!(msg, DaemonToUi::Shutdown);
+                                incoming.receive(msg);
+                                if shutdown {
+                                    break;
                                 }
                             }
                         }
@@ -477,32 +432,35 @@ impl IpcClient {
             })
             .map_err(|err| format!("启动 IPC 接收线程失败：{err}"))?;
 
-        Ok((
-            Self {
-                writer: stream,
-                next_id: 1,
-                replies,
-                kick_results,
-                update_states,
-                daemon_closed,
-                connection_lost,
-                open_account_settings,
-                open_update_modal,
-            },
-            snap_rx,
-            log_rx,
-        ))
+        Ok(Self {
+            writer: stream,
+            next_id: 1,
+            inbox,
+        })
     }
 
     pub fn send(&mut self, command: UiToDaemon) -> Result<u64, String> {
         let id = self.next_id;
         self.next_id += 1;
-        let mut line = serde_json::to_vec(&ClientFrame::Request { id, command })
-            .map_err(|e| format!("{e}"))?;
-        line.push(b'\n');
-        self.writer
-            .write_all(&line)
-            .map_err(|e| format!("发送守护命令失败：{e}"))?;
+        self.inbox.reserve(id, &command)?;
+        let frame = ClientFrame::Request { id, command };
+        let sent = serde_json::to_vec(&frame)
+            .map_err(io::Error::from)
+            .and_then(|mut line| {
+                line.push(b'\n');
+                self.writer.write_all(&line)
+            });
+        if let Err(err) = sent {
+            self.inbox.forget(id);
+            if let ClientFrame::Request {
+                command: UiToDaemon::KickDevice { ip, .. },
+                ..
+            } = &frame
+            {
+                self.inbox.forget_kick(ip);
+            }
+            return Err(format!("发送守护命令失败：{err}"));
+        }
         Ok(id)
     }
 }
@@ -525,7 +483,7 @@ pub fn forward_launch(app_dir: &Path, start: bool, minimized: bool) -> Result<()
         let endpoint: DaemonEndpoint = serde_json::from_str(&text).map_err(|e| format!("{e}"))?;
         IpcClient::connect(endpoint.port, &endpoint.token)
     };
-    let (mut client, _snapshots, _logs) = loop {
+    let mut client = loop {
         match connect() {
             Ok(connection) => break connection,
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
@@ -539,8 +497,8 @@ pub fn forward_launch(app_dir: &Path, start: bool, minimized: bool) -> Result<()
     for command in commands.into_iter().flatten() {
         let id = client.send(command)?;
         let (reply_id, result) = client
-            .replies
-            .recv_timeout(COMMAND_TIMEOUT)
+            .inbox
+            .recv_reply_timeout(COMMAND_TIMEOUT)
             .map_err(|e| format!("未收到守护进程回执：{e}"))?;
         if reply_id != id {
             return Err("守护进程回执序号不匹配".into());
@@ -602,18 +560,10 @@ mod tests {
             update: UpdateState::default(),
         });
         let ep = server.endpoint();
-        let (mut client, snapshots, logs) = IpcClient::connect(ep.port, &ep.token).unwrap();
-        assert_eq!(
-            snapshots
-                .recv_timeout(Duration::from_secs(2))
-                .unwrap()
-                .snapshot
-                .state,
-            MonitorState::Paused
-        );
+        let mut client = IpcClient::connect(ep.port, &ep.token).unwrap();
         let id = client.send(UiToDaemon::ForceCheck).unwrap();
         assert_eq!(
-            client.replies.recv_timeout(COMMAND_TIMEOUT).unwrap(),
+            client.inbox.recv_reply_timeout(COMMAND_TIMEOUT).unwrap(),
             (id, Ok(()))
         );
         assert!(matches!(
@@ -621,13 +571,21 @@ mod tests {
             Ok(UiToDaemon::ForceCheck)
         ));
         server.broadcast_log("test line".into());
+        // The second reply follows both broadcasts on this subscriber's FIFO stream.
+        let id = client.send(UiToDaemon::ShowUi).unwrap();
         assert_eq!(
-            logs.recv_timeout(Duration::from_secs(2)).unwrap(),
-            "test line"
+            client.inbox.recv_reply_timeout(COMMAND_TIMEOUT).unwrap(),
+            (id, Ok(()))
         );
+        let batch = client.inbox.take();
+        assert_eq!(batch.snapshot.unwrap().snapshot.state, MonitorState::Paused);
+        assert_eq!(batch.logs, ["test line"]);
         server.broadcast_shutdown();
-        assert!(logs.recv_timeout(Duration::from_secs(2)).is_err());
-        assert!(client.daemon_closed.load(Ordering::SeqCst));
+        assert_eq!(
+            client.inbox.recv_reply_timeout(COMMAND_TIMEOUT),
+            Err(mpsc::RecvTimeoutError::Disconnected)
+        );
+        assert!(client.inbox.daemon_closed());
         assert!(!dir.path().join(ENDPOINT_FILE).exists());
     }
     #[test]
@@ -645,15 +603,15 @@ mod tests {
             })
             .unwrap();
         let ep = server.endpoint();
-        let (mut wrong, _, _) = IpcClient::connect(ep.port, "fake-invalid-token").unwrap();
+        let mut wrong = IpcClient::connect(ep.port, "fake-invalid-token").unwrap();
         let _ = wrong.send(UiToDaemon::Start);
         assert!(matches!(
-            wrong.replies.recv_timeout(COMMAND_TIMEOUT),
+            wrong.inbox.recv_reply_timeout(COMMAND_TIMEOUT),
             Err(mpsc::RecvTimeoutError::Disconnected)
         ));
         assert!(applying.try_recv().is_err());
-        let (mut first, _s1, _l1) = IpcClient::connect(ep.port, &ep.token).unwrap();
-        let (mut second, _s2, _l2) = IpcClient::connect(ep.port, &ep.token).unwrap();
+        let mut first = IpcClient::connect(ep.port, &ep.token).unwrap();
+        let mut second = IpcClient::connect(ep.port, &ep.token).unwrap();
         let id = first
             .send(UiToDaemon::ReloadSettings {
                 start: false,
@@ -662,21 +620,171 @@ mod tests {
             })
             .unwrap();
         applying.recv_timeout(COMMAND_TIMEOUT).unwrap();
-        assert!(first.replies.try_recv().is_err());
+        assert!(first.inbox.take().replies.is_empty());
         finish.send(()).unwrap();
         assert_eq!(
-            first.replies.recv_timeout(COMMAND_TIMEOUT).unwrap(),
+            first.inbox.recv_reply_timeout(COMMAND_TIMEOUT).unwrap(),
             (id, Err("模拟热加载失败".into()))
         );
         let second_id = second.send(UiToDaemon::Start).unwrap();
         assert_eq!(id, second_id);
         applying.recv_timeout(COMMAND_TIMEOUT).unwrap();
-        assert!(second.replies.try_recv().is_err());
+        assert!(second.inbox.take().replies.is_empty());
         finish.send(()).unwrap();
         assert_eq!(
-            second.replies.recv_timeout(COMMAND_TIMEOUT).unwrap().0,
+            second.inbox.recv_reply_timeout(COMMAND_TIMEOUT).unwrap().0,
             second_id
         );
-        assert!(first.replies.try_recv().is_err());
+        assert!(first.inbox.take().replies.is_empty());
+    }
+
+    #[test]
+    fn suspended_ui_resumes_with_bounded_history_logs_and_original_manual_results() {
+        use crate::metrics_store::{SampleId, TelemetryPoint, MAX_STORED_POINTS};
+        use crate::models::{DisconnectReason, OnlineDevice, SelfServiceData, UpdateStatus};
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = IpcClient::connect(listener.local_addr().unwrap().port(), "test").unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        let mut writer = io::BufWriter::new(peer);
+        let mut emit = |msg| {
+            serde_json::to_writer(&mut writer, &msg).unwrap();
+            writer.write_all(b"\n").unwrap();
+        };
+        let manual = client.send(UiToDaemon::ForceCheck).unwrap();
+        let update = client
+            .send(UiToDaemon::CheckUpdate { manual: true })
+            .unwrap();
+        let kicked_ip = "192.0.2.1";
+        let kick = client
+            .send(UiToDaemon::KickDevice {
+                ip: kicked_ip.into(),
+                is_local: true,
+            })
+            .unwrap();
+        let snapshot = |seq: u64, state: MonitorState, ms| {
+            let offline = state == MonitorState::Offline;
+            let reason = if offline {
+                DisconnectReason::LoginRejected
+            } else {
+                DisconnectReason::Online
+            };
+            let mut snapshot = MonitorSnapshot::new(state, Some(reason), "sample", true);
+            snapshot.metrics.check_seq = seq;
+            let mut point = TelemetryPoint::check(seq as i64, ms, !offline, reason.as_str());
+            point.sample_id = Some(SampleId::generated(1, 2, seq));
+            snapshot.metrics.last_point = Some(point);
+            DaemonToUi::Snapshot(Box::new(SnapshotEnvelope {
+                snapshot,
+                online_since_unix: Some(1),
+                last_check_unix: Some(seq as i64),
+                traffic: TrafficSummary::default(),
+                active_account_id: "mock".into(),
+                self_service: SelfServiceState {
+                    data: Some(SelfServiceData {
+                        online_devices: vec![OnlineDevice {
+                            use_time_secs: Some(seq),
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                update: UpdateState::default(),
+            }))
+        };
+        let update_msg = |status, downloaded_bytes, message: &str| {
+            DaemonToUi::UpdateState(Box::new(UpdateState {
+                status,
+                downloaded_bytes,
+                message: message.into(),
+                ..Default::default()
+            }))
+        };
+        emit(snapshot(1, MonitorState::Checking, 0));
+        emit(snapshot(1, MonitorState::Offline, 0));
+        emit(update_msg(UpdateStatus::Checking, 0, ""));
+        emit(update_msg(UpdateStatus::Error, 0, "mock check error"));
+        emit(update_msg(UpdateStatus::UpToDate, 0, ""));
+        emit(DaemonToUi::KickResult {
+            ip: kicked_ip.into(),
+            is_local: true,
+            result: Ok(()),
+        });
+        let total = MAX_STORED_POINTS as u64 + 257;
+        for n in 1..=total {
+            emit(snapshot(n, MonitorState::Online, n));
+            emit(DaemonToUi::LogLine {
+                line: format!("line {n}"),
+            });
+            emit(update_msg(UpdateStatus::Downloading, n, ""));
+            emit(DaemonToUi::KickResult {
+                ip: format!("mock-{n}"),
+                is_local: false,
+                result: Ok(()),
+            });
+        }
+        // Late latency for an older sample updates its slot. New auxiliary data can carry this older reading.
+        emit(snapshot(total - 100, MonitorState::Online, 9999));
+        for id in [manual, update, kick] {
+            emit(DaemonToUi::CommandResult { id, result: Ok(()) });
+        }
+        writer.flush().unwrap();
+        for id in [manual, update, kick] {
+            assert_eq!(
+                client.inbox.recv_reply_timeout(COMMAND_TIMEOUT).unwrap(),
+                (id, Ok(()))
+            );
+        }
+        let batch = client.inbox.take();
+        let env = batch.snapshot.unwrap();
+        assert_eq!(env.snapshot.metrics.check_seq, total);
+        assert_eq!(env.last_check_unix, Some(total as i64));
+        assert_eq!(
+            env.self_service.data.unwrap().online_devices[0].use_time_secs,
+            Some(total - 100)
+        );
+        let samples = batch.samples.into_points();
+        assert_eq!(samples.len(), MAX_STORED_POINTS);
+        for (point, seq) in samples
+            .iter()
+            .zip(total - MAX_STORED_POINTS as u64 + 1..=total)
+        {
+            assert_eq!(point.sample_id, Some(SampleId::generated(1, 2, seq)));
+            assert_eq!(point.ms, if seq == total - 100 { 9999 } else { seq });
+        }
+        assert_eq!(batch.logs.len(), MAX_LOG_LINES);
+        assert!(batch
+            .logs
+            .into_iter()
+            .eq((total - MAX_LOG_LINES as u64 + 1..=total).map(|n| format!("line {n}"))));
+        assert!(batch.prompt_account);
+        assert_eq!(
+            batch.manual_check,
+            Some(CheckResult::Status(Some(DisconnectReason::LoginRejected)))
+        );
+        assert_eq!(
+            batch.manual_update,
+            Some(UpdateCheckResult::Error("mock check error".into()))
+        );
+        let latest = batch.update.unwrap();
+        assert_eq!(
+            (latest.status, latest.downloaded_bytes),
+            (UpdateStatus::Downloading, total)
+        );
+        assert_eq!(batch.kick_results.len(), CLIENT_QUEUE);
+        assert_eq!(batch.kick_results[0], (kicked_ip.into(), true, Ok(())));
+        assert_eq!(
+            batch.kick_results.back().unwrap().0,
+            format!("mock-{total}")
+        );
+        let empty = client.inbox.take();
+        assert!(
+            !empty.prompt_account && empty.manual_check.is_none() && empty.manual_update.is_none()
+        );
+        assert!(
+            empty.snapshot.is_none()
+                && empty.samples.into_points().is_empty()
+                && empty.logs.is_empty()
+        );
     }
 }

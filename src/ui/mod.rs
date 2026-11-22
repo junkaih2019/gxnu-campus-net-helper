@@ -12,7 +12,6 @@ mod widgets;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
@@ -24,8 +23,8 @@ use eframe::egui::{
 
 use crate::config::SettingsStore;
 use crate::credentials;
-use crate::ipc::{IpcClient, SnapshotEnvelope, UiToDaemon};
-use crate::metrics_store::{TelemetryPoint, TimeRange};
+use crate::ipc::{CheckResult, IpcClient, UiToDaemon, UpdateCheckResult};
+use crate::metrics_store::{SampleHistory, TelemetryPoint, TimeRange};
 use crate::models::{
     MonitorSnapshot, MonitorState, SelfServiceState, Settings, TrafficSummary, UpdateState,
     UpdateStatus,
@@ -46,7 +45,6 @@ use widgets::{
     secondary_button,
 };
 
-const MAX_TELEMETRY_POINTS: usize = 5000;
 const TITLEBAR_HEIGHT: f32 = 36.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,8 +57,6 @@ pub struct GuardDeps {
     pub store: SettingsStore,
     pub settings: Settings,
     pub ipc: IpcClient,
-    pub snapshots: Receiver<SnapshotEnvelope>,
-    pub logs: Receiver<String>,
     pub log_path: PathBuf,
     pub initial_logs: Vec<String>,
     pub initial_telemetry: Vec<TelemetryPoint>,
@@ -102,6 +98,37 @@ impl PendingCommand {
 
 fn needs_account_setup(configured: &str, stored: Option<&str>) -> bool {
     !stored.is_some_and(|id| !id.is_empty() && (configured.is_empty() || id == configured))
+}
+
+fn manual_feedback(
+    check: Option<CheckResult>,
+    update: Option<UpdateCheckResult>,
+) -> (bool, Option<(String, bool)>) {
+    let check = check.map(|result| match result {
+        CheckResult::Message(message) => (message, false),
+        CheckResult::Status(Some(crate::models::DisconnectReason::Online)) => {
+            ("检测完成：校园网正常".into(), false)
+        }
+        CheckResult::Status(reason) => {
+            let label = reason.map(|r| r.label()).unwrap_or("网络异常");
+            (format!("检测异常：{label}"), true)
+        }
+    });
+    let open_modal = matches!(update, Some(UpdateCheckResult::Available));
+    let update = match update {
+        Some(UpdateCheckResult::UpToDate) => {
+            Some((format!("当前已是最新版本（v{}）", crate::VERSION), false))
+        }
+        Some(UpdateCheckResult::Error(message)) => Some((format!("检查更新失败：{message}"), true)),
+        _ => None,
+    };
+    let toast = match (check, update) {
+        (Some((check, check_error)), Some((update, update_error))) => {
+            Some((format!("{check}\n{update}"), check_error || update_error))
+        }
+        (one, None) | (None, one) => one,
+    };
+    (open_modal, toast)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,9 +242,7 @@ pub struct GuardApp {
     store: SettingsStore,
     settings: Settings,
     ipc: IpcClient,
-    snapshots: Receiver<SnapshotEnvelope>,
     latest: Option<MonitorSnapshot>,
-    logs: Receiver<String>,
     log_lines: logs_page::LogLines,
     log_path: PathBuf,
     ui_prefs: UiPrefs,
@@ -229,7 +254,7 @@ pub struct GuardApp {
     account_menu_anchor: Option<Rect>,
     account_chip_clicked: bool,
     logs_state: logs_page::LogsState,
-    telemetry: Vec<TelemetryPoint>,
+    telemetry: SampleHistory,
     traffic: TrafficSummary,
     self_service: SelfServiceState,
     time_range: TimeRange,
@@ -245,15 +270,14 @@ pub struct GuardApp {
     recent_sessions_clicked: bool,
     update_state: UpdateState,
     update_modal_open: bool,
-    pending_manual_update_check: bool,
+    pending_manual_update_check: Option<u64>,
     last_check_seq: u64,
     last_check_unix: Option<i64>,
     online_since_unix: Option<i64>,
     toast: Option<(String, bool, Instant)>,
-    pending_manual_check: bool,
+    pending_manual_check: Option<u64>,
     pending: HashMap<u64, PendingCommand>,
     needs_setup: bool,
-    account_alert_opened: bool,
     trimmed_while_idle: bool,
     brand_icon: egui::TextureHandle,
     #[cfg(debug_assertions)]
@@ -349,9 +373,7 @@ impl GuardApp {
             store: deps.store,
             settings: deps.settings,
             ipc: deps.ipc,
-            snapshots: deps.snapshots,
             latest: None,
-            logs: deps.logs,
             log_lines: deps.initial_logs.into(),
             log_path: deps.log_path,
             ui_prefs,
@@ -363,7 +385,7 @@ impl GuardApp {
             account_menu_anchor: None,
             account_chip_clicked: false,
             logs_state: logs_page::LogsState::default(),
-            telemetry: deps.initial_telemetry,
+            telemetry: deps.initial_telemetry.into(),
             traffic: deps.initial_traffic,
             self_service: SelfServiceState::default(),
             time_range: TimeRange::H24,
@@ -382,15 +404,14 @@ impl GuardApp {
                 ..Default::default()
             },
             update_modal_open: open_update_from_env,
-            pending_manual_update_check: false,
+            pending_manual_update_check: None,
             last_check_seq: 0,
             last_check_unix: None,
             online_since_unix: None,
             toast: None,
-            pending_manual_check: false,
+            pending_manual_check: None,
             pending: HashMap::new(),
             needs_setup,
-            account_alert_opened: false,
             trimmed_while_idle: false,
             brand_icon,
             #[cfg(debug_assertions)]
@@ -519,13 +540,25 @@ impl GuardApp {
         };
         match result {
             Ok(id) => {
+                match pending.command {
+                    UiToDaemon::ForceCheck => self.pending_manual_check = Some(id),
+                    UiToDaemon::CheckUpdate { manual: true } => {
+                        self.pending_manual_update_check = Some(id)
+                    }
+                    _ => {}
+                }
                 self.pending.insert(id, pending);
             }
-            Err(err) => self.finish_command(pending, Err(err)),
+            Err(err) => self.finish_command(None, pending, Err(err)),
         }
     }
 
-    fn finish_command(&mut self, pending: PendingCommand, result: Result<(), String>) {
+    fn finish_command(
+        &mut self,
+        id: Option<u64>,
+        pending: PendingCommand,
+        result: Result<(), String>,
+    ) {
         if matches!(
             pending.command,
             UiToDaemon::ReloadSettings { start: true, .. }
@@ -534,8 +567,22 @@ impl GuardApp {
             self.needs_setup = false;
             self.view = AppView::Home;
         }
-        if matches!(pending.command, UiToDaemon::ForceCheck) && result.is_err() {
-            self.pending_manual_check = false;
+        if result.is_err() {
+            match &pending.command {
+                UiToDaemon::ForceCheck if self.pending_manual_check == id => {
+                    self.pending_manual_check = None
+                }
+                UiToDaemon::CheckUpdate { manual: true }
+                    if self.pending_manual_update_check == id =>
+                {
+                    self.pending_manual_update_check = None
+                }
+                UiToDaemon::KickDevice { ip, .. } => {
+                    self.kicking_ips.remove(ip);
+                    self.ipc.inbox.forget_kick(ip);
+                }
+                _ => {}
+            }
         }
         if let Some((message, error)) = pending.feedback(result) {
             self.show_toast(message, error);
@@ -1091,27 +1138,28 @@ impl GuardApp {
             }
         }
 
-        while let Ok((id, result)) = self.ipc.replies.try_recv() {
+        let batch = self.ipc.inbox.take();
+        for (id, result) in batch.replies {
             if let Some(pending) = self.pending.remove(&id) {
-                self.finish_command(pending, result);
+                self.finish_command(Some(id), pending, result);
             }
         }
-        let lost = self.ipc.connection_lost.load(Ordering::Acquire);
+        let lost = batch.connection_lost;
         let now = Instant::now();
         let expired: Vec<_> = self
             .pending
             .extract_if(|_, p| lost || p.deadline <= now)
-            .map(|(_, p)| p)
             .collect();
-        for pending in expired {
+        for (id, pending) in expired {
+            self.ipc.inbox.forget(id);
             let message = if lost {
                 "连接已断开，请重新打开主界面"
             } else {
                 "等待回执超时"
             };
-            self.finish_command(pending, Err(message.into()));
+            self.finish_command(Some(id), pending, Err(message.into()));
         }
-        while let Ok((ip, is_local, result)) = self.ipc.kick_results.try_recv() {
+        for (ip, is_local, result) in batch.kick_results {
             self.kicking_ips.remove(&ip);
             match result {
                 Ok(()) => {
@@ -1128,29 +1176,19 @@ impl GuardApp {
             }
         }
 
-        while let Ok(upd) = self.ipc.update_states.try_recv() {
-            if self.pending_manual_update_check && upd.status != UpdateStatus::Checking {
-                self.pending_manual_update_check = false;
-                match upd.status {
-                    UpdateStatus::Available => {
-                        self.update_modal_open = true;
-                    }
-                    UpdateStatus::UpToDate => {
-                        self.show_toast(format!("当前已是最新版本（v{}）", crate::VERSION), false);
-                    }
-                    UpdateStatus::Error => {
-                        self.show_toast(format!("检查更新失败：{}", upd.message), true);
-                    }
-                    _ => {}
-                }
-            }
-            self.update_state = upd;
-        }
-        if self.ipc.open_update_modal.swap(false, Ordering::AcqRel) {
-            self.update_modal_open = true;
+        let check = batch
+            .manual_check
+            .filter(|_| self.pending_manual_check.take().is_some());
+        let update = batch
+            .manual_update
+            .filter(|_| self.pending_manual_update_check.take().is_some());
+        let (available, toast) = manual_feedback(check, update);
+        self.update_modal_open |= available || batch.open_update_modal;
+        if let Some((message, error)) = toast {
+            self.show_toast(message, error);
         }
 
-        if self.ipc.open_account_settings.swap(false, Ordering::AcqRel) {
+        if batch.open_account_settings {
             self.settings = self.store.load();
             self.refresh_account_creds();
             self.account_menu_open = false;
@@ -1163,10 +1201,8 @@ impl GuardApp {
             }
         }
 
-        while let Ok(env) = self.snapshots.try_recv() {
+        if let Some(env) = batch.snapshot {
             let snapshot = env.snapshot;
-            self.online_since_unix = env.online_since_unix;
-            self.last_check_unix = env.last_check_unix;
             self.traffic = env.traffic;
             self.self_service = env.self_service;
             if env.update.status != UpdateStatus::Idle
@@ -1197,31 +1233,24 @@ impl GuardApp {
                     TrafficViewMode::default_for_carrier(&self.settings.carrier);
             }
 
-            if snapshot.metrics.check_seq > self.last_check_seq {
+            if snapshot.metrics.check_seq >= self.last_check_seq {
                 self.last_check_seq = snapshot.metrics.check_seq;
-                if self.pending_manual_check && snapshot.state != MonitorState::Checking {
-                    self.pending_manual_check = false;
-                    if snapshot.metrics.last_point.is_none() && snapshot.reason.is_none() {
-                        self.show_toast(&snapshot.message, false);
-                    } else if snapshot.reason == Some(crate::models::DisconnectReason::Online) {
-                        self.show_toast("检测完成：校园网正常", false);
-                    } else {
-                        let reason = snapshot.reason.map(|r| r.label()).unwrap_or("网络异常");
-                        self.show_toast(format!("检测异常：{reason}"), true);
-                    }
-                }
+                self.online_since_unix = env.online_since_unix;
+                self.last_check_unix = env.last_check_unix;
+                self.latest = Some(snapshot);
             }
-            if let Some(point) = &snapshot.metrics.last_point {
-                merge_sample(&mut self.telemetry, point);
-            }
-            if prompt_account(&snapshot, &mut self.account_alert_opened) {
-                self.view = AppView::Settings;
-                self.form.tab = settings_page::SettingsTab::Account;
-            }
-            self.latest = Some(snapshot);
         }
-
-        while let Ok(line) = self.logs.try_recv() {
+        if let Some(update) = batch.update {
+            self.update_state = update;
+        }
+        if batch.prompt_account {
+            self.view = AppView::Settings;
+            self.form.tab = settings_page::SettingsTab::Account;
+        }
+        for point in batch.samples.into_points() {
+            self.telemetry.push(point);
+        }
+        for line in batch.logs {
             self.log_lines.push(line);
         }
     }
@@ -1480,7 +1509,7 @@ impl GuardApp {
                         });
 
                         // 第二行：本机真实校园网 IP + 巡检倒计时与最近检测，异常时直接显示可读故障说明
-                        let meta_text = if self.ipc.connection_lost.load(Ordering::Acquire) {
+                        let meta_text = if self.ipc.inbox.connection_lost() {
                             "与守护进程的连接已断开，请重新打开主界面".to_string()
                         } else if state == Some(MonitorState::Online) {
                             let mut parts: Vec<String> = Vec::new();
@@ -1522,7 +1551,6 @@ impl GuardApp {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.spacing_mut().item_spacing.x = 7.0;
                         if primary_button(ui, p, Some(Icon::Refresh), "立即检测").clicked() {
-                            self.pending_manual_check = true;
                             self.show_toast("正在检测校园网连接…", false);
                             self.request(UiToDaemon::ForceCheck, None);
                         }
@@ -2596,45 +2624,11 @@ fn draw_titlebar_update_pill(ui: &mut egui::Ui, p: &Palette, label: &str) -> egu
     resp
 }
 
-fn prompt_account(snapshot: &MonitorSnapshot, opened: &mut bool) -> bool {
-    if matches!(
-        snapshot.state,
-        MonitorState::Online | MonitorState::Paused | MonitorState::Stopped
-    ) {
-        *opened = false;
-    }
-    snapshot.state == MonitorState::Offline
-        && snapshot.reason.is_some_and(|r| r.needs_account())
-        && !std::mem::replace(opened, true)
-}
-
-fn merge_sample(history: &mut Vec<TelemetryPoint>, point: &TelemetryPoint) {
-    let existing = history
-        .iter_mut()
-        .rev()
-        .take_while(|old| old.ts >= point.ts)
-        .find(|old| {
-            if point.sample_id.is_some() {
-                old.sample_id == point.sample_id
-            } else {
-                *old == point
-            }
-        });
-    if let Some(old) = existing {
-        *old = point.clone();
-    } else {
-        history.push(point.clone());
-        if history.len() > MAX_TELEMETRY_POINTS {
-            history.drain(..history.len() - MAX_TELEMETRY_POINTS);
-        }
-    }
-}
-
 impl eframe::App for GuardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_channels();
 
-        if self.ipc.daemon_closed.load(Ordering::Relaxed) {
+        if self.ipc.inbox.daemon_closed() {
             ctx.send_viewport_cmd(ViewportCommand::Close);
             return;
         }
@@ -2770,7 +2764,12 @@ impl eframe::App for GuardApp {
                         }
 
                         // Tier 3: 通栏紧凑「连接稳定性」胶囊时间轴（位于流量/设备双卡之下、运行日志之上）
-                        charts::draw_stability_strip(ui, &p, &self.telemetry, &mut self.time_range);
+                        charts::draw_stability_strip(
+                            ui,
+                            &p,
+                            self.telemetry.as_slice(),
+                            &mut self.time_range,
+                        );
 
                         // 中下可自由拖拽的横向分隔条（双击恢复默认）
                         if let Some((ss_h, min_ss, max_ss)) = ss_h_opt {
@@ -2880,7 +2879,6 @@ impl eframe::App for GuardApp {
                     );
                 }
                 if actions.check_update {
-                    self.pending_manual_update_check = true;
                     self.show_toast("正在连接 GitHub 检查新版本…", false);
                     self.request(UiToDaemon::CheckUpdate { manual: true }, None);
                 }
@@ -3139,27 +3137,26 @@ mod workflow_tests {
     use crate::models::DisconnectReason;
 
     #[test]
-    fn first_run_respects_shared_credentials_and_account_alerts_open_once() {
+    fn first_run_respects_shared_credentials() {
         assert!(needs_account_setup("", None));
         assert!(needs_account_setup("fake-other", Some("fake-student")));
         assert!(!needs_account_setup("", Some("fake-student")));
         assert!(!needs_account_setup("fake-student", Some("fake-student")));
-        let mut opened = false;
-        let rejected = MonitorSnapshot::new(
-            MonitorState::Offline,
-            Some(DisconnectReason::LoginRejected),
-            "",
-            true,
+    }
+
+    #[test]
+    fn simultaneous_manual_results_both_reach_the_ui() {
+        let online = || Some(CheckResult::Status(Some(DisconnectReason::Online)));
+        let (modal, toast) =
+            manual_feedback(online(), Some(UpdateCheckResult::Error("模拟错误".into())));
+        assert!(!modal);
+        assert_eq!(
+            toast,
+            Some(("检测完成：校园网正常\n检查更新失败：模拟错误".into(), true))
         );
-        let checking = MonitorSnapshot::new(MonitorState::Checking, None, "", true);
-        assert!(prompt_account(&rejected, &mut opened));
-        assert!(!prompt_account(&checking, &mut opened));
-        assert!(!prompt_account(&rejected, &mut opened));
-        assert!(!prompt_account(
-            &MonitorSnapshot::new(MonitorState::Online, None, "", true),
-            &mut opened
-        ));
-        assert!(prompt_account(&rejected, &mut opened));
+        let (modal, toast) = manual_feedback(online(), Some(UpdateCheckResult::Available));
+        assert!(modal);
+        assert_eq!(toast, Some(("检测完成：校园网正常".into(), false)));
     }
 
     #[test]
@@ -3186,16 +3183,17 @@ mod workflow_tests {
 
     #[test]
     fn one_latency_update_replaces_its_initial_sample_and_keeps_same_second_checks() {
-        let mut history = Vec::new();
+        let mut history = SampleHistory::default();
         let mut point = TelemetryPoint::check(100, 0, true, "ONLINE");
         point.sample_id = Some("mock-1".into());
-        merge_sample(&mut history, &point);
+        history.push(point.clone());
         point.ms = 42;
-        merge_sample(&mut history, &point);
+        history.push(point.clone());
         point.sample_id = Some("mock-2".into());
-        merge_sample(&mut history, &point);
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0].ms, 42);
+        history.push(point.clone());
+        let points = history.as_slice();
+        assert_eq!(points.len(), 2);
+        assert_eq!(points[0].ms, 42);
     }
 
     #[test]

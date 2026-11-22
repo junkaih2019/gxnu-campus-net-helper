@@ -14,7 +14,7 @@ use crate::authenticator::CampusAuthenticator;
 use crate::credentials::StoredCredential;
 use crate::diagnostics::{log_diagnostic, NetworkDiagnostics, RoutePath};
 use crate::logging;
-use crate::metrics_store::{MetricsStore, TelemetryPoint};
+use crate::metrics_store::{MetricsStore, SampleId, TelemetryPoint};
 use crate::models::{
     DiagnosticPipeline, DiagnosticResult, DisconnectReason, MonitorMetrics, MonitorSnapshot,
     MonitorState, Settings, StepState,
@@ -126,7 +126,7 @@ struct Shared {
     control: Mutex<ControlState>,
     wake_cv: Condvar,
     latency_jobs: mpsc::SyncSender<(u64, u64)>,
-    sample_prefix: String,
+    sample_epoch: i64,
     now: Box<dyn Fn() -> Instant + Send + Sync>,
 }
 
@@ -473,11 +473,7 @@ impl NetworkMonitor {
         let shared = Arc::new(Shared {
             now: Box::new(now),
             latency_jobs,
-            sample_prefix: format!(
-                "{}-{}",
-                std::process::id(),
-                chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
-            ),
+            sample_epoch: chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
             diagnostics: Box::new(diagnostics),
             authenticator,
             credentials,
@@ -654,7 +650,11 @@ impl Shared {
         }
         let mut point =
             TelemetryPoint::check(now.timestamp(), 0, result.online, result.reason.as_str());
-        point.sample_id = Some(format!("{}-{seq}", self.sample_prefix));
+        point.sample_id = Some(SampleId::generated(
+            std::process::id(),
+            self.sample_epoch,
+            seq,
+        ));
         point.confirmed_offline = Some(kind == SampleKind::ConfirmedOffline);
         metrics.last_point = Some(point.clone());
         if result.online {
@@ -1835,10 +1835,13 @@ mod tests {
         assert_eq!(opened.load(Ordering::SeqCst), 1);
 
         let ep = server.endpoint();
-        let (mut client, _snapshots, _logs) = IpcClient::connect(ep.port, &ep.token).unwrap();
+        let mut client = IpcClient::connect(ep.port, &ep.token).unwrap();
         let mut request = |cmd| {
             let id = client.send(cmd).unwrap();
-            let (reply_id, result) = client.replies.recv_timeout(ipc::COMMAND_TIMEOUT).unwrap();
+            let (reply_id, result) = client
+                .inbox
+                .recv_reply_timeout(ipc::COMMAND_TIMEOUT)
+                .unwrap();
             assert_eq!(reply_id, id);
             result
         };

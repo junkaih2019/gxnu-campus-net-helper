@@ -2,9 +2,13 @@
 //!
 //! - 每次网络巡检与认证结果追加写入 `%LOCALAPPDATA%\GXNUCampusLogin\metrics.jsonl`
 //! - 启动时自动从现有 `app.log` / `app.log.1` 回填历史记录，首次打开即有曲线
-//! - 自动保留最近 48 小时（上限 5000 条），文件体积极小
+//! - 历史读取严格保留最近 48 小时、至多 5000 条；守护进程按水位批量修剪文件
 
-use std::collections::HashSet;
+#[path = "metrics_store/point.rs"]
+mod point;
+pub use point::{SampleId, TelemetryCode};
+
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -14,7 +18,9 @@ use chrono::{Local, NaiveDateTime, TimeZone};
 use serde::{Deserialize, Serialize};
 
 const RETENTION_SECS: i64 = 48 * 3600;
-const MAX_STORED_POINTS: usize = 5000;
+pub const MAX_STORED_POINTS: usize = 5000;
+const TRIM_BATCH: usize = 256;
+const TRIM_GRACE_SECS: i64 = 3600;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeRange {
@@ -66,7 +72,7 @@ impl TimeRange {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TelemetryPoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sample_id: Option<String>,
+    pub sample_id: Option<SampleId>,
     /// Unix 时间戳（秒）。
     pub ts: i64,
     /// 门户的 HTTP 往返耗时（毫秒）。0 表示缺测或不适用。
@@ -77,18 +83,18 @@ pub struct TelemetryPoint {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirmed_offline: Option<bool>,
     /// 状态或断网原因码（例如 `ONLINE`、`AUTH_EXPIRED`、`INTERNET_TIMEOUT`）。
-    pub reason: String,
+    pub reason: TelemetryCode,
     /// 事件类型：`check` / `login_ok` / `login_fail`。
     #[serde(default = "default_event")]
-    pub event: String,
+    pub event: TelemetryCode,
 }
 
-fn default_event() -> String {
-    "check".to_string()
+fn default_event() -> TelemetryCode {
+    "check".into()
 }
 
 impl TelemetryPoint {
-    pub fn check(ts: i64, ms: u64, online: bool, reason: impl Into<String>) -> Self {
+    pub fn check(ts: i64, ms: u64, online: bool, reason: impl Into<TelemetryCode>) -> Self {
         Self {
             sample_id: None,
             ts,
@@ -96,11 +102,11 @@ impl TelemetryPoint {
             online,
             confirmed_offline: None,
             reason: reason.into(),
-            event: "check".to_string(),
+            event: default_event(),
         }
     }
 
-    pub fn auth_event(ts: i64, success: bool, reason: impl Into<String>) -> Self {
+    pub fn auth_event(ts: i64, success: bool, reason: impl Into<TelemetryCode>) -> Self {
         Self {
             sample_id: None,
             ts,
@@ -108,7 +114,7 @@ impl TelemetryPoint {
             online: success,
             confirmed_offline: None,
             reason: reason.into(),
-            event: if success { "login_ok" } else { "login_fail" }.to_string(),
+            event: if success { "login_ok" } else { "login_fail" }.into(),
         }
     }
 
@@ -134,6 +140,66 @@ impl TelemetryPoint {
             .single()
             .map(|dt| dt.format("%m-%d %H:%M").to_string())
             .unwrap_or_else(|| "-- --:--".to_string())
+    }
+}
+
+/// Arrival order stays stable when a later snapshot supplies a sample's latency.
+#[derive(Default)]
+pub struct SampleHistory {
+    points: VecDeque<TelemetryPoint>,
+    by_id: HashMap<SampleId, usize>,
+    front: usize,
+}
+
+impl SampleHistory {
+    pub fn push(&mut self, point: TelemetryPoint) {
+        if let Some(id) = &point.sample_id {
+            if let Some(&slot) = self.by_id.get(id) {
+                self.points[slot.wrapping_sub(self.front)] = point;
+                return;
+            }
+        } else if self.points.iter().rev().any(|old| old == &point) {
+            return;
+        }
+        self.append(point);
+    }
+
+    fn append(&mut self, point: TelemetryPoint) {
+        if self.points.len() == MAX_STORED_POINTS {
+            let first = self.points.pop_front().unwrap();
+            if let Some(id) = first.sample_id {
+                self.by_id.remove(&id);
+            }
+            self.front = self.front.wrapping_add(1);
+        }
+        if let Some(id) = &point.sample_id {
+            self.by_id
+                .insert(id.clone(), self.front.wrapping_add(self.points.len()));
+        }
+        self.points.push_back(point);
+    }
+
+    pub fn into_points(self) -> VecDeque<TelemetryPoint> {
+        self.points
+    }
+
+    pub fn as_slice(&mut self) -> &[TelemetryPoint] {
+        self.points.make_contiguous()
+    }
+}
+
+impl From<Vec<TelemetryPoint>> for SampleHistory {
+    fn from(points: Vec<TelemetryPoint>) -> Self {
+        let mut history = Self::default();
+        for point in points {
+            if point.sample_id.is_some() {
+                history.push(point);
+            } else {
+                // Legacy files may contain distinct checks with identical fields in the same second.
+                history.append(point);
+            }
+        }
+        history
     }
 }
 
@@ -226,12 +292,21 @@ impl MetricsStore {
     }
 
     fn maintain(&self, point: Option<&TelemetryPoint>) -> io::Result<()> {
-        let now = Local::now().timestamp();
+        self.maintain_at(point, Local::now().timestamp())
+    }
+
+    fn maintain_at(&self, point: Option<&TelemetryPoint>, now: i64) -> io::Result<()> {
         let cutoff = now - RETENTION_SECS;
         let mut state = self.bounds.lock().unwrap();
-        let point = point.filter(|p| p.ts >= cutoff);
         if let (Some(bounds), Some(p)) = (state.as_mut(), point) {
-            if bounds.count < MAX_STORED_POINTS && bounds.oldest.is_none_or(|ts| ts >= cutoff) {
+            if bounds.count < MAX_STORED_POINTS + TRIM_BATCH
+                && bounds
+                    .oldest
+                    .is_none_or(|ts| ts >= cutoff - TRIM_GRACE_SECS)
+            {
+                if p.ts < cutoff {
+                    return Ok(());
+                }
                 let mut file = OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -248,14 +323,14 @@ impl MetricsStore {
             }
         }
 
+        let point = point.filter(|p| p.ts >= cutoff);
         let dir = self.path.parent().expect("metrics file has a parent");
         fs::create_dir_all(dir)?;
         let mut points = read_jsonl(&self.path)?;
         let original_len = points.len();
         let mut changed = point.is_some() || (state.is_none() && self.path.exists());
         if state.is_none() {
-            let mut seen: HashSet<(String, i64)> =
-                points.iter().map(|p| (p.event.clone(), p.ts)).collect();
+            let mut seen: HashSet<_> = points.iter().map(|p| (p.event.clone(), p.ts)).collect();
             for p in parse_history_from_logs(&dir.join("logs/app.log"), cutoff) {
                 if !(-2..=2)
                     .any(|offset| seen.contains(&(p.event.clone(), p.ts.saturating_add(offset))))
@@ -300,10 +375,13 @@ fn read_jsonl(path: &Path) -> io::Result<Vec<TelemetryPoint>> {
         other => other?,
     };
     let mut points = Vec::new();
-    for line in BufReader::new(file).lines() {
-        if let Ok(p) = serde_json::from_str(&line?) {
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    while reader.read_line(&mut line)? != 0 {
+        if let Ok(p) = serde_json::from_str(&line) {
             points.push(p);
         }
+        line.clear();
     }
     Ok(points)
 }
@@ -832,22 +910,71 @@ mod tests {
     fn daemon_retains_only_recent_5000_points_and_ui_read_is_read_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metrics.jsonl");
-        let now = Local::now().timestamp();
+        let now = Local::now().timestamp() - TRIM_BATCH as i64;
         let sample = |ts| TelemetryPoint::check(ts, 1, true, "ONLINE");
         let mut file = BufWriter::new(fs::File::create(&path).unwrap());
-        for ts in std::iter::once(now - RETENTION_SECS - 5).chain(now - 5000..now) {
+        for ts in std::iter::once(now - RETENTION_SECS - 5).chain(now - 5001..now) {
             writeln!(file, "{}", serde_json::to_string(&sample(ts)).unwrap()).unwrap();
         }
         drop(file);
         let store = MetricsStore::new(dir.path());
-        store.append(&sample(now));
+        let startup = read_jsonl(&path).unwrap();
+        assert_eq!(startup.len(), MAX_STORED_POINTS);
+        assert_eq!(startup[0].ts, now - 5000);
+
+        // A blank line survives every plain append and disappears on the next JSONL rewrite.
+        let mut file = OpenOptions::new().append(true).open(&path).unwrap();
+        file.write_all(b"   \n").unwrap();
+        drop(file);
+        let original = fs::read(&path).unwrap();
+        for n in 0..TRIM_BATCH {
+            store.append(&sample(now + n as i64));
+        }
+        let before = fs::read(&path).unwrap();
+        assert!(before.starts_with(&original));
+        assert_eq!(
+            read_jsonl(&path).unwrap().len(),
+            MAX_STORED_POINTS + TRIM_BATCH
+        );
+        let history = MetricsStore::history(dir.path());
+        assert_eq!(history.len(), MAX_STORED_POINTS);
+        assert_eq!(history[0].ts, now - 5000 + TRIM_BATCH as i64);
+        assert_eq!(history.last().unwrap().ts, now + TRIM_BATCH as i64 - 1);
+        assert_eq!(fs::read(&path).unwrap(), before);
+
+        store.append(&sample(now + TRIM_BATCH as i64));
         let saved = read_jsonl(&path).unwrap();
         assert_eq!(saved.len(), MAX_STORED_POINTS);
-        assert_eq!(saved[0].ts, now - 4999);
-        assert_eq!(saved.last().unwrap().ts, now);
+        assert_eq!(saved[0].ts, history[0].ts + 1);
+        assert_eq!(saved.last().unwrap().ts, now + TRIM_BATCH as i64);
+        assert!(!fs::read(&path).unwrap().starts_with(&original));
+    }
+
+    #[test]
+    fn age_watermark_keeps_appends_cheap_until_grace_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metrics.jsonl");
+        let now = Local::now().timestamp();
+        let first = TelemetryPoint::check(now - RETENTION_SECS - 10, 1, true, "ONLINE");
+        let store = MetricsStore::new(dir.path());
+        store.maintain_at(Some(&first), now - 10).unwrap();
+        let original = fs::read(&path).unwrap();
+        let mut point = TelemetryPoint::check(now, 2, true, "ONLINE");
+        for n in 0..200 {
+            point.ts = now + n;
+            store.maintain_at(Some(&point), point.ts).unwrap();
+        }
         let before = fs::read(&path).unwrap();
-        assert_eq!(MetricsStore::history(dir.path()).len(), MAX_STORED_POINTS);
-        assert_eq!(fs::read(path).unwrap(), before);
+        assert!(before.starts_with(&original));
+        let history = MetricsStore::history(dir.path());
+        assert_eq!(history.len(), 200);
+        assert_eq!(history[0].ts, now);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let threshold = first.ts + RETENTION_SECS + TRIM_GRACE_SECS;
+        store.maintain_at(Some(&point), threshold).unwrap();
+        assert!(fs::read(&path).unwrap().starts_with(&original));
+        store.maintain_at(Some(&point), threshold + 1).unwrap();
+        assert_eq!(read_jsonl(&path).unwrap()[0].ts, now);
     }
 
     #[test]
