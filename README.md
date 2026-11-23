@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="docs/images/app-icon.png" width="88" height="88" alt="GXNU 校园网守护助手图标">
+  <img src="docs/images/app-icon-v2-qinglan.png" width="88" height="88" alt="GXNU 校园网守护助手图标">
 </p>
 <h1 align="center">GXNU 校园网守护助手</h1>
-<p align="center">广西师范大学校园网（Dr.COM）Windows 轻量托盘工具 —— 断网自动重连、流量与在线设备管理、多账号一键切换</p>
+<p align="center">广西师范大学校园网（Dr.COM）Windows 轻量托盘工具 —— 育才/雁山/王城三校区自动重连、流量与在线设备管理、多账号一键切换</p>
 <p align="center"><strong>简体中文</strong> · <a href="README.en.md">English</a></p>
 <p align="center">
   <a href="https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest"><strong>⬇️ 下载 Windows x64 单文件版</strong></a>
@@ -12,7 +12,7 @@
   &nbsp;·&nbsp; <a href="LICENSE">MIT 许可证</a>
 </p>
 <p align="center">
-  <sub>Windows 10 / 11 x64 · 绿色单文件免安装 · 支持应用内自动更新 · 支持校园网 / 电信 / 联通 / 移动 / 广电出口</sub>
+  <sub>Windows 10 / 11 x64 · 绿色单文件免安装 · 育才 / 雁山 / 王城三校区通用 · 支持校园网 / 电信 / 联通 / 移动 / 广电出口</sub>
 </p>
 
 ---
@@ -71,7 +71,7 @@
 
 ## 💡 核心功能与优势
 
-- 🔄 **断网无感重连**：自动监测网络状态，睡眠唤醒、插拔网线、切换 Wi-Fi 或认证过期时秒级自动重登；错误原因全中文直观提示。
+- 🔄 **三校区断网无感重连**：支持**育才 / 雁山 / 王城**多校区认证网关自动探测与跨校区无感切换（亦可手动指定或自定义网关）；睡眠唤醒、插拔网线、切换 Wi-Fi 或认证过期时秒级自动重登，错误原因全中文直观提示。
 - 📊 **流量与在线设备管理**：直连校园网自助服务，一键切换 **运营商实际吞吐 / 校园网套餐余量**；实时展示在线终端与近期上网记录浮层，支持在主界面或托盘浮窗**一键注销占线设备**。
 - ⚡ **托盘左键快捷浮窗**：单击任务栏图标秒弹原生圆角浮窗，无需打开主窗口即可切账号、看流量、踢占线设备与查看连接稳定性。
 - 👥 **多账号 / 双出口秒切 & 防封保护**：支持一键生成共享密码的「宽带 + 校园网」双出口、同号免输新增出口与改密自动同步（保存前自动无损验密）；切换到「校园网」出口前自动提醒关闭 VPN / 代理，防止账号被封禁。
@@ -83,7 +83,7 @@
 
 ## 🚀 快速开始
 
-1. **下载运行**：前往 [Releases](https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest) 下载最新单文件 **`gxnu-campus-net-helper-v0.2.5.exe`**，放入**固定文件夹**后直接双击运行（免安装、免解压）。
+1. **下载运行**：前往 [Releases](https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest) 下载最新单文件 **`gxnu-campus-net-helper-v0.2.6.exe`**，放入**固定文件夹**后直接双击运行（免安装、免解压）。
    > 💡 首次运行若弹出 Windows SmartScreen 提示，点击 **更多信息 → 仍要运行** 即可（个人开源单文件未附商业代码签名，可通过随附 `SHA256SUMS.txt` 校验完整性）。
 2. **添加账号**：首次启动会自动打开 **设置 → 账号管理**，在左侧填入校园网学号与密码，右侧点选出口（`校园网 / 电信 / 联通 / 移动 / 广电`，选运营商时可勾选同时生成「校园网」快捷切换项），点击 **验证并添加账号** 即可开始守护；后续为同一学号补充其他出口无需重复输入账密。
 3. **日常使用**：

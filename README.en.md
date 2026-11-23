@@ -1,8 +1,8 @@
 <p align="center">
-  <img src="docs/images/app-icon.png" width="88" height="88" alt="GXNU Campus Network Helper icon">
+  <img src="docs/images/app-icon-v2-qinglan.png" width="88" height="88" alt="GXNU Campus Network Helper icon">
 </p>
 <h1 align="center">GXNU Campus Network Helper</h1>
-<p align="center">A lightweight Windows tray app for Guangxi Normal University’s Dr.COM campus network — auto-reconnect, live traffic & device management, and 1-click multi-account switching</p>
+<p align="center">A lightweight Windows tray app for Guangxi Normal University’s Dr.COM campus network — multi-campus auto-reconnect (Yucai / Yanshan / Wangcheng), live traffic & device management, and 1-click multi-account switching</p>
 <p align="center"><a href="README.md">简体中文</a> · <strong>English</strong></p>
 <p align="center">
   <a href="https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest"><strong>⬇️ Download Portable Windows x64 (.exe)</strong></a>
@@ -12,7 +12,7 @@
   &nbsp;·&nbsp; <a href="LICENSE">MIT License</a>
 </p>
 <p align="center">
-  <sub>Windows 10 / 11 x64 · Single portable executable · Built-in auto-update · Supports Campus / Telecom / Unicom / Mobile / Broadnet exits</sub>
+  <sub>Windows 10 / 11 x64 · Single portable executable · Yucai / Yanshan / Wangcheng multi-campus · Supports Campus / Telecom / Unicom / Mobile / Broadnet exits</sub>
 </p>
 
 ---
@@ -71,7 +71,7 @@
 
 ## 💡 Key Features
 
-- 🔄 **Seamless Auto-Reconnect**: Automatically detects drops and signs back in after sleep/wake, Wi-Fi switches, or session timeouts, with clear human-readable diagnostics.
+- 🔄 **Multi-Campus Auto-Reconnect**: Automatically discovers and switches across **Yucai / Yanshan / Wangcheng** Dr.COM gateways (with manual & custom gateway overrides), signing back in after sleep/wake, Wi-Fi switches, or session timeouts with clear diagnostics.
 - 📊 **Live Traffic & Device Sign-Out**: Syncs with GXNU Self-Service to toggle **Carrier throughput / Campus quota**, inspect recent session history, deduplicate dual-BRAS sessions, and **sign out (`注销`) occupying devices** in one click.
 - ⚡ **Instant Left-click Tray Flyout**: Single-click the tray icon for a minimalist native flyout to switch accounts, inspect traffic, sign out devices, and check stability without opening the main window.
 - 👥 **Dual-Exit Setup, Multi-Account Switch & VPN Guard**: Pair Carrier + Campus (`校园网`) exits in one click, add extra exits for the same student ID without retyping credentials, and auto-sync password updates across peer exits; warns to close VPN/proxy software before switching to the Campus exit.
@@ -83,7 +83,7 @@
 
 ## 🚀 Quick Start
 
-1. **Download & Run**: Grab **`gxnu-campus-net-helper-v0.2.5.exe`** from [Releases](https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest), place it in a **permanent folder**, and run it directly (no installer or extraction needed).
+1. **Download & Run**: Grab **`gxnu-campus-net-helper-v0.2.6.exe`** from [Releases](https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest), place it in a **permanent folder**, and run it directly (no installer or extraction needed).
    > 💡 If Windows SmartScreen appears on first launch, click **More info → Run anyway** (you can verify the hash against `SHA256SUMS.txt` on the release page).
 2. **Add Account**: Enter your student ID and password on the left, select your exit (`校园网 / 电信 / 联通 / 移动 / 广电`) on the right — optionally keeping **同时生成「校园网」快捷切换项** checked to pair both exits at once — and click **验证并添加账号 (Verify & Add)**; adding extra exits for the same student ID later requires no password re-entry.
 3. **Everyday Use**:
