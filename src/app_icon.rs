@@ -424,8 +424,8 @@ fn sample_qinglan_jade_icon(
     tray_state: Option<MonitorState>,
     geom: &EmblemGeometry,
 ) -> (f32, f32, f32, f32) {
-    // 512 画布中的大圆角矩形：x,y ∈ [18, 494], rx = 112
-    let box_sdf = sd_rounded_box(sx - 256.0, sy - 256.0, 238.0, 238.0, 112.0);
+    // 512 画布满幅圆角方框：x,y ∈ [0, 512], rx = 116（与 Windows 托盘/任务栏主流应用 100% 等大对齐）
+    let box_sdf = sd_rounded_box(sx - 256.0, sy - 256.0, 256.0, 256.0, 116.0);
     if box_sdf > 1.5 {
         return (0.0, 0.0, 0.0, 0.0);
     }
@@ -466,7 +466,7 @@ fn sample_qinglan_jade_icon(
         ),
     };
 
-    let bg_t = project_grad(sx, sy, 52.0, 24.0, 456.0, 488.0);
+    let bg_t = project_grad(sx, sy, 36.0, 8.0, 476.0, 504.0);
     let (mut cr, mut cg, mut cb) = if bg_t < 0.48 {
         lerp3(bg_c0, bg_c1, bg_t / 0.48)
     } else {
@@ -475,7 +475,7 @@ fn sample_qinglan_jade_icon(
 
     // 2. 右上日月天际柔光晕
     if !is_paused {
-        let glow_d = (sx - 368.0).hypot(sy - 132.0) / 195.0;
+        let glow_d = (sx - 375.0).hypot(sy - 134.0) / 210.0;
         if glow_d < 1.0 {
             let (gr, gg, gb, ga) = match tray_state {
                 None
@@ -494,9 +494,9 @@ fn sample_qinglan_jade_icon(
         }
     }
 
-    // 映射到 1.08× 放大的图腾局部坐标系：transform="translate(256 266) scale(1.08) translate(-256 -248)"
-    let gx = (sx - 256.0) / 1.08 + 256.0;
-    let gy = (sy - 266.0) / 1.08 + 248.0;
+    // 随外框 238→256 等比放大内部山城图腾（1.08 → 1.165），保持饱满视觉占比
+    let gx = (sx - 256.0) / 1.165 + 256.0;
+    let gy = (sy - 267.0) / 1.165 + 248.0;
 
     // 3. 右上太阳 / 5 态圆日与弦月
     let orb_sdf = if tray_state.is_none() {
@@ -695,7 +695,7 @@ fn sample_qinglan_jade_icon(
     // 9. 圆角方框玻璃高光内描边
     if box_sdf > -5.5 {
         let rim = smoothstep(-5.5, -1.5, box_sdf) * smoothstep(0.5, -1.5, box_sdf);
-        let top_bias = ((380.0 - sy) / 360.0).clamp(0.22, 1.0);
+        let top_bias = ((408.0 - sy) / 390.0).clamp(0.22, 1.0);
         let rim_a = 0.36 * top_bias * rim;
         cr = mix(cr, 255.0, rim_a);
         cg = mix(cg, 255.0, rim_a);
@@ -829,9 +829,25 @@ mod tests {
             MonitorState::Offline,
             MonitorState::Paused,
         ] {
-            let rgba = render_icon_rgba(Some(state), 24);
-            assert_eq!(rgba.len(), 24 * 24 * 4);
+            let rgba = render_icon_rgba(Some(state), 28);
+            assert_eq!(rgba.len(), 28 * 28 * 4);
             assert!(rgba.as_chunks::<4>().0.iter().any(|px| px[3] == 255));
+            // 四边中点像素 100% 满幅贴边（28×28 占满全高全宽，与托盘相邻图标严格对齐），四角圆角外透明
+            assert_eq!(rgba[(14 * 4) + 3], 255);
+            assert_eq!(rgba[((27 * 28 + 14) * 4) + 3], 255);
+            assert_eq!(rgba[((14 * 28) * 4) + 3], 255);
+            assert_eq!(rgba[((14 * 28 + 27) * 4) + 3], 255);
+            assert_eq!(rgba[3], 0);
+            assert_eq!(rgba[(27 * 4) + 3], 0);
+        }
+
+        if let Ok(out_dir) = std::env::var("GXNU_DUMP_ICO_FRAMES") {
+            let dir = std::path::Path::new(&out_dir);
+            std::fs::create_dir_all(dir).unwrap();
+            for sz in [16u32, 24, 32, 48, 64, 128, 256] {
+                let buf = render_icon_rgba(None, sz);
+                std::fs::write(dir.join(format!("frame_{sz}.rgba")), &buf).unwrap();
+            }
         }
     }
 }

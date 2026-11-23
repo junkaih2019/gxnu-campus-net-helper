@@ -24,13 +24,14 @@ pub enum TrayAction {
 
 pub struct TrayUi {
     icon: TrayIcon,
-    last_key: Option<(MonitorState, String)>,
+    last_key: Option<(MonitorState, u32, String)>,
 }
 
 impl TrayUi {
     pub fn new() -> Result<Self, String> {
+        let size = native_tray_icon_size();
         let icon = TrayIconBuilder::new()
-            .with_icon(state_icon(MonitorState::Paused)?)
+            .with_icon(state_icon(MonitorState::Paused, size)?)
             .with_tooltip(format!("{}：启动中", crate::APP_NAME))
             .build()
             .map_err(|err| format!("创建托盘图标失败：{err}"))?;
@@ -41,15 +42,16 @@ impl TrayUi {
         })
     }
 
-    /// 状态或文案变化时才刷新托盘图标与悬停提示，避免无谓重绘。
+    /// 状态、系统托盘物理像素尺寸或文案变化时才刷新托盘图标与悬停提示，避免无谓重绘。
     pub fn apply(&mut self, snapshot: &MonitorSnapshot) {
-        let key = (snapshot.state, snapshot.message.clone());
+        let size = native_tray_icon_size();
+        let key = (snapshot.state, size, snapshot.message.clone());
         if self.last_key.as_ref() == Some(&key) {
             return;
         }
         self.last_key = Some(key);
         let title = state_title(snapshot.state);
-        if let Ok(icon) = state_icon(snapshot.state) {
+        if let Ok(icon) = state_icon(snapshot.state, size) {
             let _ = self.icon.set_icon(Some(icon));
         }
         let tooltip = format!("{}：{title}", crate::APP_NAME);
@@ -110,9 +112,18 @@ fn state_title(state: MonitorState) -> &'static str {
     }
 }
 
-/// 生成 64×64 柔和圆角矩形 Wi-Fi 托盘图标（随监控状态实时更新右下角状态圆点与色板）。
-fn state_icon(state: MonitorState) -> Result<Icon, String> {
-    const SIZE: u32 = 64;
-    let rgba = crate::app_icon::render_icon_rgba(Some(state), SIZE);
-    Icon::from_rgba(rgba, SIZE, SIZE).map_err(|err| format!("生成托盘图标失败：{err}"))
+fn native_tray_icon_size() -> u32 {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_CXSMICON};
+    let raw = unsafe { GetSystemMetrics(SM_CXSMICON) };
+    if (16..=128).contains(&raw) {
+        raw as u32
+    } else {
+        32
+    }
+}
+
+/// 按当前系统 DPI 物理像素尺寸直出满幅圆角方框 5 态托盘图标（避免系统二次缩放发虚或偏小）。
+fn state_icon(state: MonitorState, size: u32) -> Result<Icon, String> {
+    let rgba = crate::app_icon::render_icon_rgba(Some(state), size);
+    Icon::from_rgba(rgba, size, size).map_err(|err| format!("生成托盘图标失败：{err}"))
 }
