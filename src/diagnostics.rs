@@ -143,6 +143,15 @@ impl NetworkDiagnostics {
             .and_then(CampusStatusProbe::measure_rtt_and_ip)
     }
 
+    /// 测量网关延迟并同时返回 `(毫秒, 门户识别的校园网 IPv4, 生效网关简短名)`。
+    pub fn measure_portal_rtt_ip_and_gateway(
+        &self,
+    ) -> Option<(u64, Option<String>, Option<String>)> {
+        self.campus_status
+            .as_ref()
+            .and_then(CampusStatusProbe::measure_rtt_ip_and_gateway)
+    }
+
     pub(crate) fn route(&self) -> RoutePath {
         read_route_to(ROUTE_PROBE_IP)
     }
@@ -285,28 +294,34 @@ impl NetworkDiagnostics {
             Some(CampusStatusInfo {
                 online: false,
                 portal_ip,
+                gateway_label,
             }) => DiagnosticResult::new(
                 false,
                 DisconnectReason::AuthExpired,
                 "校园网门户确认当前出口已下线",
             )
             .with_portal_ip(portal_ip)
+            .with_portal_gateway(gateway_label)
             .authenticatable(true),
-            Some(_) if dns_only => DiagnosticResult::new(
+            Some(info) if dns_only => DiagnosticResult::new(
                 false,
                 DisconnectReason::DnsFailure,
                 "校园网账号仍在线，公网出口 DNS 解析失败",
-            ),
+            )
+            .with_portal_ip(info.portal_ip)
+            .with_portal_gateway(info.gateway_label),
             None if dns_only => DiagnosticResult::new(
                 false,
                 DisconnectReason::DnsFailure,
                 "DNS 无法解析联网检测域名",
             ),
-            Some(_) => DiagnosticResult::new(
+            Some(info) => DiagnosticResult::new(
                 false,
                 DisconnectReason::UplinkUnreachable,
                 "校园网账号仍在线，公网出口不可达（代理节点或上游异常）",
-            ),
+            )
+            .with_portal_ip(info.portal_ip)
+            .with_portal_gateway(info.gateway_label),
             None if captive && routed_gateway => DiagnosticResult::new(
                 false,
                 DisconnectReason::AuthExpired,
@@ -376,6 +391,9 @@ impl NetworkDiagnostics {
         ));
         if let Some(ip) = info.portal_ip.as_deref() {
             evidence.push(("portal_ip".to_string(), ip.to_string()));
+        }
+        if let Some(gw) = info.gateway_label.as_deref() {
+            evidence.push(("portal_gateway".to_string(), gw.to_string()));
         }
         Some(info)
     }

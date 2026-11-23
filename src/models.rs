@@ -95,6 +95,8 @@ pub struct DiagnosticResult {
     pub gateway: String,
     /// 校园网门户 `chkstatus` 识别到的真实校园网 IPv4（路由器/TUN 环境下优先用作 `v4ip`）。
     pub portal_ip: String,
+    /// 本次诊断命中的校园网网关简短标签（如 `"育才网关"` / `"雁山网关"`）。
+    pub portal_gateway: String,
     pub can_authenticate: bool,
     /// 有序的 k/v 证据。
     pub evidence: Vec<(String, String)>,
@@ -109,6 +111,7 @@ impl DiagnosticResult {
             local_ip: String::new(),
             gateway: String::new(),
             portal_ip: String::new(),
+            portal_gateway: String::new(),
             can_authenticate: false,
             evidence: Vec::new(),
         }
@@ -123,6 +126,13 @@ impl DiagnosticResult {
     pub fn with_portal_ip(mut self, portal_ip: Option<String>) -> Self {
         if let Some(ip) = portal_ip {
             self.portal_ip = ip;
+        }
+        self
+    }
+
+    pub fn with_portal_gateway(mut self, gateway_label: Option<String>) -> Self {
+        if let Some(gw) = gateway_label {
+            self.portal_gateway = gw;
         }
         self
     }
@@ -207,6 +217,9 @@ pub struct MonitorMetrics {
     /// 校园网门户 `chkstatus` 识别到的真实校园网 IPv4（穿透 Mihomo/Tailscale TUN）。
     #[serde(default)]
     pub portal_ip: String,
+    /// 当前生效的校园网认证网关可读标签（如 `"育才网关"` / `"雁山网关"`）。
+    #[serde(default)]
+    pub active_portal: String,
     pub last_check_ms: u64,
     pub last_check_text: String,
     pub check_seq: u64,
@@ -603,6 +616,81 @@ fn default_auto_check_updates() -> bool {
     true
 }
 
+/// 规范化用户手动输入的自定义网关地址（支持直接输 `192.168.125.21`、`http://192.168.125.21` 或粘贴完整 `/drcom/login?...` 链接）。
+pub fn normalize_custom_portal_origin(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let with_scheme = if trimmed.contains("://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    let parsed = url::Url::parse(&with_scheme).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    if host.is_empty() || host.contains(' ') {
+        return None;
+    }
+    let host_fmt = if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]")
+    } else {
+        host.to_ascii_lowercase()
+    };
+    Some(match parsed.port() {
+        Some(port) => format!("{}://{}:{}", parsed.scheme(), host_fmt, port),
+        None => format!("{}://{}", parsed.scheme(), host_fmt),
+    })
+}
+
+/// 校区 / 认证网关选择模式（默认 `Auto` 自动识别育才、雁山、王城三校区网关）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CampusZone {
+    #[default]
+    Auto,
+    Yucai,
+    Yanshan,
+    Wangcheng,
+    Custom,
+}
+
+impl CampusZone {
+    pub const ALL: [Self; 5] = [
+        Self::Auto,
+        Self::Yucai,
+        Self::Yanshan,
+        Self::Wangcheng,
+        Self::Custom,
+    ];
+
+    pub const fn short_label(self) -> &'static str {
+        match self {
+            Self::Auto => "自动探测",
+            Self::Yucai => "育才校区",
+            Self::Yanshan => "雁山校区",
+            Self::Wangcheng => "王城校区",
+            Self::Custom => "自定义",
+        }
+    }
+
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Auto => "自动竞速探测育才/雁山网关并嗅探王城/内网强制门户，跨校区移动无感切换",
+            Self::Yucai => "优先连接育才校区网关（yc.gxnu.edu.cn / 192.168.125.13）",
+            Self::Yanshan => "优先连接雁山校区网关（192.168.125.21），不可达时自动回退探测",
+            Self::Wangcheng => "优先嗅探王城校区强制门户网关并与校内主网关竞速匹配",
+            Self::Custom => "仅使用下方手动填写的自定义 Dr.COM 认证网关地址",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
@@ -610,6 +698,12 @@ pub struct Settings {
     pub student_id: String,
     /// 活跃账号的运营商镜像字段。
     pub carrier: String,
+    /// 所属校区 / 认证网关选路策略（默认 `Auto` 自动探测）。
+    #[serde(default)]
+    pub campus_zone: CampusZone,
+    /// 当 `campus_zone == CampusZone::Custom` 时使用的自定义网关地址（如 `http://192.168.125.21`）。
+    #[serde(default)]
+    pub custom_portal_url: String,
     pub check_interval: i64,
     pub heartbeat_interval: i64,
     pub offline_interval: i64,
@@ -640,6 +734,8 @@ impl Default for Settings {
         Self {
             student_id: String::new(),
             carrier: "2".to_string(),
+            campus_zone: CampusZone::Auto,
+            custom_portal_url: String::new(),
             check_interval: 30,
             heartbeat_interval: 600,
             offline_interval: 15,
@@ -709,9 +805,14 @@ impl Settings {
             .map(|a| (a.student_id.clone(), a.carrier.clone(), a.monthly_quota_gb))
             .unwrap_or((legacy_sid, legacy_carrier, legacy_quota));
 
+        let custom_portal_url = normalize_custom_portal_origin(&self.custom_portal_url)
+            .unwrap_or_else(|| self.custom_portal_url.trim().to_string());
+
         Self {
             student_id,
             carrier,
+            campus_zone: self.campus_zone,
+            custom_portal_url,
             check_interval: self.check_interval.clamp(10, 3600),
             heartbeat_interval: self.heartbeat_interval.clamp(60, 86400),
             offline_interval: self.offline_interval.clamp(5, 300),

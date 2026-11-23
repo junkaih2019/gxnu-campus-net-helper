@@ -23,6 +23,7 @@ mod models;
 mod monitor;
 mod network_events;
 mod notify;
+mod portal_gateway;
 mod self_service;
 mod single_instance;
 mod startup;
@@ -151,8 +152,14 @@ fn main() -> ExitCode {
     if once {
         let _ = logging::init(&store.app_dir.join("logs"), false);
         logging::info("[SELF_CHECK] 一次性只读检测（不提交凭据）");
-        let diagnostics = diagnostics::NetworkDiagnostics::new()
-            .with_campus_status(campus_status::CampusStatusProbe::new());
+        let once_cfg = store.load();
+        let once_resolver = Arc::new(portal_gateway::PortalGatewayResolver::new(
+            once_cfg.campus_zone,
+            &once_cfg.custom_portal_url,
+        ));
+        let diagnostics = diagnostics::NetworkDiagnostics::new().with_campus_status(
+            campus_status::CampusStatusProbe::with_resolver(once_resolver),
+        );
         let Some(result) = diagnostics.check() else {
             eprintln!("网络出口正在切换，两次只读检测均未取得稳定结果");
             return ExitCode::from(3);
@@ -212,9 +219,10 @@ fn main() -> ExitCode {
     }
     startup::ensure_app_id(notify::AUMID);
     logging::info(&format!(
-        "[CONFIG] 学号={}；运营商={}；检测间隔={}s；复核={}次；离线复检={}s；开机自启={}",
+        "[CONFIG] 学号={}；运营商={}；校区={}；检测间隔={}s；复核={}次；离线复检={}s；开机自启={}",
         mask_id(&settings.student_id),
         settings.carrier,
+        settings.campus_zone.short_label(),
         settings.check_interval,
         settings.confirm_failures,
         settings.offline_interval,
@@ -574,9 +582,15 @@ fn run_daemon(
             .ok()
     };
 
-    let diagnostics = diagnostics::NetworkDiagnostics::new()
-        .with_campus_status(campus_status::CampusStatusProbe::new());
-    let authenticator = authenticator::CampusAuthenticator::new();
+    let gateway_resolver = Arc::new(portal_gateway::PortalGatewayResolver::new(
+        settings.campus_zone,
+        &settings.custom_portal_url,
+    ));
+    let diagnostics = diagnostics::NetworkDiagnostics::new().with_campus_status(
+        campus_status::CampusStatusProbe::with_resolver(Arc::clone(&gateway_resolver)),
+    );
+    let authenticator =
+        authenticator::CampusAuthenticator::with_resolver(Arc::clone(&gateway_resolver));
     let metrics_for_flyout = Arc::clone(&metrics_store);
     let mut monitor = monitor::NetworkMonitor::new(
         diagnostics,
@@ -585,7 +599,8 @@ fn run_daemon(
         metrics_store,
         settings.clone(),
         sink,
-    );
+    )
+    .with_gateway_resolver(Arc::clone(&gateway_resolver));
     let monitor_ctrl = monitor.control();
     let updater_ctrl = monitor_ctrl.clone();
     let updater_mgr = Arc::new(updater::UpdateManager::new(
@@ -622,6 +637,7 @@ fn run_daemon(
     let commands = Arc::new(Mutex::new(DaemonCommands {
         main_tid,
         control: monitor_ctrl.clone(),
+        gateway_resolver: Arc::clone(&gateway_resolver),
         store,
         notifier,
         ipc_server: Arc::clone(&ipc_server),
@@ -797,6 +813,7 @@ fn run_daemon(
 struct DaemonCommands {
     main_tid: u32,
     control: monitor::MonitorControl,
+    gateway_resolver: Arc<portal_gateway::PortalGatewayResolver>,
     store: config::SettingsStore,
     notifier: Arc<Mutex<notify::ToastNotifier>>,
     ipc_server: Arc<ipc::IpcServer>,
@@ -891,6 +908,7 @@ impl DaemonCommands {
         }
         let ss = Arc::clone(&self.self_service);
         let ctrl = self.control.clone();
+        let gw_resolver = Arc::clone(&self.gateway_resolver);
         let ipc = Arc::clone(&self.ipc_server);
         let online_flag = Arc::clone(&self.is_online);
         let main_tid = self.main_tid;
@@ -898,7 +916,7 @@ impl DaemonCommands {
             .name("kick-online-device".to_string())
             .spawn(move || {
                 if is_local {
-                    let _ = authenticator::CampusAuthenticator::new().logout();
+                    let _ = authenticator::CampusAuthenticator::with_resolver(gw_resolver).logout();
                 }
                 let res = ss.kick_device(&ip);
                 let ui_res = match &res {
@@ -979,6 +997,8 @@ impl DaemonCommands {
                     settings.auto_check_updates,
                     &settings.skipped_update_version,
                 );
+                self.gateway_resolver
+                    .update_config(settings.campus_zone, &settings.custom_portal_url);
                 self.sync_active_account_state(&settings);
                 if password_changed {
                     self.self_service.notify_credential_updated();

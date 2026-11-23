@@ -99,7 +99,7 @@ pub enum UiToDaemon {
 #[serde(tag = "cmd")]
 enum ClientFrame {
     Hello { token: String },
-    Request { id: u64, command: UiToDaemon },
+    Request { id: u64, command: Box<UiToDaemon> },
 }
 
 pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(4);
@@ -356,7 +356,7 @@ where
             command,
         })) = read_command(&mut reader, &mut line)
         {
-            let result = on_command(command);
+            let result = on_command(*command);
             let mut line = serde_json::to_string(&DaemonToUi::CommandResult {
                 id: request_id,
                 result,
@@ -443,7 +443,10 @@ impl IpcClient {
         let id = self.next_id;
         self.next_id += 1;
         self.inbox.reserve(id, &command)?;
-        let frame = ClientFrame::Request { id, command };
+        let frame = ClientFrame::Request {
+            id,
+            command: Box::new(command),
+        };
         let sent = serde_json::to_vec(&frame)
             .map_err(io::Error::from)
             .and_then(|mut line| {
@@ -452,12 +455,10 @@ impl IpcClient {
             });
         if let Err(err) = sent {
             self.inbox.forget(id);
-            if let ClientFrame::Request {
-                command: UiToDaemon::KickDevice { ip, .. },
-                ..
-            } = &frame
-            {
-                self.inbox.forget_kick(ip);
+            if let ClientFrame::Request { command, .. } = &frame {
+                if let UiToDaemon::KickDevice { ip, .. } = command.as_ref() {
+                    self.inbox.forget_kick(ip);
+                }
             }
             return Err(format!("发送守护命令失败：{err}"));
         }

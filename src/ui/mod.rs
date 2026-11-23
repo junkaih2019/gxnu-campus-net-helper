@@ -165,7 +165,7 @@ enum CampusVpnModal {
 }
 
 /// 保存账号前的零断网风险当场验密：
-/// - 若将设为活跃账号且当前校园网明确离线：直接请求 `yc.gxnu.edu.cn` 实测登录（验对顺带联网）；
+/// - 若将设为活跃账号且当前校园网明确离线：按所选校区/自动探测网关实测登录（验对顺带联网）；
 /// - 若当前校园网已在线（绝不调 `logout` 踢断好端端的网！）或仅添加备用账号：改用 `172.16.4.2/Self/` 独立会话无损验密；
 /// - 仅对明确的账密/运营商错误拦截，离校/超时/验证码/并发满额均平滑放行。
 fn preverify_account_credentials(
@@ -174,12 +174,21 @@ fn preverify_account_credentials(
     carrier: &str,
     make_active: bool,
     fallback_local_ip: &str,
+    campus_zone: crate::models::CampusZone,
+    custom_portal_url: &str,
 ) -> PreverifyOutcome {
     if make_active {
-        if let Some(status) = crate::campus_status::CampusStatusProbe::new().check_detail() {
+        let resolver = std::sync::Arc::new(crate::portal_gateway::PortalGatewayResolver::new(
+            campus_zone,
+            custom_portal_url,
+        ));
+        if let Some(status) =
+            crate::campus_status::CampusStatusProbe::with_resolver(std::sync::Arc::clone(&resolver))
+                .check_detail()
+        {
             if !status.online {
                 let auth_ip = status.portal_ip.as_deref().unwrap_or(fallback_local_ip);
-                let auth = crate::authenticator::CampusAuthenticator::new()
+                let auth = crate::authenticator::CampusAuthenticator::with_resolver(resolver)
                     .authenticate(student_id, password, carrier, auth_ip);
                 return classify_portal_auth_for_preverify(
                     auth.success,
@@ -262,6 +271,7 @@ pub struct GuardApp {
     traffic_view_mode: TrafficViewMode,
     traffic_view_user_override: bool,
     preverify_job: Option<AccountPreverifyJob>,
+    gateway_probe_job: Option<Receiver<Result<String, String>>>,
     campus_vpn_modal: Option<CampusVpnModal>,
     campus_vpn_ack_for_draft: bool,
     kicking_ips: HashSet<String>,
@@ -399,6 +409,7 @@ impl GuardApp {
             traffic_view_mode: initial_traffic_view,
             traffic_view_user_override: false,
             preverify_job: None,
+            gateway_probe_job: None,
             campus_vpn_modal: None,
             campus_vpn_ack_for_draft: false,
             kicking_ips: HashSet::new(),
@@ -620,7 +631,60 @@ impl GuardApp {
         }
     }
 
+    fn start_gateway_probe(&mut self, ctx: &egui::Context) {
+        if self.gateway_probe_job.is_some() {
+            return;
+        }
+        let zone = self.form.campus_zone;
+        let custom_url = self.form.custom_portal_url.trim().to_string();
+        if zone == crate::models::CampusZone::Custom
+            && crate::portal_gateway::normalize_custom_portal_origin(&custom_url).is_none()
+        {
+            let msg = "请先填写有效的自定义网关地址（如 http://192.168.125.21）".to_string();
+            self.form.gateway_probe_note = Some((msg.clone(), true));
+            self.show_toast(msg, true);
+            return;
+        }
+        self.form.gateway_probe_note = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let repaint_ctx = ctx.clone();
+        let _ = std::thread::Builder::new()
+            .name("manual-gateway-probe".to_string())
+            .spawn(move || {
+                let resolver = crate::portal_gateway::PortalGatewayResolver::new(zone, &custom_url);
+                let res = resolver.probe_and_cache().map(|(portal, ms, info)| {
+                    let state_str = if info.online {
+                        "当前在线"
+                    } else {
+                        "未认证"
+                    };
+                    let ip_str = info
+                        .portal_ip
+                        .as_deref()
+                        .map(|ip| format!(" · IP {ip}"))
+                        .unwrap_or_default();
+                    format!(
+                        "已探测锁定：{}（{} ms · {}{}）",
+                        portal.label, ms, state_str, ip_str
+                    )
+                });
+                let _ = tx.send(res);
+                repaint_ctx.request_repaint();
+            });
+        self.gateway_probe_job = Some(rx);
+    }
+
     fn save_global_settings(&mut self) {
+        if self.form.campus_zone == crate::models::CampusZone::Custom
+            && crate::portal_gateway::normalize_custom_portal_origin(&self.form.custom_portal_url)
+                .is_none()
+        {
+            self.show_toast(
+                "自定义网关地址无效，请填写如 http://192.168.125.21 的地址",
+                true,
+            );
+            return;
+        }
         let next = self.form.to_global_settings(&self.settings);
         if let Err(err) = self.store.save_settings(&next) {
             self.show_toast(format!("保存设置失败：{err}"), true);
@@ -637,6 +701,7 @@ impl GuardApp {
             expected: next.clone(),
         };
         self.settings = next;
+        self.form.custom_portal_url = self.settings.custom_portal_url.clone();
         if startup_error.is_some() {
             self.settings.auto_boot = startup::is_enabled();
             self.form.auto_boot = self.settings.auto_boot;
@@ -673,6 +738,17 @@ impl GuardApp {
         ctx: &egui::Context,
     ) {
         if self.preverify_job.is_some() {
+            return;
+        }
+        if also_save_global
+            && self.form.campus_zone == crate::models::CampusZone::Custom
+            && crate::portal_gateway::normalize_custom_portal_origin(&self.form.custom_portal_url)
+                .is_none()
+        {
+            self.show_toast(
+                "自定义网关地址无效，请填写如 http://192.168.125.21 的地址",
+                true,
+            );
             return;
         }
         let student_id = self.form.student_id.trim().to_string();
@@ -794,6 +870,8 @@ impl GuardApp {
 
         let (tx, rx) = std::sync::mpsc::channel();
         let repaint_ctx = ctx.clone();
+        let preverify_zone = self.form.campus_zone;
+        let preverify_custom_url = self.form.custom_portal_url.trim().to_string();
         let _ = std::thread::Builder::new()
             .name("account-preverify".to_string())
             .spawn(move || {
@@ -803,6 +881,8 @@ impl GuardApp {
                     &carrier_str,
                     make_active,
                     &fallback_ip,
+                    preverify_zone,
+                    &preverify_custom_url,
                 );
                 let _ = tx.send(outcome);
                 repaint_ctx.request_repaint();
@@ -981,6 +1061,9 @@ impl GuardApp {
             expected: next.clone(),
         };
         self.settings = next;
+        if also_save_global {
+            self.form.custom_portal_url = self.settings.custom_portal_url.clone();
+        }
         if startup_error.is_some() {
             self.settings.auto_boot = startup::is_enabled();
             self.form.auto_boot = self.settings.auto_boot;
@@ -1141,6 +1224,25 @@ impl GuardApp {
                     let also_global = job.also_save_global;
                     self.preverify_job = None;
                     self.commit_account_profile(also_global, None);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
+            }
+        }
+
+        if let Some(rx) = &self.gateway_probe_job {
+            match rx.try_recv() {
+                Ok(Ok(summary)) => {
+                    self.gateway_probe_job = None;
+                    self.form.gateway_probe_note = Some((summary.clone(), false));
+                    self.show_toast(summary, false);
+                }
+                Ok(Err(err)) => {
+                    self.gateway_probe_job = None;
+                    self.form.gateway_probe_note = Some((err.clone(), true));
+                    self.show_toast(err, true);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.gateway_probe_job = None;
                 }
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
@@ -1533,9 +1635,17 @@ impl GuardApp {
                                     parts.push(format!("{rem}s 后自动巡检"));
                                 }
                             }
+                            let gw_tag = self
+                                .latest
+                                .as_ref()
+                                .map(|s| s.metrics.active_portal.as_str())
+                                .filter(|s| !s.is_empty())
+                                .unwrap_or("网关");
                             if last_at_str != "—" {
                                 if dur != "—" {
-                                    parts.push(format!("上次检测 {last_at_str}（网关 {dur}）"));
+                                    parts.push(format!("上次检测 {last_at_str}（{gw_tag} {dur}）"));
+                                } else if gw_tag != "网关" {
+                                    parts.push(format!("上次检测 {last_at_str}（{gw_tag}）"));
                                 } else {
                                     parts.push(format!("上次检测 {last_at_str}"));
                                 }
@@ -2679,6 +2789,7 @@ impl eframe::App for GuardApp {
         let fast_refresh = !self.pending.is_empty()
             || !self.kicking_ips.is_empty()
             || self.preverify_job.is_some()
+            || self.gateway_probe_job.is_some()
             || self.toast.is_some()
             || matches!(
                 self.update_state.status,
@@ -2840,6 +2951,12 @@ impl eframe::App for GuardApp {
                     .values()
                     .any(|p| matches!(p.command, UiToDaemon::ReloadSettings { .. }));
                 let verifying_account = self.preverify_job.is_some();
+                let probing_gateway = self.gateway_probe_job.is_some();
+                let active_portal = self
+                    .latest
+                    .as_ref()
+                    .map(|s| s.metrics.active_portal.clone())
+                    .unwrap_or_default();
                 let mut actions = settings_page::SettingsActions::default();
                 egui::CentralPanel::default()
                     .frame(egui::Frame::new().fill(p.bg))
@@ -2855,9 +2972,11 @@ impl eframe::App for GuardApp {
                             &self.log_path,
                             &self.account_creds,
                             &self.update_state,
+                            &active_portal,
                             self.needs_setup,
                             saving,
                             verifying_account,
+                            probing_gateway,
                             total_h,
                         );
                     });
@@ -2917,6 +3036,9 @@ impl eframe::App for GuardApp {
                 }
                 if actions.open_update_modal {
                     self.update_modal_open = true;
+                }
+                if actions.probe_gateway {
+                    self.start_gateway_probe(ctx);
                 }
             }
         }

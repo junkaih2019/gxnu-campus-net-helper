@@ -2,10 +2,13 @@
 //!
 //! Dr.COM 的失败响应里 `msg` 是数字码、`msga` 才是人话，两者都保留。
 
+use std::sync::Arc;
+
 use crate::campus_status::jsonp_payload;
 use crate::http;
 use crate::logging;
 use crate::models::DisconnectReason;
+use crate::portal_gateway::PortalGatewayResolver;
 
 pub const PORTAL_URL: &str = "https://yc.gxnu.edu.cn/drcom/login";
 pub const LOGOUT_URL: &str = "https://yc.gxnu.edu.cn/drcom/logout";
@@ -25,10 +28,17 @@ pub struct LogoutResult {
     pub message: String,
 }
 
+enum AuthEndpoints {
+    Fixed {
+        portal_url: String,
+        logout_url: String,
+    },
+    Dynamic(Arc<PortalGatewayResolver>),
+}
+
 pub struct CampusAuthenticator {
     agent: ureq::Agent,
-    portal_url: String,
-    logout_url: String,
+    endpoints: AuthEndpoints,
 }
 
 impl Default for CampusAuthenticator {
@@ -41,8 +51,10 @@ impl CampusAuthenticator {
     pub fn new() -> Self {
         Self {
             agent: http::agent(10),
-            portal_url: PORTAL_URL.to_string(),
-            logout_url: LOGOUT_URL.to_string(),
+            endpoints: AuthEndpoints::Fixed {
+                portal_url: PORTAL_URL.to_string(),
+                logout_url: LOGOUT_URL.to_string(),
+            },
         }
     }
 
@@ -55,17 +67,41 @@ impl CampusAuthenticator {
         };
         Self {
             agent: http::agent(10),
-            portal_url,
-            logout_url,
+            endpoints: AuthEndpoints::Fixed {
+                portal_url,
+                logout_url,
+            },
+        }
+    }
+
+    pub fn with_resolver(resolver: Arc<PortalGatewayResolver>) -> Self {
+        Self {
+            agent: http::agent(10),
+            endpoints: AuthEndpoints::Dynamic(resolver),
+        }
+    }
+
+    fn current_urls(&self) -> (String, String, Option<(Arc<PortalGatewayResolver>, String)>) {
+        match &self.endpoints {
+            AuthEndpoints::Fixed {
+                portal_url,
+                logout_url,
+            } => (portal_url.clone(), logout_url.clone(), None),
+            AuthEndpoints::Dynamic(resolver) => {
+                let ep = resolver.resolve_endpoints();
+                (
+                    ep.login_url,
+                    ep.logout_url,
+                    Some((Arc::clone(resolver), ep.origin)),
+                )
+            }
         }
     }
 
     /// 主动注销当前 Dr.COM 校园网会话（切换账号前调用，失败或本已离线均不阻塞后续登录）。
     pub fn logout(&self) -> LogoutResult {
-        let url = format!(
-            "{}?callback=dr1005&jsVersion=4.2.2&v=4532&lang=zh",
-            self.logout_url
-        );
+        let (_, logout_url, dyn_ctx) = self.current_urls();
+        let url = format!("{logout_url}?callback=dr1005&jsVersion=4.2.2&v=4532&lang=zh");
         match http::get_portal(&self.agent, &url) {
             Ok(response) => {
                 if !(200..300).contains(&response.status) {
@@ -85,10 +121,17 @@ impl CampusAuthenticator {
                     },
                 }
             }
-            Err(err) => LogoutResult {
-                success: false,
-                message: format!("请求注销接口失败：{err}"),
-            },
+            Err(err) => {
+                if let Some((resolver, origin)) = dyn_ctx {
+                    if !resolver.is_custom_mode() {
+                        resolver.invalidate_if_origin(&origin);
+                    }
+                }
+                LogoutResult {
+                    success: false,
+                    message: format!("请求注销接口失败：{err}"),
+                }
+            }
         }
     }
 
@@ -124,21 +167,40 @@ impl CampusAuthenticator {
         } else {
             "2"
         };
-        let url = format!(
-            "{}?callback=dr1004&DDDDD={}&upass={}&0MKKey=123456&R1=0&R2=&R3={}&R6=0&para=00\
-             &v4ip={}&v6ip=&terminal_type=1&lang=zh&jsVersion=4.2.2&v=4532",
-            self.portal_url,
-            http::urlencode(student_id),
-            http::urlencode(password),
-            carrier,
-            http::urlencode(local_ip),
-        );
+        let (portal_url, _, dyn_ctx) = self.current_urls();
+        let build_login_url = |base: &str| {
+            format!(
+                "{base}?callback=dr1004&DDDDD={}&upass={}&0MKKey=123456&R1=0&R2=&R3={carrier}&R6=0&para=00\
+                 &v4ip={}&v6ip=&terminal_type=1&lang=zh&jsVersion=4.2.2&v=4532",
+                http::urlencode(student_id),
+                http::urlencode(password),
+                http::urlencode(local_ip),
+            )
+        };
+        let url = build_login_url(&portal_url);
 
         // Commit this request only after preparing it and immediately before network I/O.
         if !begin() {
             return None;
         }
-        Some(match http::get_portal(&self.agent, &url) {
+        let mut response_res = http::get_portal(&self.agent, &url);
+
+        // 若多校区自动模式下旧缓存网关连接失败，立即失效缓存并尝试重探一次新校区网关
+        if response_res.is_err() {
+            if let Some((resolver, failed_origin)) = &dyn_ctx {
+                if !resolver.is_custom_mode() {
+                    resolver.invalidate_if_origin(failed_origin);
+                    if let Ok((fresh, _, _)) = resolver.probe_and_cache() {
+                        if fresh.origin != *failed_origin {
+                            let retry_url = build_login_url(&fresh.login_url);
+                            response_res = http::get_portal(&self.agent, &retry_url);
+                        }
+                    }
+                }
+            }
+        }
+
+        Some(match response_res {
             Ok(response) => {
                 let reply = (200..300)
                     .contains(&response.status)

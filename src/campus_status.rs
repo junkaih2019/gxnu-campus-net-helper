@@ -2,12 +2,14 @@
 //!
 //! 查询 `/drcom/chkstatus`，
 //! `result = 1 在线 / 0 不在线`。它免凭据、直连、体积小，用来区分
-//! “校园会话掉线”和“代理节点/上游出口不通”。
+//! “校园会话掉线”和“代理节点/上游出口不通”，并支持多校区网关自动探测与故障切换。
 
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::http;
 use crate::logging;
+use crate::portal_gateway::{probe_chkstatus_once, PortalGatewayResolver};
 
 pub const CHKSTATUS_URL: &str = "https://yc.gxnu.edu.cn/drcom/chkstatus";
 
@@ -16,11 +18,18 @@ pub struct CampusStatusInfo {
     pub online: bool,
     /// 门户侧看到的真实校园网 IPv4（例如经路由器或 TUN 出口后的 `172.16.x.x`）。
     pub portal_ip: Option<String>,
+    /// 本次响应所属的网关简短名称（如 `"育才网关"` / `"雁山网关"`）。
+    pub gateway_label: Option<String>,
+}
+
+enum ProbeTarget {
+    FixedUrl(String),
+    Dynamic(Arc<PortalGatewayResolver>),
 }
 
 pub struct CampusStatusProbe {
     agent: ureq::Agent,
-    url: String,
+    target: ProbeTarget,
 }
 
 impl Default for CampusStatusProbe {
@@ -33,36 +42,67 @@ impl CampusStatusProbe {
     pub fn new() -> Self {
         Self {
             agent: http::agent(5),
-            url: CHKSTATUS_URL.to_string(),
+            target: ProbeTarget::FixedUrl(CHKSTATUS_URL.to_string()),
         }
     }
 
     pub fn with_url(url: impl Into<String>) -> Self {
         Self {
             agent: http::agent(5),
-            url: url.into(),
+            target: ProbeTarget::FixedUrl(url.into()),
         }
     }
 
-    /// 静默测量到校园网认证网关（yc.gxnu.edu.cn）的真实应用层往返延迟（毫秒）。
-    /// 使用完整 HTTP 响应而非纯 TCP 握手，避免 TUN/代理虚拟网卡本地秒回 ACK 导致的假 1ms 延迟。
-    pub fn measure_rtt_ms(&self) -> Option<u64> {
-        self.measure_rtt_and_ip().map(|(ms, _)| ms)
+    pub fn with_resolver(resolver: Arc<PortalGatewayResolver>) -> Self {
+        Self {
+            agent: http::agent(5),
+            target: ProbeTarget::Dynamic(resolver),
+        }
     }
 
-    /// 静默测量网关 RTT，同时顺带解析门户看到的真实校园网 IPv4（穿透代理 TUN，零额外请求）。
+    /// 静默测量到当前生效校园网认证网关的真实应用层往返延迟（毫秒）。
+    pub fn measure_rtt_ms(&self) -> Option<u64> {
+        self.measure_rtt_ip_and_gateway().map(|(ms, _, _)| ms)
+    }
+
+    /// 静默测量网关 RTT，同时顺带解析门户看到的真实校园网 IPv4。
     pub fn measure_rtt_and_ip(&self) -> Option<(u64, Option<String>)> {
-        let url = format!("{}?callback=dr1002&v=4532&lang=zh", self.url);
-        let started = Instant::now();
-        match http::get_portal(&self.agent, &url) {
-            Ok(response) if (200..300).contains(&response.status) => {
+        self.measure_rtt_ip_and_gateway()
+            .map(|(ms, ip, _)| (ms, ip))
+    }
+
+    /// 静默测量网关 RTT，并返回 `(毫秒, 真实校园网 IPv4, 生效网关简短名)`。
+    pub fn measure_rtt_ip_and_gateway(&self) -> Option<(u64, Option<String>, Option<String>)> {
+        match &self.target {
+            ProbeTarget::FixedUrl(base_url) => {
+                let url = format!("{base_url}?callback=dr1002&v=4532&lang=zh");
+                let started = Instant::now();
+                let response = http::get_portal(&self.agent, &url).ok()?;
+                if !(200..300).contains(&response.status) {
+                    return None;
+                }
                 let detail = parse_chkstatus_detail(&response.body)?;
                 Some((
                     started.elapsed().as_millis().max(1) as u64,
                     detail.portal_ip,
+                    detail.gateway_label,
                 ))
             }
-            _ => None,
+            ProbeTarget::Dynamic(resolver) => {
+                if let Some(portal) = resolver.cached_endpoints() {
+                    if let Some((ms, info)) = probe_chkstatus_once(&self.agent, &portal) {
+                        return Some((ms, info.portal_ip, Some(portal.short_name)));
+                    }
+                    if resolver.is_custom_mode() {
+                        return None;
+                    }
+                    resolver.invalidate_if_origin(&portal.origin);
+                }
+                if let Ok((fresh, ms, info)) = resolver.probe_and_cache() {
+                    return Some((ms, info.portal_ip, Some(fresh.short_name)));
+                }
+                None
+            }
         }
     }
 
@@ -73,22 +113,63 @@ impl CampusStatusProbe {
 
     /// 返回门户在线状态以及门户侧识别到的真实校园网 IPv4。
     pub fn check_detail(&self) -> Option<CampusStatusInfo> {
-        let url = format!("{}?callback=dr1002&v=4532&lang=zh", self.url);
+        match &self.target {
+            ProbeTarget::FixedUrl(base_url) => self.check_single_url(base_url, None),
+            ProbeTarget::Dynamic(resolver) => {
+                if let Some(portal) = resolver.cached_endpoints() {
+                    if let Some(info) =
+                        self.check_single_url(&portal.chkstatus_url, Some(&portal.short_name))
+                    {
+                        return Some(info);
+                    }
+                    if resolver.is_custom_mode() {
+                        return None;
+                    }
+                    resolver.invalidate_if_origin(&portal.origin);
+                }
+                if let Ok((fresh, _ms, info)) = resolver.probe_and_cache() {
+                    logging::info(&format!(
+                        "[CAMPUS_STATUS] 已自动探测网关「{}」，门户判定{}",
+                        fresh.label,
+                        if info.online { "在线" } else { "不在线" }
+                    ));
+                    return Some(info);
+                }
+                None
+            }
+        }
+    }
+
+    fn check_single_url(
+        &self,
+        chkstatus_url: &str,
+        gateway_short_name: Option<&str>,
+    ) -> Option<CampusStatusInfo> {
+        let url = format!("{chkstatus_url}?callback=dr1002&v=4532&lang=zh");
         match http::get_portal(&self.agent, &url) {
             Ok(response) => {
-                let detail = (200..300)
+                let mut detail = (200..300)
                     .contains(&response.status)
                     .then(|| parse_chkstatus_detail(&response.body))
                     .flatten();
+                if let (Some(info), Some(gw)) = (detail.as_mut(), gateway_short_name) {
+                    info.gateway_label = Some(gw.to_string());
+                }
                 match &detail {
                     Some(info) => {
+                        let gw_note = info
+                            .gateway_label
+                            .as_deref()
+                            .map(|g| format!("（{g}）"))
+                            .unwrap_or_default();
                         let ip_note = info
                             .portal_ip
                             .as_deref()
                             .map(|ip| format!("（门户识别IP={ip}）"))
                             .unwrap_or_default();
                         logging::info(&format!(
-                            "[CAMPUS_STATUS] 门户判定本次出口{}{}",
+                            "[CAMPUS_STATUS] 门户{}判定本次出口{}{}",
+                            gw_note,
                             if info.online { "在线" } else { "不在线" },
                             ip_note
                         ));
@@ -135,6 +216,7 @@ pub fn parse_chkstatus_detail(text: &str) -> Option<CampusStatusInfo> {
     Some(CampusStatusInfo {
         online: number == 1,
         portal_ip,
+        gateway_label: None,
     })
 }
 

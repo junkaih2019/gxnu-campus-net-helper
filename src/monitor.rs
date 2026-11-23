@@ -35,6 +35,10 @@ pub(crate) trait NetworkCheck: Send + Sync {
     fn portal_probe(&self) -> (Option<u64>, Option<String>) {
         (self.portal_latency(), None)
     }
+    fn portal_probe_full(&self) -> (Option<u64>, Option<String>, Option<String>) {
+        let (ms, ip) = self.portal_probe();
+        (ms, ip, None)
+    }
 }
 
 impl NetworkCheck for NetworkDiagnostics {
@@ -51,6 +55,12 @@ impl NetworkCheck for NetworkDiagnostics {
         match self.measure_portal_rtt_and_ip() {
             Some((ms, ip)) => (Some(ms), ip),
             None => (None, None),
+        }
+    }
+    fn portal_probe_full(&self) -> (Option<u64>, Option<String>, Option<String>) {
+        match self.measure_portal_rtt_ip_and_gateway() {
+            Some((ms, ip, gw)) => (Some(ms), ip, gw),
+            None => (None, None, None),
         }
     }
 }
@@ -119,6 +129,7 @@ struct Cycle {
 struct Shared {
     diagnostics: Box<dyn NetworkCheck>,
     authenticator: CampusAuthenticator,
+    gateway_resolver: Mutex<Option<Arc<crate::portal_gateway::PortalGatewayResolver>>>,
     credentials: CredentialProvider,
     metrics_store: Arc<MetricsStore>,
     settings: Mutex<Settings>,
@@ -187,6 +198,13 @@ impl Shared {
         mode.generation += 1;
         mode.event_pending = true;
         mode.wake = true;
+        if different_route {
+            mode.metrics.active_portal.clear();
+            let resolver = self.gateway_resolver.lock().unwrap().clone();
+            if let Some(resolver) = resolver {
+                resolver.invalidate_cache();
+            }
+        }
         if first || different_route {
             let cause = if different_route {
                 "出网路由改变"
@@ -395,16 +413,30 @@ impl MonitorControl {
         settings: Settings,
         password_changed: bool,
     ) -> Result<(), String> {
+        let settings = settings.normalized();
+        let gateway_changed = self
+            .shared
+            .gateway_resolver
+            .lock()
+            .unwrap()
+            .clone()
+            .is_some_and(|r| r.update_config(settings.campus_zone, &settings.custom_portal_url));
         let mut mode = self.shared.control.lock().unwrap();
         ensure_running(&mode)?;
-        let settings = settings.normalized();
         let mut current = self.shared.settings.lock().unwrap();
+        let zone_changed = current.campus_zone != settings.campus_zone
+            || current.custom_portal_url != settings.custom_portal_url;
         let rescan = password_changed
+            || gateway_changed
+            || zone_changed
             || current.student_id != settings.student_id
             || current.carrier != settings.carrier
             || current.check_interval != settings.check_interval
             || current.offline_interval != settings.offline_interval
             || current.confirm_failures != settings.confirm_failures;
+        if gateway_changed || zone_changed {
+            mode.metrics.active_portal.clear();
+        }
         *current = settings;
         if !rescan {
             return Ok(());
@@ -476,6 +508,7 @@ impl NetworkMonitor {
             sample_epoch: chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
             diagnostics: Box::new(diagnostics),
             authenticator,
+            gateway_resolver: Mutex::new(None),
             credentials,
             metrics_store,
             settings: Mutex::new(settings.normalized()),
@@ -490,8 +523,8 @@ impl NetworkMonitor {
                 while let Ok((generation, seq)) = jobs.recv() {
                     let Some(shared) = weak.upgrade() else { break };
                     if shared.is_pending(generation, seq) {
-                        let (ms, portal_ip) = shared.diagnostics.portal_probe();
-                        shared.finish_latency(generation, seq, ms, portal_ip);
+                        let (ms, portal_ip, portal_gw) = shared.diagnostics.portal_probe_full();
+                        shared.finish_latency(generation, seq, ms, portal_ip, portal_gw);
                     }
                 }
             })
@@ -510,6 +543,14 @@ impl NetworkMonitor {
             .shared
             .publish(0, MonitorState::Paused, None, "监控已暂停");
         monitor
+    }
+
+    pub fn with_gateway_resolver(
+        self,
+        resolver: Arc<crate::portal_gateway::PortalGatewayResolver>,
+    ) -> Self {
+        *self.shared.gateway_resolver.lock().unwrap() = Some(resolver);
+        self
     }
 
     pub fn control(&self) -> MonitorControl {
@@ -574,7 +615,7 @@ impl Shared {
 
     fn measure_latency(&self, cycle: Cycle, seq: u64) {
         if self.latency_jobs.try_send((cycle.generation, seq)).is_err() {
-            self.finish_latency(cycle.generation, seq, None, None);
+            self.finish_latency(cycle.generation, seq, None, None, None);
         }
     }
 
@@ -584,6 +625,7 @@ impl Shared {
         seq: u64,
         ms: Option<u64>,
         portal_ip: Option<String>,
+        portal_gateway: Option<String>,
     ) {
         let mut mode = self.control.lock().unwrap();
         if mode.generation != generation || mode.metrics.check_seq != seq {
@@ -598,6 +640,12 @@ impl Shared {
         if let Some(ip) = portal_ip.filter(|s| !s.is_empty()) {
             if mode.metrics.portal_ip != ip {
                 mode.metrics.portal_ip = ip;
+                updated = true;
+            }
+        }
+        if let Some(gw) = portal_gateway.filter(|s| !s.is_empty()) {
+            if mode.metrics.active_portal != gw {
+                mode.metrics.active_portal = gw;
                 updated = true;
             }
         }
@@ -640,6 +688,14 @@ impl Shared {
             DisconnectReason::LinkDown | DisconnectReason::NoIp | DisconnectReason::NoGateway
         ) {
             metrics.portal_ip.clear();
+        }
+        if !result.portal_gateway.is_empty() {
+            metrics.active_portal = result.portal_gateway.clone();
+        } else if matches!(
+            result.reason,
+            DisconnectReason::LinkDown | DisconnectReason::NoIp | DisconnectReason::NoGateway
+        ) {
+            metrics.active_portal.clear();
         }
         metrics.last_check_ms = 0;
         metrics.last_check_text = now.format("%H:%M:%S").to_string();
@@ -740,9 +796,20 @@ fn build_pipeline(result: &DiagnosticResult) -> DiagnosticPipeline {
         _ => (StepState::Warn, result.reason.label().to_string()),
     };
 
+    let gw_label = evidence_value(result, "portal_gateway").filter(|s| !s.is_empty());
     let portal = match evidence_value(result, "campus_status") {
-        Some("online") => (StepState::Ok, "门户在线".to_string()),
-        Some("offline") => (StepState::Fail, "会话已下线".to_string()),
+        Some("online") => (
+            StepState::Ok,
+            gw_label
+                .map(|gw| format!("{gw}在线"))
+                .unwrap_or_else(|| "门户在线".to_string()),
+        ),
+        Some("offline") => (
+            StepState::Fail,
+            gw_label
+                .map(|gw| format!("{gw}未登录"))
+                .unwrap_or_else(|| "会话已下线".to_string()),
+        ),
         _ => match result.reason {
             DisconnectReason::Online => (StepState::Ok, "会话有效".to_string()),
             DisconnectReason::AuthExpired => (StepState::Fail, "需要重新认证".to_string()),
@@ -1791,6 +1858,7 @@ mod tests {
                 path: path.clone(),
             },
             control: f.monitor.control(),
+            gateway_resolver: Arc::new(crate::portal_gateway::PortalGatewayResolver::default()),
             notifier: Arc::new(Mutex::new(crate::notify::ToastNotifier::new(false))),
             ipc_server: Arc::clone(&server),
             is_online: Arc::new(std::sync::atomic::AtomicBool::new(false)),

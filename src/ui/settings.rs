@@ -8,7 +8,7 @@ use std::path::Path;
 
 use eframe::egui::{self, CornerRadius, CursorIcon, Pos2, Rect, Sense, Stroke, StrokeKind, Vec2};
 
-use crate::models::{AccountProfile, Settings, UpdateState, UpdateStatus};
+use crate::models::{AccountProfile, CampusZone, Settings, UpdateState, UpdateStatus};
 use crate::ui::icons::{self, Icon};
 use crate::ui::theme::{
     body_text, bold_text, carrier_label, clamp_ui_zoom, with_alpha, Palette, ThemeMode, UiPrefs,
@@ -72,6 +72,10 @@ pub struct SettingsForm {
     pub also_create_campus_exit: bool,
     /// 最近一次保存前验密被拒的中文说明；存在时在账号卡片内展示醒目红框与「仍要强制保存」兜底入口。
     pub verify_error: Option<String>,
+    pub campus_zone: CampusZone,
+    pub custom_portal_url: String,
+    pub request_custom_portal_focus: bool,
+    pub gateway_probe_note: Option<(String, bool)>,
     pub check_interval: i64,
     pub heartbeat_minutes: i64,
     pub offline_interval: i64,
@@ -117,6 +121,10 @@ impl SettingsForm {
             carrier,
             also_create_campus_exit: is_empty,
             verify_error: None,
+            campus_zone: settings.campus_zone,
+            custom_portal_url: settings.custom_portal_url.clone(),
+            request_custom_portal_focus: false,
+            gateway_probe_note: None,
             check_interval: settings.check_interval,
             heartbeat_minutes: (settings.heartbeat_interval / 60).clamp(1, 1440),
             offline_interval: settings.offline_interval,
@@ -204,6 +212,8 @@ impl SettingsForm {
     /// 将全局监控/自启/通知参数合并回给定配置，保留已有账号列表与活跃账号。
     pub fn to_global_settings(&self, base: &Settings) -> Settings {
         Settings {
+            campus_zone: self.campus_zone,
+            custom_portal_url: self.custom_portal_url.trim().to_string(),
             check_interval: self.check_interval,
             heartbeat_interval: self.heartbeat_minutes.clamp(1, 1440) * 60,
             offline_interval: self.offline_interval,
@@ -232,7 +242,10 @@ impl SettingsForm {
 
     pub fn is_global_dirty(&self, saved: &Settings) -> bool {
         let current = self.to_global_settings(saved);
-        current.check_interval != saved.check_interval
+        let saved_norm = saved.normalized();
+        current.campus_zone != saved_norm.campus_zone
+            || current.custom_portal_url != saved_norm.custom_portal_url
+            || current.check_interval != saved.check_interval
             || current.heartbeat_interval != saved.heartbeat_interval
             || current.offline_interval != saved.offline_interval
             || current.confirm_failures != saved.confirm_failures
@@ -290,6 +303,7 @@ pub struct SettingsActions {
     pub set_window_size: Option<[f32; 2]>,
     pub check_update: bool,
     pub open_update_modal: bool,
+    pub probe_gateway: bool,
 }
 
 /// 成熟版 Windows 11 Fluent 设置中心视图（左侧分组导航 + 右侧分组卡片 + 底部常驻保存栏）。
@@ -304,9 +318,11 @@ pub fn draw_settings_view(
     log_path: &Path,
     account_creds: &HashMap<String, bool>,
     update_state: &UpdateState,
+    active_portal: &str,
     needs_setup: bool,
     saving: bool,
     verifying_account: bool,
+    probing_gateway: bool,
     total_height: f32,
 ) -> SettingsActions {
     let mut actions = SettingsActions::default();
@@ -501,9 +517,15 @@ pub fn draw_settings_view(
                                         verifying_account,
                                         &mut actions,
                                     ),
-                                    SettingsTab::Monitor => {
-                                        draw_monitor_page(ui, p, form, update_state, &mut actions)
-                                    }
+                                    SettingsTab::Monitor => draw_monitor_page(
+                                        ui,
+                                        p,
+                                        form,
+                                        active_portal,
+                                        probing_gateway,
+                                        update_state,
+                                        &mut actions,
+                                    ),
                                     SettingsTab::Display => {
                                         draw_display_page(ui, p, ui_prefs, &mut actions)
                                     }
@@ -1822,10 +1844,66 @@ fn draw_symmetric_carrier_row(
     changed
 }
 
+fn campus_zone_selector(ui: &mut egui::Ui, p: &Palette, zone: &mut CampusZone) -> bool {
+    let mut changed = false;
+    let items = CampusZone::ALL;
+    let gap = 5.0_f32;
+    let n = items.len();
+    let avail = ui.available_width().max(200.0);
+    let usable_w = avail - gap * (n.saturating_sub(1) as f32);
+    let base_w = (usable_w / n as f32).floor().max(46.0);
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = gap;
+        for (idx, item) in items.iter().enumerate() {
+            let active = *zone == *item;
+            let btn_w = if idx + 1 == n {
+                (usable_w - base_w * (n.saturating_sub(1) as f32)).max(base_w)
+            } else {
+                base_w
+            };
+            let (rect, resp) = ui.allocate_exact_size(Vec2::new(btn_w, 30.0), Sense::click());
+            let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+            let (fill, stroke, fg) = if active {
+                (p.accent_soft, Stroke::new(1.3_f32, p.accent), p.accent)
+            } else if resp.hovered() {
+                (p.card_hover, Stroke::new(1.0_f32, p.border_strong), p.text)
+            } else {
+                (p.subtle, Stroke::new(1.0_f32, p.border), p.text_secondary)
+            };
+            ui.painter().rect(
+                rect,
+                CornerRadius::same(RADIUS_SM),
+                fill,
+                stroke,
+                StrokeKind::Inside,
+            );
+            let font = if active {
+                egui::FontId::new(11.3, crate::ui::theme::bold_family())
+            } else {
+                egui::FontId::proportional(11.3)
+            };
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                item.short_label(),
+                font,
+                fg,
+            );
+            if resp.on_hover_text(item.description()).clicked() && *zone != *item {
+                *zone = *item;
+                changed = true;
+            }
+        }
+    });
+    changed
+}
+
 fn draw_monitor_page(
     ui: &mut egui::Ui,
     p: &Palette,
     form: &mut SettingsForm,
+    active_portal: &str,
+    probing_gateway: bool,
     update_state: &UpdateState,
     actions: &mut SettingsActions,
 ) {
@@ -1833,8 +1911,101 @@ fn draw_monitor_page(
         ui,
         p,
         "监控与自启",
-        "自定义网络巡检周期、防抖复核策略、Windows 登录自启与版本自动更新。",
+        "支持育才、雁山、王城多校区认证网关自动探测与切换，以及巡检周期、开机自启与版本更新。",
     );
+
+    group_card(ui, p, |ui| {
+        ui.spacing_mut().item_spacing.y = 4.0;
+        ui.label(bold_text("校区与认证网关", 12.0, p.text));
+        ui.label(body_text(
+            form.campus_zone.description(),
+            10.5,
+            p.text_muted,
+        ));
+        ui.add_space(3.0);
+        if campus_zone_selector(ui, p, &mut form.campus_zone) {
+            form.gateway_probe_note = None;
+            if form.campus_zone == CampusZone::Custom {
+                form.request_custom_portal_focus = true;
+            }
+        }
+
+        if form.campus_zone == CampusZone::Custom {
+            row_divider(ui, p);
+            ui.spacing_mut().item_spacing.y = 4.0;
+            ui.label(bold_text("自定义 Dr.COM 网关地址", 11.5, p.text));
+            let input_w = ui.available_width().max(180.0);
+            let edit_resp = styled_text_box(
+                ui,
+                p,
+                "custom_portal_url_input",
+                input_w,
+                Some(Icon::Globe),
+                &mut form.custom_portal_url,
+                "如 http://192.168.125.21 或 https://yc.gxnu.edu.cn",
+                false,
+                None,
+                &mut form.request_custom_portal_focus,
+            );
+            if edit_resp.changed() {
+                form.gateway_probe_note = None;
+            }
+        }
+
+        row_divider(ui, p);
+        let row_w = ui.available_width();
+        ui.allocate_ui_with_layout(
+            Vec2::new(row_w, 34.0),
+            egui::Layout::left_to_right(egui::Align::Center),
+            |ui| {
+                let left_w = (row_w - 104.0).max(150.0);
+                ui.allocate_ui_with_layout(
+                    Vec2::new(left_w, 32.0),
+                    egui::Layout::top_down(egui::Align::LEFT),
+                    |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.0;
+                        let title_txt = if !active_portal.is_empty() {
+                            format!("当前生效网关：{active_portal}")
+                        } else {
+                            "网关状态探测".to_string()
+                        };
+                        ui.label(bold_text(title_txt, 11.5, p.text));
+                        let (sub_txt, sub_col) = if probing_gateway {
+                            (
+                                "正在并行探测三校区候选网关与强制门户…".to_string(),
+                                p.accent,
+                            )
+                        } else if let Some((note, is_err)) = &form.gateway_probe_note {
+                            (note.clone(), if *is_err { p.danger } else { p.ok })
+                        } else if !active_portal.is_empty() {
+                            (
+                                "跨校区切换 Wi-Fi / 有线网络时将自动刷新网关缓存".to_string(),
+                                p.text_muted,
+                            )
+                        } else {
+                            (
+                                "连入师大校园网后自动锁定，也可点击右侧立即探测验证".to_string(),
+                                p.text_muted,
+                            )
+                        };
+                        ui.add(egui::Label::new(body_text(sub_txt, 10.5, sub_col)).truncate());
+                    },
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if probing_gateway {
+                        badge(ui, p.accent, p.accent_soft, p.accent_border, "探测中…");
+                    } else if draw_compact_action_btn(ui, p, Some(Icon::Router), "探测网关", false)
+                        .on_hover_text("立即实测当前网络下可达的师大 Dr.COM 认证网关及往返延迟")
+                        .clicked()
+                    {
+                        actions.probe_gateway = true;
+                    }
+                });
+            },
+        );
+    });
+
+    ui.add_space(10.0);
 
     group_card(ui, p, |ui| {
         fluent_stepper_row(
@@ -2578,6 +2749,17 @@ mod tests {
         assert_eq!(merged.check_interval, 60);
         assert_eq!(merged.accounts.len(), 2);
         assert_eq!(merged.active_account_id, "acc-1");
+
+        // 修改校区选路策略或自定义网关 -> 全局配置变脏，且自定义网关自动规范化
+        form.check_interval = saved.check_interval;
+        assert!(!form.is_global_dirty(&saved));
+        form.campus_zone = CampusZone::Yanshan;
+        assert!(form.is_global_dirty(&saved));
+        form.campus_zone = CampusZone::Custom;
+        form.custom_portal_url = "192.168.125.21/drcom/login".into();
+        let custom_merged = form.to_global_settings(&saved);
+        assert_eq!(custom_merged.campus_zone, CampusZone::Custom);
+        assert_eq!(custom_merged.custom_portal_url, "http://192.168.125.21");
     }
 
     #[test]
