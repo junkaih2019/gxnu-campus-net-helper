@@ -48,7 +48,7 @@
 
 ## 💡 Key Features
 
-- 🔄 **Multi-Campus Auto-Reconnect**: Automatically discovers and switches across **Yucai / Yanshan / Wangcheng** Dr.COM gateways (with manual & custom gateway overrides), signing back in after sleep/wake, Wi-Fi switches, or session timeouts with clear diagnostics.
+- 🔄 **Zero-Config Multi-Campus Auto-Reconnect**: Automatically discovers and switches across **Yucai / Yanshan / Wangcheng** Dr.COM gateways (with an optional custom gateway fallback), signing back in after sleep/wake, Wi-Fi switches, or session timeouts with clear diagnostics.
 - 📊 **Live Traffic & Device Sign-Out**: Syncs with GXNU Self-Service to toggle **Carrier throughput / Campus quota**, inspect recent session history, deduplicate dual-BRAS sessions, and **sign out (`注销`) occupying devices** in one click.
 - ⚡ **Instant Left-click Tray Flyout**: Single-click the tray icon for a minimalist native flyout to switch accounts, inspect traffic, sign out devices, and check stability without opening the main window.
 - 👥 **Dual-Exit Setup, Multi-Account Switch & VPN Guard**: Pair Carrier + Campus (`校园网`) exits in one click, add extra exits for the same student ID without retyping credentials, and auto-sync password updates across peer exits; warns to close VPN/proxy software before switching to the Campus exit.
@@ -66,7 +66,7 @@
 3. **Everyday Use**:
    - **Close the main window (`×`)** anytime to keep monitoring silently in the tray with minimal RAM;
    - **Left-click** the tray icon for the quick flyout, **double-click** for the main window, or **right-click** for the context menu;
-   - Enable **Start at sign-in** or customize your campus gateway (auto-detected across Yucai / Yanshan / Wangcheng by default) under **设置 → 监控与自启**.
+   - Enable **Start at sign-in** under **设置 → 监控与自启** if needed (Yucai / Yanshan / Wangcheng gateways are detected automatically with zero setup).
 
 ### Tray 5-State Indicators
 
@@ -79,7 +79,7 @@
 ## ❓ FAQ
 
 - **Do I need to reconfigure anything when moving between Yucai, Yanshan, and Wangcheng campuses?**  
-  No. **Auto-detect (`自动探测`)** is enabled by default — it races campus gateways and sniffs captive-portal redirects with strict GXNU subnet & protocol verification (never leaking credentials on public Wi-Fi or home routers). You can also manually pin a campus or specify a custom gateway URL under **设置 → 监控与自启 → 校区与认证网关**.
+  No. Multi-campus gateway discovery runs automatically — racing campus gateways and sniffing captive-portal redirects with strict GXNU subnet & protocol verification (never leaking credentials on public Wi-Fi or home routers). For special lab subnets, a collapsible **Custom (`自定义`)** override is available under **设置 → 监控与自启 → 认证网关**.
 - **Why are there both "Carrier" (`运营商`) and "Campus" (`校园网`) traffic views?**  
   Carrier broadband exits (Telecom / Unicom / Mobile / Broadnet) are unmetered, whereas the self-service package quota only applies to the Campus (`校园网`) exit. The app defaults to your active exit and lets you toggle anytime.
 - **Does it conflict with Clash / Mihomo (TUN mode)?**  

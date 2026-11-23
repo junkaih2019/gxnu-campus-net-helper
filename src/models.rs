@@ -805,13 +805,17 @@ impl Settings {
             .map(|a| (a.student_id.clone(), a.carrier.clone(), a.monthly_quota_gb))
             .unwrap_or((legacy_sid, legacy_carrier, legacy_quota));
 
+        let campus_zone = match self.campus_zone {
+            CampusZone::Custom => CampusZone::Custom,
+            _ => CampusZone::Auto,
+        };
         let custom_portal_url = normalize_custom_portal_origin(&self.custom_portal_url)
             .unwrap_or_else(|| self.custom_portal_url.trim().to_string());
 
         Self {
             student_id,
             carrier,
-            campus_zone: self.campus_zone,
+            campus_zone,
             custom_portal_url,
             check_interval: self.check_interval.clamp(10, 3600),
             heartbeat_interval: self.heartbeat_interval.clamp(60, 86400),

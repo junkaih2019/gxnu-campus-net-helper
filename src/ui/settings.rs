@@ -1844,58 +1844,115 @@ fn draw_symmetric_carrier_row(
     changed
 }
 
-fn campus_zone_selector(ui: &mut egui::Ui, p: &Palette, zone: &mut CampusZone) -> bool {
-    let mut changed = false;
-    let items = CampusZone::ALL;
-    let gap = 5.0_f32;
-    let n = items.len();
-    let avail = ui.available_width().max(200.0);
-    let usable_w = avail - gap * (n.saturating_sub(1) as f32);
-    let base_w = (usable_w / n as f32).floor().max(46.0);
-    ui.horizontal(|ui| {
-        ui.spacing_mut().item_spacing.x = gap;
-        for (idx, item) in items.iter().enumerate() {
-            let active = *zone == *item;
-            let btn_w = if idx + 1 == n {
-                (usable_w - base_w * (n.saturating_sub(1) as f32)).max(base_w)
-            } else {
-                base_w
-            };
-            let (rect, resp) = ui.allocate_exact_size(Vec2::new(btn_w, 30.0), Sense::click());
-            let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
-            let (fill, stroke, fg) = if active {
-                (p.accent_soft, Stroke::new(1.3_f32, p.accent), p.accent)
-            } else if resp.hovered() {
-                (p.card_hover, Stroke::new(1.0_f32, p.border_strong), p.text)
-            } else {
-                (p.subtle, Stroke::new(1.0_f32, p.border), p.text_secondary)
-            };
-            ui.painter().rect(
-                rect,
-                CornerRadius::same(RADIUS_SM),
-                fill,
-                stroke,
-                StrokeKind::Inside,
+fn draw_gateway_row(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    form: &mut SettingsForm,
+    active_portal: &str,
+    probing_gateway: bool,
+    actions: &mut SettingsActions,
+) {
+    let is_custom = form.campus_zone == CampusZone::Custom;
+    let row_w = ui.available_width();
+    let right_reserve = if is_custom { 154.0 } else { 132.0 };
+    let left_w = (row_w - right_reserve).max(150.0);
+
+    ui.allocate_ui_with_layout(
+        Vec2::new(row_w, 38.0),
+        egui::Layout::left_to_right(egui::Align::Center),
+        |ui| {
+            ui.allocate_ui_with_layout(
+                Vec2::new(left_w, 36.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.spacing_mut().item_spacing.y = 2.0;
+                    ui.horizontal(|ui| {
+                        ui.spacing_mut().item_spacing.x = 6.0;
+                        ui.label(bold_text("认证网关", 12.0, p.text));
+                        if is_custom {
+                            badge(ui, p.warn, p.warn_soft, p.warn_border, "自定义覆盖");
+                        } else {
+                            badge(ui, p.ok, p.ok_soft, p.ok_border, "自动识别");
+                        }
+                    });
+                    let (sub_txt, sub_col) = if probing_gateway {
+                        (
+                            "正在并行探测三校区认证网关与强制门户…".to_string(),
+                            p.accent,
+                        )
+                    } else if let Some((note, is_err)) = &form.gateway_probe_note {
+                        (note.clone(), if *is_err { p.danger } else { p.ok })
+                    } else if is_custom {
+                        (
+                            "仅使用下方手动指定的网关地址，点击「恢复自动」即可切回无感识别"
+                                .to_string(),
+                            p.text_muted,
+                        )
+                    } else if !active_portal.is_empty() {
+                        (
+                            format!("育才 / 雁山 / 王城无感切换 · 当前生效：{active_portal}"),
+                            p.ok,
+                        )
+                    } else {
+                        (
+                            "育才 / 雁山 / 王城三校区无感切换，连入校园网后自动锁定".to_string(),
+                            p.text_muted,
+                        )
+                    };
+                    ui.add(egui::Label::new(body_text(sub_txt, 10.5, sub_col)).truncate());
+                },
             );
-            let font = if active {
-                egui::FontId::new(11.3, crate::ui::theme::bold_family())
-            } else {
-                egui::FontId::proportional(11.3)
-            };
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                item.short_label(),
-                font,
-                fg,
-            );
-            if resp.on_hover_text(item.description()).clicked() && *zone != *item {
-                *zone = *item;
-                changed = true;
-            }
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                if is_custom {
+                    if draw_compact_action_btn(ui, p, None, "恢复自动", true)
+                        .on_hover_text("关闭手动覆盖，恢复三校区全自动识别与无感切换")
+                        .clicked()
+                    {
+                        form.campus_zone = CampusZone::Auto;
+                        form.gateway_probe_note = None;
+                    }
+                } else if draw_compact_action_btn(ui, p, None, "自定义", false)
+                    .on_hover_text("仅在特殊子网无法自动识别时，手动指定 Dr.COM 认证网关地址")
+                    .clicked()
+                {
+                    form.campus_zone = CampusZone::Custom;
+                    form.request_custom_portal_focus = true;
+                    form.gateway_probe_note = None;
+                }
+
+                if probing_gateway {
+                    badge(ui, p.accent, p.accent_soft, p.accent_border, "探测中…");
+                } else if draw_compact_action_btn(ui, p, Some(Icon::Router), "探测", false)
+                    .on_hover_text("立即实测当前网络下可达的师大认证网关与延迟")
+                    .clicked()
+                {
+                    actions.probe_gateway = true;
+                }
+            });
+        },
+    );
+
+    if is_custom {
+        ui.add_space(6.0);
+        let input_w = ui.available_width().max(180.0);
+        let edit_resp = styled_text_box(
+            ui,
+            p,
+            "custom_portal_url_input",
+            input_w,
+            Some(Icon::Globe),
+            &mut form.custom_portal_url,
+            "填写自定义网关，如 http://192.168.125.21 或 https://yc.gxnu.edu.cn",
+            false,
+            None,
+            &mut form.request_custom_portal_focus,
+        );
+        if edit_resp.changed() {
+            form.gateway_probe_note = None;
         }
-    });
-    changed
+    }
 }
 
 fn draw_monitor_page(
@@ -1911,103 +1968,12 @@ fn draw_monitor_page(
         ui,
         p,
         "监控与自启",
-        "支持育才、雁山、王城多校区认证网关自动探测与切换，以及巡检周期、开机自启与版本更新。",
+        "管理三校区网关探测、网络巡检周期、Windows 登录自启与版本自动更新。",
     );
 
     group_card(ui, p, |ui| {
-        ui.spacing_mut().item_spacing.y = 4.0;
-        ui.label(bold_text("校区与认证网关", 12.0, p.text));
-        ui.label(body_text(
-            form.campus_zone.description(),
-            10.5,
-            p.text_muted,
-        ));
-        ui.add_space(3.0);
-        if campus_zone_selector(ui, p, &mut form.campus_zone) {
-            form.gateway_probe_note = None;
-            if form.campus_zone == CampusZone::Custom {
-                form.request_custom_portal_focus = true;
-            }
-        }
-
-        if form.campus_zone == CampusZone::Custom {
-            row_divider(ui, p);
-            ui.spacing_mut().item_spacing.y = 4.0;
-            ui.label(bold_text("自定义 Dr.COM 网关地址", 11.5, p.text));
-            let input_w = ui.available_width().max(180.0);
-            let edit_resp = styled_text_box(
-                ui,
-                p,
-                "custom_portal_url_input",
-                input_w,
-                Some(Icon::Globe),
-                &mut form.custom_portal_url,
-                "如 http://192.168.125.21 或 https://yc.gxnu.edu.cn",
-                false,
-                None,
-                &mut form.request_custom_portal_focus,
-            );
-            if edit_resp.changed() {
-                form.gateway_probe_note = None;
-            }
-        }
-
+        draw_gateway_row(ui, p, form, active_portal, probing_gateway, actions);
         row_divider(ui, p);
-        let row_w = ui.available_width();
-        ui.allocate_ui_with_layout(
-            Vec2::new(row_w, 34.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                let left_w = (row_w - 104.0).max(150.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(left_w, 32.0),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        let title_txt = if !active_portal.is_empty() {
-                            format!("当前生效网关：{active_portal}")
-                        } else {
-                            "网关状态探测".to_string()
-                        };
-                        ui.label(bold_text(title_txt, 11.5, p.text));
-                        let (sub_txt, sub_col) = if probing_gateway {
-                            (
-                                "正在并行探测三校区候选网关与强制门户…".to_string(),
-                                p.accent,
-                            )
-                        } else if let Some((note, is_err)) = &form.gateway_probe_note {
-                            (note.clone(), if *is_err { p.danger } else { p.ok })
-                        } else if !active_portal.is_empty() {
-                            (
-                                "跨校区切换 Wi-Fi / 有线网络时将自动刷新网关缓存".to_string(),
-                                p.text_muted,
-                            )
-                        } else {
-                            (
-                                "连入师大校园网后自动锁定，也可点击右侧立即探测验证".to_string(),
-                                p.text_muted,
-                            )
-                        };
-                        ui.add(egui::Label::new(body_text(sub_txt, 10.5, sub_col)).truncate());
-                    },
-                );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if probing_gateway {
-                        badge(ui, p.accent, p.accent_soft, p.accent_border, "探测中…");
-                    } else if draw_compact_action_btn(ui, p, Some(Icon::Router), "探测网关", false)
-                        .on_hover_text("立即实测当前网络下可达的师大 Dr.COM 认证网关及往返延迟")
-                        .clicked()
-                    {
-                        actions.probe_gateway = true;
-                    }
-                });
-            },
-        );
-    });
-
-    ui.add_space(10.0);
-
-    group_card(ui, p, |ui| {
         fluent_stepper_row(
             ui,
             p,
@@ -2750,13 +2716,12 @@ mod tests {
         assert_eq!(merged.accounts.len(), 2);
         assert_eq!(merged.active_account_id, "acc-1");
 
-        // 修改校区选路策略或自定义网关 -> 全局配置变脏，且自定义网关自动规范化
+        // 修改自定义网关覆盖 -> 全局配置变脏，且自定义网关自动规范化
         form.check_interval = saved.check_interval;
         assert!(!form.is_global_dirty(&saved));
-        form.campus_zone = CampusZone::Yanshan;
-        assert!(form.is_global_dirty(&saved));
         form.campus_zone = CampusZone::Custom;
         form.custom_portal_url = "192.168.125.21/drcom/login".into();
+        assert!(form.is_global_dirty(&saved));
         let custom_merged = form.to_global_settings(&saved);
         assert_eq!(custom_merged.campus_zone, CampusZone::Custom);
         assert_eq!(custom_merged.custom_portal_url, "http://192.168.125.21");
