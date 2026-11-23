@@ -17,53 +17,30 @@
 
 ---
 
-## ✨ Preview
-
-### Main Dashboard
+## ✨ Interface Overview
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/main-window.png">
-    <source media="(prefers-color-scheme: light)" srcset="docs/images/main-window-light.png">
-    <img src="docs/images/main-window-light.png" alt="GXNU Campus Network Helper main dashboard">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-overview-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/readme-overview-light.png">
+    <img src="docs/images/readme-overview-light.png" alt="GXNU Campus Network Helper unified interface showcase (Main Dashboard, Quick Tray Flyout, Multi-Account Settings, Multi-Campus Gateway & 5-State Tray)">
   </picture>
 </p>
 
-### Tray Experience (Left-click Flyout × Right-click Menu)
-
-<table>
-  <tr>
-    <th align="center">🖱️ Left-click · Quick Flyout (Switch Account & Sign Out Devices)</th>
-    <th align="center">🖱️ Right-click · Context Menu</th>
-  </tr>
-  <tr>
-    <td align="center" valign="middle">
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="docs/images/tray-flyout.png">
-        <source media="(prefers-color-scheme: light)" srcset="docs/images/tray-flyout-light.png">
-        <img src="docs/images/tray-flyout-light.png" width="300" alt="Left-click vertical tray flyout">
-      </picture>
-    </td>
-    <td align="center" valign="middle">
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="docs/images/tray-menu.png">
-        <source media="(prefers-color-scheme: light)" srcset="docs/images/tray-menu-light.png">
-        <img src="docs/images/tray-menu-light.png" width="248" alt="Right-click context menu">
-      </picture>
-    </td>
-  </tr>
-</table>
-
 <details>
-<summary>🖼️ More views: Light / Dark comparison, Campus multi-device view & Settings Center</summary>
+<summary>🖼️ Expand individual screenshots (Light / Dark Dashboard, Tray Flyout, Context Menu & Settings Center)</summary>
 
 | Light Dashboard (Carrier view) | Dark Dashboard (Carrier view) |
 | :---: | :---: |
 | [![Light dashboard](docs/images/main-window-light.png)](docs/images/main-window-light.png) | [![Dark dashboard](docs/images/main-window.png)](docs/images/main-window.png) |
 
-| Campus Quota & Multi-device Management | Settings Center (Multi-account) |
+| Campus Quota & Multi-device Management | Settings Center (Multi-account & 5 Exits) |
 | :---: | :---: |
 | [![Campus quota & multi-device view](docs/images/main-window-campus.png)](docs/images/main-window-campus.png) | [![Settings Center multi-account](docs/images/settings-dark.png)](docs/images/settings-dark.png) |
+
+| Left-click · Quick Tray Flyout | Right-click · Context Menu |
+| :---: | :---: |
+| [![Left-click vertical tray flyout](docs/images/tray-flyout-light.png)](docs/images/tray-flyout-light.png) | [![Right-click context menu](docs/images/tray-menu-light.png)](docs/images/tray-menu-light.png) |
 
 </details>
 
@@ -89,11 +66,11 @@
 3. **Everyday Use**:
    - **Close the main window (`×`)** anytime to keep monitoring silently in the tray with minimal RAM;
    - **Left-click** the tray icon for the quick flyout, **double-click** for the main window, or **right-click** for the context menu;
-   - Enable **Start at sign-in** under **设置 → 监控与自启** if needed.
+   - Enable **Start at sign-in** or customize your campus gateway (auto-detected across Yucai / Yanshan / Wangcheng by default) under **设置 → 监控与自启**.
 
-### Tray Status Indicators
+### Tray 5-State Indicators
 
-| <img src="docs/images/tray-online.png" width="22"> Online | <img src="docs/images/tray-checking.png" width="22"> Checking | <img src="docs/images/tray-recovery.png" width="22"> Recovering | <img src="docs/images/tray-offline.png" width="22"> Offline | <img src="docs/images/tray-paused.png" width="22"> Paused |
+| <img src="docs/images/tray-v2-online.png" width="24"> Online | <img src="docs/images/tray-v2-checking.png" width="24"> Checking | <img src="docs/images/tray-v2-recovery.png" width="24"> Recovering | <img src="docs/images/tray-v2-offline.png" width="24"> Offline | <img src="docs/images/tray-v2-paused.png" width="24"> Paused |
 | :---: | :---: | :---: | :---: | :---: |
 | Internet OK | Routine probe | Recheck / Sign-in / Verify | Disconnected or rejected | Monitoring paused |
 
@@ -101,6 +78,8 @@
 
 ## ❓ FAQ
 
+- **Do I need to reconfigure anything when moving between Yucai, Yanshan, and Wangcheng campuses?**  
+  No. **Auto-detect (`自动探测`)** is enabled by default — it races campus gateways and sniffs captive-portal redirects with strict GXNU subnet & protocol verification (never leaking credentials on public Wi-Fi or home routers). You can also manually pin a campus or specify a custom gateway URL under **设置 → 监控与自启 → 校区与认证网关**.
 - **Why are there both "Carrier" (`运营商`) and "Campus" (`校园网`) traffic views?**  
   Carrier broadband exits (Telecom / Unicom / Mobile / Broadnet) are unmetered, whereas the self-service package quota only applies to the Campus (`校园网`) exit. The app defaults to your active exit and lets you toggle anytime.
 - **Does it conflict with Clash / Mihomo (TUN mode)?**  

@@ -17,53 +17,30 @@
 
 ---
 
-## ✨ 界面预览
-
-### 主窗口看板
+## ✨ 界面总览
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/main-window.png">
-    <source media="(prefers-color-scheme: light)" srcset="docs/images/main-window-light.png">
-    <img src="docs/images/main-window-light.png" alt="GXNU 校园网守护助手主窗口">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-overview-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="docs/images/readme-overview-light.png">
+    <img src="docs/images/readme-overview-light.png" alt="GXNU 校园网守护助手多界面全景预览（主窗口看板、托盘左键浮窗、多账号管理、三校区网关切换与五态托盘）">
   </picture>
 </p>
 
-### 托盘交互（左键浮窗 × 右键菜单）
-
-<table>
-  <tr>
-    <th align="center">🖱️ 左键单击 · 竖版快捷浮窗（支持切号与踢线）</th>
-    <th align="center">🖱️ 右键单击 · 快捷菜单</th>
-  </tr>
-  <tr>
-    <td align="center" valign="middle">
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="docs/images/tray-flyout.png">
-        <source media="(prefers-color-scheme: light)" srcset="docs/images/tray-flyout-light.png">
-        <img src="docs/images/tray-flyout-light.png" width="300" alt="左键单击托盘竖版快捷浮窗">
-      </picture>
-    </td>
-    <td align="center" valign="middle">
-      <picture>
-        <source media="(prefers-color-scheme: dark)" srcset="docs/images/tray-menu.png">
-        <source media="(prefers-color-scheme: light)" srcset="docs/images/tray-menu-light.png">
-        <img src="docs/images/tray-menu-light.png" width="248" alt="右键单击托盘快捷菜单">
-      </picture>
-    </td>
-  </tr>
-</table>
-
 <details>
-<summary>🖼️ 展开查看：浅色 / 深色主题对比、校园网多设备视图与设置中心</summary>
+<summary>🖼️ 展开查看各界面独立高清截图（浅色 / 深色主看板、托盘浮窗、右键菜单与设置中心）</summary>
 
 | 浅色主窗口（运营商视角） | 深色主窗口（运营商视角） |
 | :---: | :---: |
 | [![浅色主窗口](docs/images/main-window-light.png)](docs/images/main-window-light.png) | [![深色主窗口](docs/images/main-window.png)](docs/images/main-window.png) |
 
-| 校园网额度与多终端管理视图 | 设置中心（多账号管理） |
+| 校园网额度与多终端管理视图 | 设置中心（多账号与五出口管理） |
 | :---: | :---: |
 | [![校园网额度与多终端管理视图](docs/images/main-window-campus.png)](docs/images/main-window-campus.png) | [![设置中心多账号管理](docs/images/settings-dark.png)](docs/images/settings-dark.png) |
+
+| 左键单击 · 竖版快捷浮窗 | 右键单击 · 快捷菜单 |
+| :---: | :---: |
+| [![左键托盘快捷浮窗](docs/images/tray-flyout-light.png)](docs/images/tray-flyout-light.png) | [![右键托盘菜单](docs/images/tray-menu-light.png)](docs/images/tray-menu-light.png) |
 
 </details>
 
@@ -89,11 +66,11 @@
 3. **日常使用**：
    - **平时直接关闭主窗口（`×`）**，程序会在系统托盘极轻常驻；
    - **左键单击**托盘图标秒开快捷浮窗，**左键双击**打开完整主窗口，**右键单击**呼出快捷菜单；
-   - 如需开机自启，在 **设置 → 监控与自启** 中勾选「开机自动启动到托盘」并保存即可。
+   - 如需开机自启或手动指定校区网关（默认自动识别育才/雁山/王城），可在 **设置 → 监控与自启** 中调整并保存。
 
-### 托盘状态指示
+### 托盘五态指示
 
-| <img src="docs/images/tray-online.png" width="22"> 正常 | <img src="docs/images/tray-checking.png" width="22"> 检测中 | <img src="docs/images/tray-recovery.png" width="22"> 重连恢复中 | <img src="docs/images/tray-offline.png" width="22"> 连接异常 | <img src="docs/images/tray-paused.png" width="22"> 已暂停 |
+| <img src="docs/images/tray-v2-online.png" width="24"> 正常在线 | <img src="docs/images/tray-v2-checking.png" width="24"> 检测中 | <img src="docs/images/tray-v2-recovery.png" width="24"> 重连恢复中 | <img src="docs/images/tray-v2-offline.png" width="24"> 连接异常 | <img src="docs/images/tray-v2-paused.png" width="24"> 已暂停 |
 | :---: | :---: | :---: | :---: | :---: |
 | 公网连通正常 | 正在例行探测 | 复核 / 登录 / 验证中 | 离线或认证被拒 | 自动守护已暂停 |
 
@@ -101,6 +78,8 @@
 
 ## ❓ 常见问题
 
+- **在育才、雁山、王城不同校区之间移动需要手动改设置吗？**  
+  不需要。程序默认开启**「自动探测」**，会自动并行测速候选网关并嗅探当前校区的认证门户，合盖换校区联网也会自动无缝切换；同时内置师大网段与协议白名单校验，在外连接公共 Wi-Fi 或家用路由绝不会误发凭据。若有特殊需求，也可在「设置 → 监控与自启 → 校区与认证网关」手动锁定校区或填写自定义网关地址。
 - **为什么账号流量有「运营商」和「校园网」两个切换项？**  
   师大电信/联通/移动/广电宽带出口通常不限流量，而自助服务套餐余量仅统计「校园网」出口额度。程序默认匹配当前账号出口视角，也可随时点击右上角一键切换。
 - **开着 Clash / Mihomo 代理（或 TUN 模式）会影响自动登录吗？**  
