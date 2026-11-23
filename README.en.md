@@ -20,11 +20,7 @@
 ## ✨ Interface Overview
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-overview-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="docs/images/readme-overview-light.png">
-    <img src="docs/images/readme-overview-light.png" alt="GXNU Campus Network Helper unified interface showcase (Main Dashboard, Quick Tray Flyout, Multi-Account Settings, Multi-Campus Gateway & 5-State Tray)">
-  </picture>
+  <img src="docs/images/readme-overview-light.png" alt="GXNU Campus Network Helper unified interface showcase (Main Dashboard, Quick Tray Flyout, Multi-Account Settings, Context Menu & 5-State Tray)">
 </p>
 
 <details>

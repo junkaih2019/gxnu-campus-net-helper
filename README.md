@@ -20,11 +20,7 @@
 ## ✨ 界面总览
 
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/images/readme-overview-dark.png">
-    <source media="(prefers-color-scheme: light)" srcset="docs/images/readme-overview-light.png">
-    <img src="docs/images/readme-overview-light.png" alt="GXNU 校园网守护助手多界面全景预览（主窗口看板、托盘左键浮窗、多账号管理、三校区网关切换与五态托盘）">
-  </picture>
+  <img src="docs/images/readme-overview-light.png" alt="GXNU 校园网守护助手多界面全景预览（主窗口看板、托盘左键浮窗、多账号管理、右键快捷菜单与五态托盘）">
 </p>
 
 <details>
