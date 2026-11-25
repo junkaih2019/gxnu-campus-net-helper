@@ -1172,7 +1172,7 @@ dependencies = [
 
 [[package]]
 name = "gxnu-guard"
-version = "0.2.6"
+version = "0.2.7"
 dependencies = [
  "chrono",
  "eframe",

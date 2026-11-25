@@ -56,13 +56,13 @@
 
 ## 🚀 Quick Start
 
-1. **Download & Run**: Grab **`gxnu-campus-net-helper-v0.2.6.exe`** from [Releases](https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest), place it in a **permanent folder**, and run it directly (no installer or extraction needed).
+1. **Download & Run**: Grab **`gxnu-campus-net-helper-v0.2.7.exe`** from [Releases](https://github.com/junkaih2019/gxnu-campus-net-helper/releases/latest), place it in a **permanent folder**, and run it directly (no installer or extraction needed).
    > 💡 If Windows SmartScreen appears on first launch, click **More info → Run anyway** (you can verify the hash against `SHA256SUMS.txt` on the release page).
 2. **Add Account**: Enter your student ID and password on the left, select your exit (`校园网 / 电信 / 联通 / 移动 / 广电`) on the right — optionally keeping **同时生成「校园网」快捷切换项** checked to pair both exits at once — and click **验证并添加账号 (Verify & Add)**; adding extra exits for the same student ID later requires no password re-entry.
 3. **Everyday Use**:
    - **Close the main window (`×`)** anytime to keep monitoring silently in the tray with minimal RAM;
    - **Left-click** the tray icon for the quick flyout, **double-click** for the main window, or **right-click** for the context menu;
-   - Enable **Start at sign-in** under **设置 → 监控与自启** if needed (Yucai / Yanshan / Wangcheng gateways are detected automatically with zero setup).
+   - Auto-start at sign-in is enabled by default during first-time setup and can be toggled anytime under **设置 → 监控与自启** (Yucai / Yanshan / Wangcheng gateways are detected automatically with zero setup).
 
 ### Tray 5-State Indicators
 
