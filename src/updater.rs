@@ -1659,24 +1659,222 @@ fn sibling_path_with_suffix(exe: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(os)
 }
 
+/// 若 `exe` 的文件名（不含目录与扩展名）中包含语义版本号片段（如 `gxnu-campus-net-helper-v0.2.6.exe`、
+/// `GXNU校园网守护助手v0.2.6.exe`、`gxnu-0.2.0-windows-x64.exe`），则将最右侧版本号片段替换为 `new_version`
+/// （保留原有的 `v` / `V` 前缀风格）；若文件名不含版本号（如用户自定义的 `校园网助手.exe`），原样返回。
+pub fn updated_exe_path(exe: &Path, new_version: &str) -> PathBuf {
+    let clean_ver = normalize_version_str(new_version);
+    if clean_ver.is_empty() || parse_version(&clean_ver).is_none() {
+        return exe.to_path_buf();
+    }
+    let Some(stem) = exe.file_stem().and_then(|s| s.to_str()) else {
+        return exe.to_path_buf();
+    };
+    let Some((start, end, v_prefix)) = find_rightmost_version_span(stem) else {
+        return exe.to_path_buf();
+    };
+
+    let mut new_stem = String::with_capacity(stem.len() + clean_ver.len());
+    new_stem.push_str(&stem[..start]);
+    if let Some(prefix) = v_prefix {
+        new_stem.push(prefix);
+    }
+    new_stem.push_str(&clean_ver);
+    new_stem.push_str(&stem[end..]);
+
+    let mut new_name = std::ffi::OsString::from(new_stem);
+    if let Some(ext) = exe.extension() {
+        new_name.push(".");
+        new_name.push(ext);
+    }
+    match exe.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(new_name),
+        _ => PathBuf::from(new_name),
+    }
+}
+
+fn find_rightmost_version_span(stem: &str) -> Option<(usize, usize, Option<char>)> {
+    let bytes = stem.as_bytes();
+    let mut i = 0usize;
+    let mut last_match = None;
+
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let prev_char = stem[..i].chars().next_back();
+        if prev_char.is_some_and(|c| c.is_ascii_digit() || c == '.') {
+            i += 1;
+            continue;
+        }
+
+        let start_info = match prev_char {
+            Some(vp @ ('v' | 'V')) => {
+                let before_v = stem[..i - 1].chars().next_back();
+                before_v
+                    .is_none_or(|c| !c.is_ascii_alphanumeric())
+                    .then_some((i - 1, Some(vp)))
+            }
+            Some(c) if c.is_ascii_alphanumeric() => None,
+            _ => Some((i, None)),
+        };
+
+        let mut pos = i;
+        let mut seg_count = 0usize;
+        let mut valid_numbers = true;
+        loop {
+            let seg_start = pos;
+            while pos < bytes.len() && bytes[pos].is_ascii_digit() {
+                pos += 1;
+            }
+            if pos == seg_start {
+                break;
+            }
+            if stem[seg_start..pos].parse::<u32>().is_err() {
+                valid_numbers = false;
+                break;
+            }
+            seg_count += 1;
+            if pos < bytes.len()
+                && bytes[pos] == b'.'
+                && pos + 1 < bytes.len()
+                && bytes[pos + 1].is_ascii_digit()
+            {
+                pos += 1;
+            } else {
+                break;
+            }
+        }
+
+        let after_ok = stem[pos..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_ascii_alphanumeric() && c != '.');
+
+        if let Some((span_start, v_prefix)) = start_info {
+            if valid_numbers && (2..=4).contains(&seg_count) && after_ok {
+                last_match = Some((span_start, pos, v_prefix));
+            }
+        }
+        i = pos.max(i + 1);
+    }
+
+    last_match
+}
+
 /// 将已校验的新版 `.new` 原子替换到 `target_exe`（先将运行中的 `target_exe` 改名为 `.old`）。
 /// 若第二步改名失败则立即将 `.old` 改回 `target_exe` 无损回滚。
 pub fn atomic_swap_executable(target_exe: &Path, staged_new_exe: &Path) -> Result<PathBuf, String> {
-    let old_exe = sibling_path_with_suffix(target_exe, ".old");
+    let (_, old_exe) = atomic_swap_executable_to(target_exe, target_exe, staged_new_exe)?;
+    Ok(old_exe)
+}
+
+/// 将运行中的 `current_exe` 替换为 `staged_new_exe`，并同步重命名为期望的新版文件名 `desired_exe`。
+/// 返回 `(实际落盘的新版可执行路径, 待清理的 .old 备份路径)`。
+pub fn atomic_swap_executable_to(
+    current_exe: &Path,
+    desired_exe: &Path,
+    staged_new_exe: &Path,
+) -> Result<(PathBuf, PathBuf), String> {
+    let mut final_exe = desired_exe.to_path_buf();
+    if !crate::startup::same_exe_path(current_exe, &final_exe) && final_exe.exists() {
+        if let Err(err) = fs::remove_file(&final_exe) {
+            logging::warn(&format!(
+                "[UPDATER] 目标文件名「{}」已存在且无法覆盖（{err}），回退保留原文件名",
+                final_exe.display()
+            ));
+            final_exe = current_exe.to_path_buf();
+        }
+    }
+
+    let old_exe = sibling_path_with_suffix(&final_exe, ".old");
     if old_exe.exists() {
         let _ = fs::remove_file(&old_exe);
     }
-    if target_exe.exists() {
-        fs::rename(target_exe, &old_exe)
+    let legacy_old = sibling_path_with_suffix(current_exe, ".old");
+    if legacy_old != old_exe && legacy_old.exists() {
+        let _ = fs::remove_file(&legacy_old);
+    }
+
+    if current_exe.exists() {
+        fs::rename(current_exe, &old_exe)
             .map_err(|e| format!("无法重命名当前程序以腾出更新位置：{e}"))?;
     }
-    if let Err(err) = fs::rename(staged_new_exe, target_exe) {
+    if let Err(err) = fs::rename(staged_new_exe, &final_exe) {
         if old_exe.exists() {
-            let _ = fs::rename(&old_exe, target_exe);
+            let _ = fs::rename(&old_exe, current_exe);
         }
         return Err(format!("写入新版可执行文件失败（已回滚原程序）：{err}"));
     }
-    Ok(old_exe)
+    Ok((final_exe, old_exe))
+}
+
+/// 兼容从 `v0.2.2`～`v0.2.7` 旧版原位同名覆盖升级上来的场景：
+/// 旧版更新器会把新版二进制写回旧版本号文件名（如 `...-v0.2.6.exe`）并拉起 `--after-update`；
+/// 此函数在旧进程已退出且尚未持有单实例锁时，将自身可执行文件改名为当前版本号文件名并无缝重启一次，
+/// 使 `current_exe()`、文件资源管理器展示及后续开机自启同步路径全部对齐新版本号。
+pub fn realign_self_filename_after_update(current_version: &str) -> bool {
+    let Ok(current_exe) = std::env::current_exe() else {
+        return false;
+    };
+    if crate::startup::auto_manage_disabled_for(&current_exe) {
+        return false;
+    }
+    let desired_exe = updated_exe_path(&current_exe, current_version);
+    if crate::startup::same_exe_path(&current_exe, &desired_exe) {
+        return false;
+    }
+    if desired_exe.exists() && fs::remove_file(&desired_exe).is_err() {
+        return false;
+    }
+
+    // 若旧版的图形界面子进程仍在关闭收尾，短暂重试清理旧名对应的 `.old`；若仍占用则随新文件名一并改名以便下次启动清理
+    let legacy_old = sibling_path_with_suffix(&current_exe, ".old");
+    if legacy_old.exists() {
+        for _ in 0..10 {
+            if fs::remove_file(&legacy_old).is_ok() || !legacy_old.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(80));
+        }
+        if legacy_old.exists() {
+            let desired_old = sibling_path_with_suffix(&desired_exe, ".old");
+            let _ = fs::rename(&legacy_old, &desired_old);
+        }
+    }
+
+    if fs::rename(&current_exe, &desired_exe).is_err() {
+        return false;
+    }
+    let my_pid = std::process::id().to_string();
+    let mut forward_args = vec![
+        "--after-update".to_string(),
+        my_pid,
+        "--renamed-self".to_string(),
+    ];
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    let mut idx = 0usize;
+    while idx < raw_args.len() {
+        if raw_args[idx] == "--after-update" {
+            idx += 2;
+            continue;
+        }
+        if raw_args[idx] != "--renamed-self" {
+            forward_args.push(raw_args[idx].clone());
+        }
+        idx += 1;
+    }
+    match std::process::Command::new(&desired_exe)
+        .args(&forward_args)
+        .spawn()
+    {
+        Ok(_) => true,
+        Err(_) => {
+            let _ = fs::rename(&desired_exe, &current_exe);
+            false
+        }
+    }
 }
 
 /// 启动时静默清理上次原位自更新遗留的 `<current_exe>.old` 与临时目录安装包。
@@ -1720,13 +1918,19 @@ pub fn wait_for_pid_exit(pid: u32, timeout: Duration) {
 pub fn run_elevated_apply_update(target_exe: &Path, wait_pid: u32) -> Result<(), String> {
     wait_for_pid_exit(wait_pid, Duration::from_secs(12));
     let self_exe = std::env::current_exe().map_err(|e| format!("无法获取更新器路径：{e}"))?;
-    let same_dir_new = sibling_path_with_suffix(target_exe, ".new");
+    let desired_exe = updated_exe_path(target_exe, CURRENT_VERSION);
+    let same_dir_new = sibling_path_with_suffix(&desired_exe, ".new");
     fs::copy(&self_exe, &same_dir_new).map_err(|e| format!("复制更新包到目标目录失败：{e}"))?;
-    atomic_swap_executable(target_exe, &same_dir_new)?;
-    let _ = std::process::Command::new(target_exe)
-        .args(["--after-update", "0"])
+    let (launched_exe, old_exe) =
+        atomic_swap_executable_to(target_exe, &desired_exe, &same_dir_new)?;
+    if let Err(err) = std::process::Command::new(&launched_exe)
+        .args(["--after-update", "0", "--renamed-self"])
         .spawn()
-        .map_err(|e| format!("启动更新后的程序失败：{e}"))?;
+    {
+        let _ = fs::remove_file(&launched_exe);
+        let _ = fs::rename(&old_exe, target_exe);
+        return Err(format!("启动更新后的程序失败：{err}"));
+    }
     Ok(())
 }
 
@@ -2187,19 +2391,25 @@ where
     F: FnMut(u64, Option<u64>),
 {
     let target_exe = std::env::current_exe().map_err(|e| format!("无法获取当前程序路径：{e}"))?;
-    let same_dir_new = sibling_path_with_suffix(&target_exe, ".new");
+    let desired_exe = updated_exe_path(&target_exe, &release.version);
+    let same_dir_new = sibling_path_with_suffix(&desired_exe, ".new");
     let daemon_pid = std::process::id();
 
-    // 尝试直接在原程序同目录创建 `.new`（桌面、D 盘等常规目录无需 UAC 即可原位无感替换）
+    // 尝试直接在原程序同目录创建 `.new`（桌面、D 盘等常规目录无需 UAC 即可原位无感替换并同步版本号后缀）
     let direct_writable = File::create(&same_dir_new).is_ok();
     if direct_writable {
         let _ = fs::remove_file(&same_dir_new);
         stream_download_and_verify(release, &same_dir_new, false, on_progress)?;
-        atomic_swap_executable(&target_exe, &same_dir_new)?;
-        std::process::Command::new(&target_exe)
-            .args(["--after-update", &daemon_pid.to_string()])
+        let (launched_exe, old_exe) =
+            atomic_swap_executable_to(&target_exe, &desired_exe, &same_dir_new)?;
+        if let Err(e) = std::process::Command::new(&launched_exe)
+            .args(["--after-update", &daemon_pid.to_string(), "--renamed-self"])
             .spawn()
-            .map_err(|e| format!("原位覆盖成功，但拉起新版进程失败：{e}"))?;
+        {
+            let _ = fs::remove_file(&launched_exe);
+            let _ = fs::rename(&old_exe, &target_exe);
+            return Err(format!("原位覆盖成功，但拉起新版进程失败（已回滚）：{e}"));
+        }
         Ok(())
     } else {
         // 原目录受系统保护（如 Program Files）：先下载校验至 %LOCALAPPDATA%\GXNUCampusLogin\updates\，再请求一次 UAC 提权覆盖
@@ -2267,6 +2477,79 @@ mod tests {
         assert_eq!(fs::read(&target).unwrap(), b"MZ-new-binary");
         assert_eq!(fs::read(&old_path).unwrap(), b"MZ-old-binary");
         assert!(!staged.exists());
+    }
+
+    #[test]
+    fn updated_exe_path_syncs_version_suffix_and_preserves_custom_names() {
+        assert_eq!(
+            updated_exe_path(
+                Path::new(r"F:\GXNU校园网助手\gxnu-campus-net-helper-v0.2.2.exe"),
+                "0.2.8"
+            ),
+            PathBuf::from(r"F:\GXNU校园网助手\gxnu-campus-net-helper-v0.2.8.exe")
+        );
+        assert_eq!(
+            updated_exe_path(
+                Path::new(r"D:\Tools\gxnu-campus-net-helper-V0.2.7.8.exe"),
+                "v0.2.8"
+            ),
+            PathBuf::from(r"D:\Tools\gxnu-campus-net-helper-V0.2.8.exe")
+        );
+        assert_eq!(
+            updated_exe_path(
+                Path::new(r"D:\Tools\gxnu-campus-net-helper-0.2.0-windows-x64.exe"),
+                "0.2.8"
+            ),
+            PathBuf::from(r"D:\Tools\gxnu-campus-net-helper-0.2.8-windows-x64.exe")
+        );
+        assert_eq!(
+            updated_exe_path(
+                Path::new(r"D:\Downloads\gxnu-campus-net-helper-v0.2.6 (1).exe"),
+                "0.2.8"
+            ),
+            PathBuf::from(r"D:\Downloads\gxnu-campus-net-helper-v0.2.8 (1).exe")
+        );
+        assert_eq!(
+            updated_exe_path(Path::new(r"D:\Tools\GXNU校园网守护助手v0.2.6.exe"), "0.2.8"),
+            PathBuf::from(r"D:\Tools\GXNU校园网守护助手v0.2.8.exe")
+        );
+        // 父目录带版本号但文件名自定义无版本号时，绝不误改文件名或父目录
+        assert_eq!(
+            updated_exe_path(Path::new(r"F:\builds\v0.2.7\校园网助手.exe"), "0.2.8"),
+            PathBuf::from(r"F:\builds\v0.2.7\校园网助手.exe")
+        );
+        assert_eq!(
+            updated_exe_path(Path::new(r"D:\Tools\gxnu-campus-net-helper.exe"), "0.2.8"),
+            PathBuf::from(r"D:\Tools\gxnu-campus-net-helper.exe")
+        );
+    }
+
+    #[test]
+    fn atomic_swap_to_renames_versioned_executable_and_rolls_back_on_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_ver_exe = dir.path().join("gxnu-campus-net-helper-v0.2.6.exe");
+        let desired_exe = updated_exe_path(&old_ver_exe, "0.2.8");
+        let staged = sibling_path_with_suffix(&desired_exe, ".new");
+        fs::write(&old_ver_exe, b"MZ-v026").unwrap();
+        fs::write(&staged, b"MZ-v028").unwrap();
+
+        let (final_exe, backup_old) =
+            atomic_swap_executable_to(&old_ver_exe, &desired_exe, &staged).unwrap();
+        assert_eq!(
+            final_exe,
+            dir.path().join("gxnu-campus-net-helper-v0.2.8.exe")
+        );
+        assert!(!old_ver_exe.exists());
+        assert!(!staged.exists());
+        assert_eq!(fs::read(&final_exe).unwrap(), b"MZ-v028");
+        assert_eq!(fs::read(&backup_old).unwrap(), b"MZ-v026");
+
+        // 若暂存新文件缺失，必须完整回滚回原文件名
+        let missing_stage = sibling_path_with_suffix(&final_exe, ".missing");
+        let next_desired = updated_exe_path(&final_exe, "0.2.9");
+        assert!(atomic_swap_executable_to(&final_exe, &next_desired, &missing_stage).is_err());
+        assert!(final_exe.exists());
+        assert_eq!(fs::read(&final_exe).unwrap(), b"MZ-v028");
     }
 
     #[test]

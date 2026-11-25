@@ -106,6 +106,12 @@ fn main() -> ExitCode {
         return ExitCode::FAILURE;
     }
     updater::cleanup_old_artifacts(&store.app_dir);
+    if just_updated
+        && !args.iter().any(|arg| arg == "--renamed-self")
+        && updater::realign_self_filename_after_update(VERSION)
+    {
+        return ExitCode::SUCCESS;
+    }
 
     if test_toast {
         let _ = logging::init(&store.app_dir.join("logs"), false);
