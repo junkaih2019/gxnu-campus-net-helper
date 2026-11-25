@@ -3,14 +3,19 @@
 //! 诊断顺序：网卡 → 出网 IP → 网关 → 并行公网探测 →
 //! （探测全失败且链路正常时）问门户在线状态 → 分类结论。
 
+use std::error::Error;
+use std::io;
 use std::net::Ipv4Addr;
 use std::process::Command;
-use std::sync::{mpsc, Arc, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, LazyLock, Weak};
+use std::time::{Duration, Instant};
 
 use crate::campus_status::{CampusStatusInfo, CampusStatusProbe};
 use crate::http::{self, HttpError};
 use crate::logging;
 use crate::models::{DiagnosticResult, DisconnectReason};
+use crate::portal_gateway::{captive_origin_from_prefix, extract_captive_portal_origin};
 
 #[derive(Clone, Copy)]
 pub struct ProbeTarget {
@@ -20,8 +25,8 @@ pub struct ProbeTarget {
 
 pub const DEFAULT_PROBES: &[ProbeTarget] = &[
     ProbeTarget {
-        url: "https://www.msftconnecttest.com/connecttest.txt",
-        expect_text: Some("Microsoft Connect Test"),
+        url: http::CONNECT_TEST_URL,
+        expect_text: Some(http::CONNECT_TEST_BODY),
     },
     ProbeTarget {
         url: "https://www.baidu.com/favicon.ico",
@@ -30,6 +35,15 @@ pub const DEFAULT_PROBES: &[ProbeTarget] = &[
 ];
 
 const PROBE_TEXT_LIMIT: usize = 4 * 1024;
+const PROBE_ERROR_CHARS: usize = 512;
+static NEXT_PROBE_ROUND: AtomicU64 = AtomicU64::new(1);
+static PROBE_SESSION: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{}-{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_millis()
+    )
+});
 
 /// 只用来做路由决策，不发包。
 const ROUTE_PROBE_IP: Ipv4Addr = Ipv4Addr::new(223, 5, 5, 5);
@@ -76,20 +90,23 @@ impl ProbeKind {
 struct ProbeOutcome {
     kind: ProbeKind,
     hostname: &'static str,
+    captive_origin: Option<String>,
 }
 
 struct ProbeRequest {
-    round: Weak<()>,
+    round: Weak<u64>,
     result: mpsc::Sender<ProbeOutcome>,
 }
 
 // A single worker per target bounds outstanding HTTP requests across manual checks.
-fn probe_worker(check: impl Fn() -> ProbeOutcome + Send + 'static) -> mpsc::Sender<ProbeRequest> {
+fn probe_worker(
+    check: impl Fn(u64) -> ProbeOutcome + Send + 'static,
+) -> mpsc::Sender<ProbeRequest> {
     let (tx, rx) = mpsc::channel::<ProbeRequest>();
     std::thread::spawn(move || {
         for request in rx {
-            if request.round.strong_count() > 0 {
-                let _ = request.result.send(check());
+            if let Some(round) = request.round.upgrade().map(|round| *round) {
+                let _ = request.result.send(check(round));
             }
         }
     });
@@ -109,13 +126,13 @@ impl Default for NetworkDiagnostics {
 
 impl NetworkDiagnostics {
     pub fn new() -> Self {
-        // 公网探测禁用重定向，让门户 302 跳转立刻判为 AUTH_EXPIRED。
+        // 公网探测禁用重定向，使门户跳转可以作为网关探测线索。
         let agent = http::no_redirect_agent(5);
         let probes = DEFAULT_PROBES
             .iter()
             .map(|target| {
                 let agent = agent.clone();
-                probe_worker(move || probe_once(&agent, target))
+                probe_worker(move |round| probe_once(&agent, target, round))
             })
             .collect();
         Self {
@@ -289,7 +306,10 @@ impl NetworkDiagnostics {
             }
         }
 
-        let campus = self.query_campus(&mut evidence);
+        let captive_origin = outcomes
+            .iter()
+            .find_map(|outcome| outcome.captive_origin.as_deref());
+        let campus = self.query_campus(&mut evidence, captive_origin);
         let result = match campus {
             Some(CampusStatusInfo {
                 online: false,
@@ -322,12 +342,6 @@ impl NetworkDiagnostics {
             )
             .with_portal_ip(info.portal_ip)
             .with_portal_gateway(info.gateway_label),
-            None if captive && routed_gateway => DiagnosticResult::new(
-                false,
-                DisconnectReason::AuthExpired,
-                "联网探测被重定向或返回异常内容，可能需要校园网认证",
-            )
-            .authenticatable(true),
             None if gateway_reachable == Some(true)
                 && !outcomes.is_empty()
                 && outcomes
@@ -337,18 +351,22 @@ impl NetworkDiagnostics {
                 DiagnosticResult::new(false, DisconnectReason::InternetTimeout, "公网探测均超时")
                     .authenticatable(true)
             }
-            // Mixed DNS/transport failures do not establish that the session expired.
             None => DiagnosticResult::new(
                 false,
                 DisconnectReason::UplinkUnreachable,
-                "公网探测失败，尚未确认校园网认证状态",
+                if captive {
+                    "公网探测被重定向或返回异常内容，尚未确认校园网认证状态"
+                } else {
+                    "公网探测失败，尚未确认校园网认证状态"
+                },
             ),
         };
         finish(result.with_ip(local_ip.to_string(), gateway_text), evidence)
     }
 
     fn run_probes(&self, evidence: &mut Vec<(String, String)>) -> Vec<ProbeOutcome> {
-        let round = Arc::new(());
+        let round = Arc::new(NEXT_PROBE_ROUND.fetch_add(1, Ordering::Relaxed));
+        evidence.push(("probe_round".into(), probe_round_id(*round)));
         let (tx, rx) = mpsc::channel();
         for probe in &self.probes {
             let _ = probe.send(ProbeRequest {
@@ -378,9 +396,13 @@ impl NetworkDiagnostics {
         outcomes
     }
 
-    fn query_campus(&self, evidence: &mut Vec<(String, String)>) -> Option<CampusStatusInfo> {
+    fn query_campus(
+        &self,
+        evidence: &mut Vec<(String, String)>,
+        captive_origin: Option<&str>,
+    ) -> Option<CampusStatusInfo> {
         let probe = self.campus_status.as_ref()?;
-        let info = probe.check_detail()?;
+        let info = probe.check_detail_with_hint(captive_origin)?;
         evidence.push((
             "campus_status".to_string(),
             if info.online {
@@ -404,44 +426,186 @@ fn finish(mut result: DiagnosticResult, evidence: Vec<(String, String)>) -> Diag
     result
 }
 
-fn probe_once(agent: &ureq::Agent, target: &ProbeTarget) -> ProbeOutcome {
+fn probe_round_id(round: u64) -> String {
+    format!("{}-{round}", *PROBE_SESSION)
+}
+
+fn probe_once(agent: &ureq::Agent, target: &ProbeTarget, round: u64) -> ProbeOutcome {
     let hostname = target
         .url
-        .split("://")
-        .nth(1)
-        .and_then(|rest| rest.split('/').next())
+        .split_once("://")
+        .and_then(|(_, rest)| rest.split(['/', '?', '#']).next())
+        .and_then(|authority| authority.rsplit('@').next())
         .unwrap_or("");
-    let kind = http::get_response(agent, target.url)
-        .and_then(|response| probe_response(response, target.expect_text))
-        .unwrap_or_else(ProbeKind::Error);
-    ProbeOutcome { kind, hostname }
+    let started = Instant::now();
+    // 在探测线程中记录，另一项先成功时仍可保留本次失败。
+    let response = match http::get_response(agent, target.url) {
+        Ok(response) => response,
+        Err(error) => {
+            let (kind, stage) = http::classify_transport(&error);
+            log_probe_error(
+                round,
+                hostname,
+                started.elapsed(),
+                stage,
+                kind,
+                error.as_ref(),
+            );
+            return ProbeOutcome {
+                kind: ProbeKind::Error(kind),
+                hostname,
+                captive_origin: None,
+            };
+        }
+    };
+    let (kind, captive_origin, read_error) = probe_response(response, target.expect_text);
+    let elapsed = started.elapsed();
+    match (kind, read_error) {
+        (_, Some(error)) => log_probe_error(
+            round,
+            hostname,
+            elapsed,
+            "http_body",
+            HttpError::from(&error),
+            &error,
+        ),
+        (ProbeKind::Unexpected(200), None) => log_probe_failure(
+            round,
+            hostname,
+            elapsed,
+            "http_body",
+            "status=200, error=UnexpectedContent",
+        ),
+        (ProbeKind::Unexpected(status) | ProbeKind::HttpStatus(status), None) => log_probe_failure(
+            round,
+            hostname,
+            elapsed,
+            "http_status",
+            format_args!("status={status}"),
+        ),
+        _ => {}
+    }
+    ProbeOutcome {
+        kind,
+        hostname,
+        captive_origin,
+    }
+}
+
+fn log_probe_error(
+    round: u64,
+    hostname: &str,
+    elapsed: Duration,
+    stage: &str,
+    kind: HttpError,
+    error: &(dyn Error + 'static),
+) {
+    let mut os_error = None;
+    let mut parts = Vec::new();
+    for cause in http::error_chain(error) {
+        let transport = cause.downcast_ref::<ureq::Transport>().or_else(|| {
+            match cause.downcast_ref::<ureq::Error>() {
+                Some(ureq::Error::Transport(transport)) => Some(transport),
+                _ => None,
+            }
+        });
+        if let Some(transport) = transport {
+            // ureq 的 Display 包含完整 URL 和底层错误，仅保留这一层的类型和消息。
+            let kind = transport.kind();
+            parts.push(match transport.message() {
+                Some(message) => format!("{kind:?}: {message}"),
+                None => format!("{kind:?}"),
+            });
+            continue;
+        }
+        if let Some(io_error) = cause.downcast_ref::<io::Error>() {
+            os_error = os_error.or_else(|| io_error.raw_os_error());
+            if io_error.get_ref().is_some() {
+                // 下一个 cause 会包含原始消息，避免重复输出。
+                parts.push(format!("{:?}", io_error.kind()));
+                continue;
+            }
+        }
+        parts.push(cause.to_string());
+    }
+    let os_error = os_error.map_or_else(|| "none".into(), |code| code.to_string());
+    let detail = redact_probe_error(&parts.join(" -> "));
+    log_probe_failure(
+        round,
+        hostname,
+        elapsed,
+        stage,
+        format_args!("error={kind}, os_error={os_error}, detail={detail}"),
+    );
+}
+
+fn redact_probe_error(detail: &str) -> String {
+    let mut safe = detail
+        .split(|ch: char| ch.is_whitespace() || ch.is_control())
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            if part.contains("://") || part.contains(['?', '=', '@']) {
+                "[redacted]"
+            } else {
+                part
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    if let Some((end, _)) = safe.char_indices().nth(PROBE_ERROR_CHARS) {
+        safe.truncate(end);
+        safe.push('…');
+    }
+    safe
+}
+
+fn log_probe_failure(
+    round: u64,
+    hostname: &str,
+    elapsed: Duration,
+    stage: &str,
+    details: impl std::fmt::Display,
+) {
+    logging::info(&format!(
+        "[PUBLIC_PROBE_FAILED] target={hostname}, probe_round={}, stage={stage}, elapsed_ms={}, {details}",
+        probe_round_id(round),
+        elapsed.as_millis()
+    ));
 }
 
 fn probe_response(
     response: ureq::Response,
     expect_text: Option<&str>,
-) -> Result<ProbeKind, HttpError> {
+) -> (ProbeKind, Option<String>, Option<io::Error>) {
     let status = response.status();
     if let (200, Some(text)) = (status, expect_text) {
         let mut prefix = [0; PROBE_TEXT_LIMIT];
-        let len = http::read_prefix(response.into_reader(), &mut prefix)?;
+        let (len, error) = http::read_prefix_with_error(response.into_reader(), &mut prefix);
         let matched = text.is_empty()
             || prefix[..len]
                 .windows(text.len())
                 .any(|part| part == text.as_bytes());
-        return Ok(if matched {
-            ProbeKind::Ok
-        } else {
-            ProbeKind::Unexpected(status)
-        });
+        if matched && error.is_none() {
+            return (ProbeKind::Ok, None, None);
+        }
+        let origin =
+            captive_origin_from_prefix(&prefix[..len], error.is_some() || len == prefix.len());
+        // 已收到 HTTP 响应，正文超时也属于响应异常，不能作为双路无响应的重连证据。
+        return (ProbeKind::Unexpected(status), origin, error);
     }
 
+    let origin = if matches!(status, 300..=399 | 511) {
+        extract_captive_portal_origin(response.header("Location"), "")
+    } else {
+        None
+    };
     http::drain_small_body(response);
-    Ok(match status {
+    let kind = match status {
         200 => ProbeKind::Ok,
         201..=399 | 511 => ProbeKind::Unexpected(status),
         _ => ProbeKind::HttpStatus(status),
-    })
+    };
+    (kind, origin, None)
 }
 
 fn read_adapters() -> (Vec<String>, Vec<Ipv4Addr>) {
@@ -608,7 +772,7 @@ mod tests {
         };
         let agent = http::no_redirect_agent(5);
         for _ in 0..3 {
-            assert_eq!(probe_once(&agent, &target).kind, ProbeKind::Ok);
+            assert_eq!(probe_once(&agent, &target, 0).kind, ProbeKind::Ok);
         }
         server.join().unwrap();
     }
@@ -656,14 +820,19 @@ mod tests {
                 url: Box::leak(format!("{base}/test").into_boxed_str()),
                 expect_text: expected_text,
             };
-            assert_eq!(probe_once(&http::no_redirect_agent(8), &target).kind, kind);
+            assert_eq!(
+                probe_once(&http::no_redirect_agent(8), &target, 0).kind,
+                kind
+            );
             server.join().unwrap();
         }
     }
 
     #[test]
     fn text_marker_must_fit_entirely_in_the_prefix() {
-        let marker = "Microsoft Connect Test";
+        let microsoft = DEFAULT_PROBES[0];
+        assert!(microsoft.url.starts_with("http://"));
+        let marker = microsoft.expect_text.unwrap();
         for (end, kind) in [
             (PROBE_TEXT_LIMIT, ProbeKind::Ok),
             (PROBE_TEXT_LIMIT + 1, ProbeKind::Unexpected(200)),
@@ -676,7 +845,10 @@ mod tests {
                 url: Box::leak(spawn_http_once(response).into_boxed_str()),
                 expect_text: Some(marker),
             };
-            assert_eq!(probe_once(&http::no_redirect_agent(3), &target).kind, kind);
+            assert_eq!(
+                probe_once(&http::no_redirect_agent(3), &target, 0).kind,
+                kind
+            );
         }
     }
 
@@ -691,9 +863,75 @@ mod tests {
             url: Box::leak(url.into_boxed_str()),
             expect_text: None,
         };
-        let outcome = probe_once(&agent, &target);
+        let outcome = probe_once(&agent, &target, 0);
         assert_eq!(outcome.kind, ProbeKind::Unexpected(302));
         assert_eq!(outcome.kind.note(), "HTTP 302");
+    }
+
+    #[test]
+    fn public_redirect_never_authorizes_login_without_portal_status() {
+        for (location, expected_origin) in [
+            ("http://192.168.1.1/login.html", None),
+            (
+                "http://192.168.125.21/login.html",
+                Some("http://192.168.125.21"),
+            ),
+        ] {
+            let target = ProbeTarget {
+                url: Box::leak(
+                    spawn_http_once(format!(
+                        "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\n\r\n"
+                    ))
+                    .into_boxed_str(),
+                ),
+                expect_text: Some(http::CONNECT_TEST_BODY),
+            };
+            let redirect = probe_once(&http::no_redirect_agent(1), &target, 0);
+            assert_eq!(redirect.kind, ProbeKind::Unexpected(302));
+            assert_eq!(redirect.captive_origin.as_deref(), expected_origin);
+            let another_failure = ProbeOutcome {
+                kind: ProbeKind::Error(HttpError::Tls),
+                hostname: "fixture",
+                captive_origin: None,
+            };
+            let result = NetworkDiagnostics::new().classify_outcomes(
+                &[redirect, another_failure],
+                Ipv4Addr::LOCALHOST,
+                Ipv4Addr::LOCALHOST,
+                vec![],
+                |_| Some(true),
+            );
+            assert_eq!(result.reason, DisconnectReason::UplinkUnreachable);
+            assert!(!result.can_authenticate);
+        }
+    }
+
+    #[test]
+    fn partial_response_keeps_a_complete_captive_origin_after_read_timeout() {
+        let (release, gate) = mpsc::channel();
+        let (base, server) = http::mock::serve(move |stream| {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<script>location.href='http://192.168.125.21/';</script>")
+                .unwrap();
+            gate.recv_timeout(Duration::from_secs(4)).unwrap();
+        });
+        let target = ProbeTarget {
+            url: Box::leak(base.into_boxed_str()),
+            expect_text: Some(http::CONNECT_TEST_BODY),
+        };
+        let agent = ureq::AgentBuilder::new()
+            .try_proxy_from_env(false)
+            .timeout(Duration::from_secs(1))
+            .redirects(0)
+            .build();
+        let outcome = probe_once(&agent, &target, 0);
+        release.send(()).unwrap();
+        server.join().unwrap();
+        assert_eq!(outcome.kind, ProbeKind::Unexpected(200));
+        assert_eq!(
+            outcome.captive_origin.as_deref(),
+            Some("http://192.168.125.21")
+        );
     }
 
     #[test]
@@ -705,10 +943,12 @@ mod tests {
             ProbeOutcome {
                 kind: ProbeKind::Error(HttpError::Dns),
                 hostname: "www.msftconnecttest.com",
+                captive_origin: None,
             },
             ProbeOutcome {
                 kind: ProbeKind::Error(HttpError::Dns),
                 hostname: "www.baidu.com",
+                captive_origin: None,
             },
         ];
         let res = diag.classify_outcomes(
@@ -732,6 +972,7 @@ mod tests {
         let outcomes = vec![ProbeOutcome {
             kind: ProbeKind::Error(HttpError::Dns),
             hostname: "www.baidu.com",
+            captive_origin: None,
         }];
         let res = diag.classify_outcomes(
             &outcomes,
@@ -762,6 +1003,7 @@ mod tests {
                     url: Box::leak(url.into_boxed_str()),
                     expect_text: None,
                 },
+                0,
             );
             assert_eq!(probe.kind, expected);
             let portal = spawn_http_once(http_200(r#"dr1002({"result":1})"#));
@@ -770,6 +1012,7 @@ mod tests {
             let timeout = ProbeOutcome {
                 kind: ProbeKind::Error(HttpError::Timeout),
                 hostname: "mock",
+                captive_origin: None,
             };
             let result = diag.classify_outcomes(
                 &[probe, timeout],
@@ -784,37 +1027,109 @@ mod tests {
     }
 
     #[test]
-    fn successful_probe_releases_caller_while_second_probe_is_still_running() {
-        use std::time::Duration;
+    fn a_successful_probe_returns_online_and_the_later_failure_is_logged() {
         let (running, started) = mpsc::channel();
         let (release, gate) = mpsc::channel();
-        let slow = probe_worker(move || {
+        let gate = std::sync::Mutex::new(gate);
+        let resolver = move |_: &str| {
             running.send(()).unwrap();
-            gate.recv_timeout(Duration::from_secs(3)).unwrap();
-            ProbeOutcome {
-                kind: ProbeKind::Error(HttpError::Timeout),
-                hostname: "slow",
-            }
+            gate.lock()
+                .unwrap()
+                .recv_timeout(Duration::from_secs(3))
+                .unwrap();
+            Err(io::Error::other(io::Error::from_raw_os_error(11001)))
+        };
+        let agent = ureq::AgentBuilder::new()
+            .try_proxy_from_env(false)
+            .resolver(resolver)
+            .build();
+        let slow = probe_worker(move |round| {
+            probe_once(
+                &agent,
+                &ProbeTarget {
+                    url: "https://late-probe.invalid/check?marker=omit-this-value",
+                    expect_text: None,
+                },
+                round,
+            )
         });
-        let fast = probe_worker(move || {
+        let fast = probe_worker(move |_| {
             started.recv_timeout(Duration::from_secs(3)).unwrap();
             ProbeOutcome {
                 kind: ProbeKind::Ok,
                 hostname: "fast",
+                captive_origin: None,
             }
         });
         let diag = NetworkDiagnostics {
             probes: vec![slow, fast],
             campus_status: None,
         };
+        let logs = logging::subscribe();
         let (finished, result) = mpsc::channel();
         let handle = std::thread::spawn(move || {
-            let _ = finished.send(diag.run_probes(&mut Vec::new()));
+            let mut evidence = Vec::new();
+            let outcomes = diag.run_probes(&mut evidence);
+            let _ = finished.send(diag.classify_outcomes(
+                &outcomes,
+                Ipv4Addr::LOCALHOST,
+                Ipv4Addr::UNSPECIFIED,
+                evidence,
+                |_| panic!("a successful probe needs no gateway check"),
+            ));
         });
         let result = result.recv_timeout(Duration::from_secs(2));
         release.send(()).unwrap();
         handle.join().unwrap();
-        assert_eq!(result.unwrap()[0].kind, ProbeKind::Ok);
+        let result = result.unwrap();
+        assert!(result.online);
+        let round = result
+            .evidence
+            .iter()
+            .find(|(key, _)| key == "probe_round")
+            .unwrap();
+        let failure = std::iter::from_fn(|| logs.recv_timeout(Duration::from_secs(2)).ok())
+            .find(|line| line.contains("[PUBLIC_PROBE_FAILED] target=late-probe.invalid,"))
+            .expect("the pending probe must log its failure after the round returned");
+        assert!(failure.contains("stage=dns, elapsed_ms="));
+        assert!(failure.contains(&format!("probe_round={},", round.1)));
+        assert!(failure.contains("error=DnsError, os_error=11001"));
+        assert!(failure.contains("detail=Dns: resolve dns name"));
+        assert!(!failure.contains("omit-this-value"));
+    }
+
+    #[test]
+    fn probe_error_details_redact_urls_and_keep_a_bounded_single_line() {
+        let description =
+            "证书失败\r\nfrom https://probe-user@localhost/test?key=value to /test?key=other";
+        assert_eq!(
+            redact_probe_error(description),
+            "证书失败 from [redacted] to [redacted]"
+        );
+        let long = "字".repeat(PROBE_ERROR_CHARS + 1);
+        assert_eq!(
+            redact_probe_error(&long),
+            format!("{}…", "字".repeat(PROBE_ERROR_CHARS))
+        );
+    }
+
+    #[test]
+    fn nested_ureq_error_logs_the_os_cause_once() {
+        let logs = logging::subscribe();
+        let error = io::Error::other(ureq::Error::from(io::Error::from_raw_os_error(10054)));
+        log_probe_error(
+            0,
+            "headers-probe.invalid",
+            Duration::ZERO,
+            "http_headers",
+            HttpError::Connect,
+            &error,
+        );
+        let failure = std::iter::from_fn(|| logs.recv_timeout(Duration::from_secs(2)).ok())
+            .find(|line| line.contains("[PUBLIC_PROBE_FAILED] target=headers-probe.invalid,"))
+            .unwrap();
+        assert!(failure.contains("error=ConnectionError, os_error=10054"));
+        assert_eq!(failure.matches("(os error 10054)").count(), 1);
     }
 
     #[test]
@@ -823,6 +1138,7 @@ mod tests {
         let failure = ProbeOutcome {
             kind: ProbeKind::HttpStatus(503),
             hostname: "mock",
+            captive_origin: None,
         };
         let status = d.classify_outcomes(
             &[failure],
@@ -859,6 +1175,7 @@ mod tests {
             let outcome = ProbeOutcome {
                 kind,
                 hostname: "fixture",
+                captive_origin: None,
             };
             let result = diag.classify_outcomes(
                 &[outcome],
@@ -881,6 +1198,7 @@ mod tests {
         let failure = ProbeOutcome {
             kind: ProbeKind::Error(HttpError::Other),
             hostname: "fixture",
+            captive_origin: None,
         };
         let r = diag.classify_outcomes(
             &[failure],
@@ -898,6 +1216,7 @@ mod tests {
         let outcomes = [HttpError::Dns, HttpError::Other].map(|error| ProbeOutcome {
             kind: ProbeKind::Error(error),
             hostname: "fixture",
+            captive_origin: None,
         });
         for (reply, reason, can_auth) in [
             (
@@ -931,6 +1250,7 @@ mod tests {
         let outcomes = [ProbeOutcome {
             kind: ProbeKind::Error(HttpError::Timeout),
             hostname: "fixture",
+            captive_origin: None,
         }];
         let diag = NetworkDiagnostics::new();
         for gateway in [Some(false), None, Some(true)] {
@@ -950,9 +1270,10 @@ mod tests {
         let probes = ["a", "b"]
             .into_iter()
             .map(|hostname| {
-                probe_worker(move || ProbeOutcome {
+                probe_worker(move |_| ProbeOutcome {
                     kind: ProbeKind::Error(HttpError::Dns),
                     hostname,
+                    captive_origin: None,
                 })
             })
             .collect();
@@ -965,6 +1286,7 @@ mod tests {
         evidence.sort();
         assert_eq!(evidence[0].0, "probe_a");
         assert_eq!(evidence[1].0, "probe_b");
+        assert_eq!(evidence[2].0, "probe_round");
     }
 
     #[test]

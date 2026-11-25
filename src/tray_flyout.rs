@@ -46,7 +46,7 @@ use crate::models::{
 };
 use crate::tray::TrayAction;
 
-const FLYOUT_CLASS_NAME: &str = "GXNUGuardFluentTrayFlyout";
+pub(crate) const FLYOUT_CLASS_NAME: &str = "GXNUGuardFluentTrayFlyout";
 const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 const DWMWA_BORDER_COLOR: u32 = 34;

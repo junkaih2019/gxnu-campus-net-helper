@@ -50,7 +50,7 @@ impl Default for CampusAuthenticator {
 impl CampusAuthenticator {
     pub fn new() -> Self {
         Self {
-            agent: http::agent(10),
+            agent: http::no_redirect_agent(10),
             endpoints: AuthEndpoints::Fixed {
                 portal_url: PORTAL_URL.to_string(),
                 logout_url: LOGOUT_URL.to_string(),
@@ -66,7 +66,7 @@ impl CampusAuthenticator {
             LOGOUT_URL.to_string()
         };
         Self {
-            agent: http::agent(10),
+            agent: http::no_redirect_agent(10),
             endpoints: AuthEndpoints::Fixed {
                 portal_url,
                 logout_url,
@@ -76,31 +76,20 @@ impl CampusAuthenticator {
 
     pub fn with_resolver(resolver: Arc<PortalGatewayResolver>) -> Self {
         Self {
-            agent: http::agent(10),
+            agent: http::no_redirect_agent(10),
             endpoints: AuthEndpoints::Dynamic(resolver),
-        }
-    }
-
-    fn current_urls(&self) -> (String, String, Option<(Arc<PortalGatewayResolver>, String)>) {
-        match &self.endpoints {
-            AuthEndpoints::Fixed {
-                portal_url,
-                logout_url,
-            } => (portal_url.clone(), logout_url.clone(), None),
-            AuthEndpoints::Dynamic(resolver) => {
-                let ep = resolver.resolve_endpoints();
-                (
-                    ep.login_url,
-                    ep.logout_url,
-                    Some((Arc::clone(resolver), ep.origin)),
-                )
-            }
         }
     }
 
     /// 主动注销当前 Dr.COM 校园网会话（切换账号前调用，失败或本已离线均不阻塞后续登录）。
     pub fn logout(&self) -> LogoutResult {
-        let (_, logout_url, dyn_ctx) = self.current_urls();
+        let (logout_url, dyn_ctx) = match &self.endpoints {
+            AuthEndpoints::Fixed { logout_url, .. } => (logout_url.clone(), None),
+            AuthEndpoints::Dynamic(resolver) => {
+                let portal = resolver.resolve_endpoints();
+                (portal.logout_url, Some((resolver, portal.origin)))
+            }
+        };
         let url = format!("{logout_url}?callback=dr1005&jsVersion=4.2.2&v=4532&lang=zh");
         match http::get_portal(&self.agent, &url) {
             Ok(response) => {
@@ -152,7 +141,7 @@ impl CampusAuthenticator {
         password: &str,
         carrier: &str,
         local_ip: &str,
-        begin: impl FnOnce() -> bool,
+        begin: impl Fn() -> bool,
     ) -> Option<AuthenticationResult> {
         if student_id.is_empty() || password.is_empty() {
             return Some(AuthenticationResult {
@@ -167,7 +156,23 @@ impl CampusAuthenticator {
         } else {
             "2"
         };
-        let (portal_url, _, dyn_ctx) = self.current_urls();
+        let (portal_url, dyn_ctx) = match &self.endpoints {
+            AuthEndpoints::Fixed { portal_url, .. } => (portal_url.clone(), None),
+            AuthEndpoints::Dynamic(resolver) => match resolver.resolve_login_endpoints() {
+                Ok(portal) => (portal.login_url, Some((resolver, portal.origin))),
+                Err(message) => {
+                    if !begin() {
+                        return None;
+                    }
+                    return Some(AuthenticationResult {
+                        success: false,
+                        reason: DisconnectReason::PortalUnavailable,
+                        message,
+                        code: String::new(),
+                    });
+                }
+            },
+        };
         let build_login_url = |base: &str| {
             format!(
                 "{base}?callback=dr1004&DDDDD={}&upass={}&0MKKey=123456&R1=0&R2=&R3={carrier}&R6=0&para=00\
@@ -191,7 +196,7 @@ impl CampusAuthenticator {
                 if !resolver.is_custom_mode() {
                     resolver.invalidate_if_origin(failed_origin);
                     if let Ok((fresh, _, _)) = resolver.probe_and_cache() {
-                        if fresh.origin != *failed_origin {
+                        if fresh.origin != *failed_origin && begin() {
                             let retry_url = build_login_url(&fresh.login_url);
                             response_res = http::get_portal(&self.agent, &retry_url);
                         }
@@ -479,6 +484,38 @@ fn sanitize(message: &str, secrets: &[&str]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn login_and_logout_do_not_follow_redirects() {
+        use std::io::Write;
+        use std::net::TcpListener;
+
+        for logout in [false, true] {
+            let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+            destination.set_nonblocking(true).unwrap();
+            let target = destination.local_addr().unwrap();
+            let (base, server) = http::mock::serve(move |stream| {
+                write!(
+                    stream,
+                    "HTTP/1.1 302 Found\r\nLocation: http://{target}/redirected\r\nContent-Length: 0\r\n\r\n"
+                )
+                .unwrap();
+            });
+            let auth = CampusAuthenticator::with_url(format!("{base}/login"));
+            let success = if logout {
+                auth.logout().success
+            } else {
+                auth.authenticate("fixture-user", "fixture-value", "2", "192.0.2.1")
+                    .success
+            };
+            server.join().unwrap();
+            assert!(!success);
+            assert_eq!(
+                destination.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
 
     #[test]
     fn login_and_logout_report_oversized_jsonp() {

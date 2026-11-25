@@ -179,16 +179,44 @@ fn main() -> ExitCode {
         };
     }
 
-    // 单实例检查：若守护已在运行，直接通知它拉起/前置主窗口并退出，不再重复启动。
+    // 单实例协调：若后台已有同版本/更高版本在跑则直接转发唤醒；若后台是更低版本则平滑通知其退出并由当前新版接管。
+    // 临时目录、cargo 构建目录或设置了 GXNU_NO_TAKEOVER 时不接管，避免开发构建误关用户真实守护进程。
+    let allow_takeover = std::env::current_exe()
+        .ok()
+        .is_some_and(|exe| !startup::auto_manage_disabled_for(&exe));
+    let mut took_over_from: Option<(String, u32, bool)> = None;
     let _instance = match single_instance::InstanceGuard::acquire(MUTEX_NAME) {
-        Ok((_guard, true)) => {
-            return match ipc::forward_launch(&store.app_dir, force_start, minimized) {
-                Ok(()) => ExitCode::SUCCESS,
+        Ok((existing_guard, true)) => {
+            drop(existing_guard);
+            match ipc::coordinate_existing_daemon(
+                &store.app_dir,
+                VERSION,
+                allow_takeover,
+                force_start,
+                minimized,
+            ) {
+                Ok(ipc::ExistingDaemonOutcome::Forwarded) => return ExitCode::SUCCESS,
+                Ok(ipc::ExistingDaemonOutcome::Takeover {
+                    old_pid,
+                    old_version,
+                    ipc_quit_sent,
+                }) => match complete_daemon_takeover(old_pid, ipc_quit_sent, &old_version) {
+                    Ok(Some(guard)) => {
+                        took_over_from = Some((old_version, old_pid, ipc_quit_sent));
+                        Some(guard)
+                    }
+                    // 旧版已退出，但另一个同时启动的新版实例抢先接管了：交给它即可。
+                    Ok(None) => return ExitCode::SUCCESS,
+                    Err(err) => {
+                        report_takeover_failure(&store.app_dir, &err);
+                        return ExitCode::FAILURE;
+                    }
+                },
                 Err(err) => {
                     eprintln!("{err}");
-                    ExitCode::FAILURE
+                    return ExitCode::FAILURE;
                 }
-            };
+            }
         }
         Ok((guard, false)) => Some(guard),
         Err(err) => {
@@ -208,10 +236,21 @@ fn main() -> ExitCode {
         "[APP_STARTED] {APP_NAME} {VERSION} 守护模式启动，日志路径：{}",
         log_path.display()
     ));
+    if let Some((old_ver, old_pid, via_ipc)) = &took_over_from {
+        let channel = if *via_ipc {
+            "IPC 确认退出"
+        } else {
+            "托盘线程退出消息"
+        };
+        logging::info(&format!(
+            "[TAKEOVER] 检测到更高版本启动，已平滑接替旧守护进程 v{old_ver}（PID {old_pid}，通知方式：{channel}）"
+        ));
+    }
     logging::info(
         "[NET_POLICY] 探测与认证直连（不吃系统代理）；门户说在线则不重复登录；认证首次被拒只静默重试",
     );
 
+    startup::sync_autostart_if_needed(VERSION);
     let mut settings = store.load();
     settings.auto_boot = startup::is_enabled();
     if force_start {
@@ -233,15 +272,24 @@ fn main() -> ExitCode {
         logging::info(&format!("[UPDATER] 已成功原位覆盖升级并重启至 v{VERSION}"));
     }
 
-    run_daemon(store, settings, log_path, minimized, just_updated)
+    let took_over_ver = took_over_from.map(|(ver, _, _)| ver);
+    run_daemon(
+        store,
+        settings,
+        log_path,
+        minimized,
+        just_updated,
+        took_over_ver,
+    )
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum UiOpenTarget {
     Normal,
     AccountSettings,
     UpdateModal,
     AfterUpdateToast,
+    TakeoverToast(String),
 }
 
 /// ── 模式 2：超轻量常驻守护进程（无 OpenGL、无字库、纯 Win32 托盘消息循环）──
@@ -251,6 +299,7 @@ fn run_daemon(
     log_path: PathBuf,
     minimized: bool,
     just_updated: bool,
+    took_over_from: Option<String>,
 ) -> ExitCode {
     tray_menu::enable_dpi_awareness();
     let main_tid = current_thread_id();
@@ -351,7 +400,9 @@ fn run_daemon(
         .name("ipc-log-forwarder".to_string())
         .spawn(move || {
             while let Ok(line) = log_rx.recv() {
-                ipc_for_logs.broadcast_log(line);
+                if !logging::is_probe_detail(&line) {
+                    ipc_for_logs.broadcast_log(line);
+                }
             }
         });
 
@@ -763,6 +814,8 @@ fn run_daemon(
     if !minimized {
         let open_res = if just_updated {
             commands.lock().unwrap().open_after_update()
+        } else if let Some(old_ver) = took_over_from {
+            commands.lock().unwrap().open_after_takeover(old_ver)
         } else {
             commands.lock().unwrap().apply(ipc::UiToDaemon::ShowUi)
         };
@@ -867,6 +920,13 @@ impl DaemonCommands {
 
     fn open_after_update(&self) -> Result<(), String> {
         (self.show_ui)(UiOpenTarget::AfterUpdateToast)?;
+        self.self_service
+            .trigger(self_service::FetchTrigger::UiOpen);
+        Ok(())
+    }
+
+    fn open_after_takeover(&self, old_version: String) -> Result<(), String> {
+        (self.show_ui)(UiOpenTarget::TakeoverToast(old_version))?;
         self.self_service
             .trigger(self_service::FetchTrigger::UiOpen);
         Ok(())
@@ -1037,6 +1097,31 @@ impl DaemonCommands {
                     .trigger(self_service::FetchTrigger::UiOpen);
             }
             TestToast { body } => self.notifier.lock().unwrap().send_test(&body),
+            QuitForTakeover { new_version } => {
+                if updater::compare_versions(&new_version, VERSION)
+                    != Some(std::cmp::Ordering::Greater)
+                {
+                    logging::warn(&format!(
+                        "[TAKEOVER] 拒绝 v{new_version} 的接管请求：当前守护进程 v{VERSION} 不低于请求方，继续运行"
+                    ));
+                    return Err(format!(
+                        "拒绝非高版本接管请求（当前 v{VERSION}，请求方 v{new_version}）"
+                    ));
+                }
+                logging::info(&format!(
+                    "[TAKEOVER] 检测到更高版本 v{new_version} 启动，当前守护进程（v{VERSION}）正在退出交接"
+                ));
+                self.control.signal_stop();
+                let main_tid = self.main_tid;
+                if main_tid != 0 {
+                    let _ = std::thread::Builder::new()
+                        .name("takeover-quit".to_string())
+                        .spawn(move || {
+                            std::thread::sleep(Duration::from_millis(30));
+                            post_thread_msg(main_tid, WM_DAEMON_QUIT);
+                        });
+                }
+            }
         }
         Ok(())
     }
@@ -1137,10 +1222,12 @@ fn show_or_spawn_ui(
     if let Some(child) = guard.as_mut() {
         match child.try_wait() {
             Ok(None) => {
-                match target {
+                match &target {
                     UiOpenTarget::AccountSettings => ipc_server.broadcast_open_account_settings(),
                     UiOpenTarget::UpdateModal => ipc_server.broadcast_open_update_modal(),
-                    UiOpenTarget::Normal | UiOpenTarget::AfterUpdateToast => {}
+                    UiOpenTarget::Normal
+                    | UiOpenTarget::AfterUpdateToast
+                    | UiOpenTarget::TakeoverToast(_) => {}
                 }
                 bring_pid_window_to_front(child.id());
                 return Ok(());
@@ -1170,6 +1257,9 @@ fn show_or_spawn_ui(
         }
         UiOpenTarget::AfterUpdateToast => {
             cmd.env("GXNU_JUST_UPDATED", "1");
+        }
+        UiOpenTarget::TakeoverToast(old_ver) => {
+            cmd.env("GXNU_TAKEOVER_FROM", old_ver);
         }
         UiOpenTarget::Normal => {}
     }
@@ -1258,6 +1348,206 @@ fn post_thread_msg(tid: u32, msg: u32) {
     unsafe {
         PostThreadMessageW(tid, msg, 0, 0);
     }
+}
+
+/// 与 `post_thread_msg` 相同，但返回是否投递成功（跨权限级别时会被 UIPI 拦截）。
+fn try_post_thread_msg(tid: u32, msg: u32) -> Result<(), u32> {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
+    unsafe {
+        if PostThreadMessageW(tid, msg, 0, 0) != 0 {
+            Ok(())
+        } else {
+            Err(GetLastError())
+        }
+    }
+}
+
+const TAKEOVER_EXIT_TIMEOUT: Duration = Duration::from_secs(30);
+const TAKEOVER_MUTEX_WAIT: Duration = Duration::from_secs(5);
+
+fn complete_daemon_takeover(
+    old_pid: u32,
+    ipc_quit_sent: bool,
+    old_version: &str,
+) -> Result<Option<single_instance::InstanceGuard>, String> {
+    complete_daemon_takeover_with(
+        old_pid,
+        ipc_quit_sent,
+        old_version,
+        MUTEX_NAME,
+        TAKEOVER_EXIT_TIMEOUT,
+        TAKEOVER_MUTEX_WAIT,
+    )
+}
+
+/// 通知旧守护退出并等待它真正结束后再接管单实例锁。
+/// - 旧版仍在运行时绝不返回成功；无法通知旧版时立即报错（旧版保持运行，不会出现无人守护）。
+/// - 旧版已结束但锁被另一个新实例抢走时返回 `Ok(None)`，由那个实例继续守护。
+fn complete_daemon_takeover_with(
+    old_pid: u32,
+    ipc_quit_sent: bool,
+    old_version: &str,
+    mutex_name: &str,
+    exit_timeout: Duration,
+    mutex_wait: Duration,
+) -> Result<Option<single_instance::InstanceGuard>, String> {
+    let exit_hint = "请先在右下角托盘图标上右键选择「退出」，再重新打开本程序。";
+    let started = std::time::Instant::now();
+    let mut escalated = !ipc_quit_sent;
+    if !ipc_quit_sent {
+        match request_legacy_daemon_quit(old_pid) {
+            LegacyQuit::Posted => {}
+            LegacyQuit::Denied(code) if is_process_alive(old_pid) => {
+                return Err(format!(
+                    "后台正在运行的旧版本 v{old_version} 以管理员身份运行，新版无法自动接替它（错误码 {code}）。\n\n{exit_hint}"
+                ));
+            }
+            LegacyQuit::NotFound if is_process_alive(old_pid) => {
+                return Err(format!(
+                    "没能联系上后台正在运行的旧版本 v{old_version}。\n\n{exit_hint}"
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    while is_process_alive(old_pid) {
+        let elapsed = started.elapsed();
+        if elapsed >= exit_timeout {
+            return Err(format!(
+                "旧版本 v{old_version} 已收到退出指令，但 {} 秒内仍未退出。\n\n请在任务管理器中结束旧版本进程（PID {old_pid}）后，再重新打开本程序。",
+                exit_timeout.as_secs()
+            ));
+        }
+        if !escalated && elapsed >= Duration::from_millis(1500) {
+            escalated = true;
+            let _ = request_legacy_daemon_quit(old_pid);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let deadline = std::time::Instant::now() + mutex_wait;
+    loop {
+        match single_instance::InstanceGuard::acquire(mutex_name) {
+            Ok((guard, false)) => return Ok(Some(guard)),
+            Ok((guard, true)) => {
+                drop(guard);
+                if std::time::Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// 接管失败时写入日志并弹窗告知用户（正式版没有控制台，`eprintln` 看不到）。
+fn report_takeover_failure(app_dir: &std::path::Path, message: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONWARNING, MB_OK, MB_SETFOREGROUND,
+    };
+
+    eprintln!("{message}");
+    if logging::init(&app_dir.join("logs"), false).is_ok() {
+        logging::warn(&format!(
+            "[TAKEOVER] v{VERSION} 接替旧守护进程失败：{}",
+            message.replace('\n', " ")
+        ));
+    }
+    let wide = |s: &str| -> Vec<u16> { s.encode_utf16().chain(std::iter::once(0)).collect() };
+    let title = wide(APP_NAME);
+    let body = wide(message);
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            body.as_ptr(),
+            title.as_ptr(),
+            MB_OK | MB_ICONWARNING | MB_SETFOREGROUND,
+        );
+    }
+}
+
+/// 只需 `PROCESS_QUERY_LIMITED_INFORMATION`：即使旧守护以管理员身份运行也能可靠判断存活，
+/// 避免因 `SYNCHRONIZE` 权限不足把仍在运行的旧版误判为已退出。
+fn is_process_alive(pid: u32) -> bool {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{
+        GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const STILL_ACTIVE: u32 = 259;
+
+    if pid == 0 || pid == std::process::id() {
+        return false;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            return false;
+        }
+        let mut code = 0u32;
+        let ok = GetExitCodeProcess(handle, &mut code);
+        CloseHandle(handle);
+        ok != 0 && code == STILL_ACTIVE
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LegacyQuit {
+    Posted,
+    /// 找到了旧版托盘线程，但消息被系统拒绝（通常是旧版以管理员身份运行，被 UIPI 拦截）。
+    Denied(u32),
+    NotFound,
+}
+
+/// 兼容 `v0.1.0`～`v0.2.6` 历史守护进程：定位其专属托盘隐藏窗口线程并投递 `WM_DAEMON_QUIT` 触发干净退出。
+fn request_legacy_daemon_quit(target_pid: u32) -> LegacyQuit {
+    use windows_sys::Win32::Foundation::{BOOL, HWND, LPARAM};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetWindowThreadProcessId,
+    };
+
+    struct QuitSearch {
+        pid: u32,
+        outcome: LegacyQuit,
+    }
+
+    unsafe extern "system" fn enum_cb(hwnd: HWND, lparam: LPARAM) -> BOOL {
+        let state = &mut *(lparam as *mut QuitSearch);
+        let mut pid: u32 = 0;
+        let tid = GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid != state.pid || tid == 0 {
+            return 1;
+        }
+        let mut buf = [0u16; 64];
+        let len = GetClassNameW(hwnd, buf.as_mut_ptr(), buf.len() as i32);
+        if len > 0 {
+            let class_name = String::from_utf16_lossy(&buf[..len as usize]);
+            if class_name == tray_menu::MENU_CLASS_NAME
+                || class_name == tray_flyout::FLYOUT_CLASS_NAME
+            {
+                state.outcome = match try_post_thread_msg(tid, WM_DAEMON_QUIT) {
+                    Ok(()) => LegacyQuit::Posted,
+                    Err(code) => LegacyQuit::Denied(code),
+                };
+                return 0;
+            }
+        }
+        1
+    }
+
+    if target_pid == 0 {
+        return LegacyQuit::NotFound;
+    }
+    let mut search = QuitSearch {
+        pid: target_pid,
+        outcome: LegacyQuit::NotFound,
+    };
+    unsafe {
+        EnumWindows(Some(enum_cb), (&mut search as *mut QuitSearch) as LPARAM);
+    }
+    search.outcome
 }
 
 fn bring_pid_window_to_front(target_pid: u32) {
@@ -1366,5 +1656,155 @@ fn window_icon() -> egui::IconData {
         rgba,
         width: SIZE,
         height: SIZE,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_daemon_quit_posts_wm_daemon_quit_to_matching_pid_tray_thread() {
+        use std::ptr::{null, null_mut};
+        use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+        use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            CreateWindowExW, DefWindowProcW, DestroyWindow, GetMessageW, RegisterClassW, MSG,
+            WNDCLASSW, WS_POPUP,
+        };
+
+        unsafe extern "system" fn wnd_proc(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || unsafe {
+            let class_w: Vec<u16> = tray_menu::MENU_CLASS_NAME
+                .encode_utf16()
+                .chain(std::iter::once(0))
+                .collect();
+            let hinstance = GetModuleHandleW(null());
+            let mut wc: WNDCLASSW = std::mem::zeroed();
+            wc.lpfnWndProc = Some(wnd_proc);
+            wc.hInstance = hinstance;
+            wc.lpszClassName = class_w.as_ptr();
+            let _ = RegisterClassW(&wc);
+
+            let hwnd = CreateWindowExW(
+                0,
+                class_w.as_ptr(),
+                class_w.as_ptr(),
+                WS_POPUP,
+                0,
+                0,
+                1,
+                1,
+                null_mut(),
+                null_mut(),
+                hinstance,
+                null(),
+            );
+            assert!(!hwnd.is_null());
+            // 先触发一次 PeekMessage 建立线程消息队列再通知主线程发送退出信号
+            let mut msg: MSG = std::mem::zeroed();
+            windows_sys::Win32::UI::WindowsAndMessaging::PeekMessageW(
+                &mut msg,
+                null_mut(),
+                0,
+                0,
+                0,
+            );
+            ready_tx.send(()).unwrap();
+
+            let mut received_quit = false;
+            while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
+                if msg.message == WM_DAEMON_QUIT {
+                    received_quit = true;
+                    break;
+                }
+            }
+            DestroyWindow(hwnd);
+            received_quit
+        });
+
+        ready_rx.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(
+            request_legacy_daemon_quit(std::process::id()),
+            LegacyQuit::Posted
+        );
+        assert!(worker.join().unwrap());
+    }
+
+    #[test]
+    fn takeover_only_succeeds_after_the_old_daemon_really_exits() {
+        // 使用测试专属锁名与假 PID / 子进程，绝不触碰真实守护进程的单实例锁。
+        let name = format!("Local\\GXNUTakeoverTest-{}", std::process::id());
+        let gone_pid = u32::MAX;
+
+        // 1) 旧版已结束、锁空闲：立即接管
+        let guard = complete_daemon_takeover_with(
+            gone_pid,
+            true,
+            "0.0.1",
+            &name,
+            Duration::from_secs(1),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(guard.is_some());
+
+        // 2) 旧版已结束、但锁被另一个新实例抢先拿到：安静让出，不报错
+        let yielded = complete_daemon_takeover_with(
+            gone_pid,
+            true,
+            "0.0.1",
+            &name,
+            Duration::from_secs(1),
+            Duration::from_millis(200),
+        )
+        .unwrap();
+        assert!(yielded.is_none());
+        drop(guard);
+
+        // 3) 旧版仍在运行且不响应退出：超时后报错，绝不在旧版存活时拿锁
+        let mut stubborn = std::process::Command::new("ping")
+            .args(["-n", "30", "127.0.0.1"])
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let err = complete_daemon_takeover_with(
+            stubborn.id(),
+            true,
+            "0.0.1",
+            &name,
+            Duration::from_millis(600),
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(600));
+        assert!(err.contains(&format!("PID {}", stubborn.id())));
+
+        // 4) 旧版存活但找不到它的托盘线程（无法通知）：立即报错，旧版保持运行
+        let err = complete_daemon_takeover_with(
+            stubborn.id(),
+            false,
+            "0.0.1",
+            &name,
+            Duration::from_secs(5),
+            Duration::from_millis(200),
+        )
+        .unwrap_err();
+        assert!(err.contains("托盘"));
+        assert!(is_process_alive(stubborn.id()));
+
+        let _ = stubborn.kill();
+        let _ = stubborn.wait();
+        assert!(!is_process_alive(stubborn.id()));
     }
 }

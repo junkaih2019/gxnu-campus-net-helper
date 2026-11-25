@@ -41,21 +41,21 @@ impl Default for CampusStatusProbe {
 impl CampusStatusProbe {
     pub fn new() -> Self {
         Self {
-            agent: http::agent(5),
+            agent: http::no_redirect_agent(5),
             target: ProbeTarget::FixedUrl(CHKSTATUS_URL.to_string()),
         }
     }
 
     pub fn with_url(url: impl Into<String>) -> Self {
         Self {
-            agent: http::agent(5),
+            agent: http::no_redirect_agent(5),
             target: ProbeTarget::FixedUrl(url.into()),
         }
     }
 
     pub fn with_resolver(resolver: Arc<PortalGatewayResolver>) -> Self {
         Self {
-            agent: http::agent(5),
+            agent: http::no_redirect_agent(5),
             target: ProbeTarget::Dynamic(resolver),
         }
     }
@@ -113,10 +113,21 @@ impl CampusStatusProbe {
 
     /// 返回门户在线状态以及门户侧识别到的真实校园网 IPv4。
     pub fn check_detail(&self) -> Option<CampusStatusInfo> {
+        self.check_detail_with_hint(None)
+    }
+
+    pub(crate) fn check_detail_with_hint(
+        &self,
+        captive_origin: Option<&str>,
+    ) -> Option<CampusStatusInfo> {
         match &self.target {
             ProbeTarget::FixedUrl(base_url) => self.check_single_url(base_url, None),
             ProbeTarget::Dynamic(resolver) => {
-                if let Some(portal) = resolver.cached_endpoints() {
+                if let Some(portal) = resolver.cached_endpoints().filter(|portal| {
+                    captive_origin.is_none_or(|origin| {
+                        origin == portal.origin || portal.is_https_alternative_to(origin)
+                    })
+                }) {
                     if let Some(info) =
                         self.check_single_url(&portal.chkstatus_url, Some(&portal.short_name))
                     {
@@ -127,7 +138,7 @@ impl CampusStatusProbe {
                     }
                     resolver.invalidate_if_origin(&portal.origin);
                 }
-                if let Ok((fresh, _ms, info)) = resolver.probe_and_cache() {
+                if let Ok((fresh, _ms, info)) = resolver.probe_and_cache_with_hint(captive_origin) {
                     logging::info(&format!(
                         "[CAMPUS_STATUS] 已自动探测网关「{}」，门户判定{}",
                         fresh.label,

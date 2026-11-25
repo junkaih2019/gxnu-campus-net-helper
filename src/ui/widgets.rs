@@ -341,6 +341,7 @@ pub fn nav_rail_item(
     selected: bool,
     icon: Icon,
     label: &str,
+    dirty: bool,
 ) -> bool {
     let width = ui.available_width();
     let (rect, response) = ui.allocate_exact_size(Vec2::new(width, 36.0), Sense::click());
@@ -403,7 +404,16 @@ pub fn nav_rail_item(
         font,
         fg,
     );
+    if dirty {
+        ui.painter()
+            .circle_filled(Pos2::new(rect.right() - 12.0, rect.center().y), 3.3, p.warn);
+    }
 
+    let response = if dirty {
+        response.on_hover_text("该栏目有未保存的修改")
+    } else {
+        response
+    };
     ui.add_space(2.0);
     response.clicked()
 }

@@ -76,6 +76,7 @@
 | `GXNU_SHOW_TRAFFIC` | `0` / `1` | 临时覆盖主页是否展示「本机流量」卡片 |
 | `GXNU_VIEW` | `home` / `settings` | 指定启动时打开主页还是设置中心 |
 | `GXNU_SETTINGS_TAB` | `account` / `monitor` / `display` / `notify` | 指定进入设置中心时的默认目录页 |
+| `GXNU_NO_TAKEOVER` | `1` | 禁用新版自动接管后台守护进程与自动改写开机自启路径（开发测试隔离用） |
 
 ---
 

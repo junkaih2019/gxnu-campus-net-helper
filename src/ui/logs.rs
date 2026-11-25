@@ -620,6 +620,7 @@ fn format_human_log(raw_index: usize, line: &str) -> Option<HumanLogLine> {
             | "UI"
             | "NETWORK_CHANGE"
             | "NETWORK_SWITCH"
+            | "PUBLIC_PROBE_FAILED"
             | "SELF_CHECK"
     ) {
         return None;
@@ -1060,6 +1061,7 @@ mod tests {
             "2026-11-22 03:00:03 INFO [CREDENTIALS_MISSING] 凭据待补".into(),
             "2026-11-22 03:00:04 INFO [SELF_SERVICE] İSTANBUL ΟΣ".into(),
             "2026-11-22 03:00:05 INFO [NOTIFY_SENT] 隐藏回执".into(),
+            "2026-11-22 03:00:06 INFO [PUBLIC_PROBE_FAILED] target=hidden.example".into(),
         ]);
         let mut state = LogsState::default();
         state.refresh(&lines);
@@ -1076,6 +1078,7 @@ mod tests {
             (0, "ος", &[3]),
             (0, "οσ", &[]),
             (0, "隐藏回执", &[]),
+            (0, "hidden.example", &[]),
             (2, "", &[1]),
             (1, "", &[0, 3]),
             (3, "", &[2]),

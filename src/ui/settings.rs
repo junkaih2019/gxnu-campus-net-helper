@@ -109,11 +109,12 @@ impl SettingsForm {
             ),
         };
         let is_empty = settings.accounts.is_empty();
+        let fresh_first_setup = is_empty && settings.student_id.trim().is_empty();
         Self {
             tab: SettingsTab::Account,
             editing_account_id,
             new_account_mode: NewAccountMode::FullAccount,
-            request_student_id_focus: is_empty && settings.student_id.trim().is_empty(),
+            request_student_id_focus: fresh_first_setup,
             remark,
             student_id,
             password: String::new(),
@@ -129,8 +130,16 @@ impl SettingsForm {
             heartbeat_minutes: (settings.heartbeat_interval / 60).clamp(1, 1440),
             offline_interval: settings.offline_interval,
             confirm_failures: settings.confirm_failures,
-            auto_start_monitoring: settings.auto_start_monitoring,
-            auto_boot: settings.auto_boot,
+            auto_start_monitoring: if fresh_first_setup {
+                true
+            } else {
+                settings.auto_start_monitoring
+            },
+            auto_boot: if fresh_first_setup {
+                true
+            } else {
+                settings.auto_boot
+            },
             auto_check_updates: settings.auto_check_updates,
             notify_toast: settings.notify_toast,
             notify_wechat: settings.notify_wechat,
@@ -240,20 +249,59 @@ impl SettingsForm {
         .normalized()
     }
 
-    pub fn is_global_dirty(&self, saved: &Settings) -> bool {
+    pub fn is_monitor_dirty(&self, saved: &Settings) -> bool {
         let current = self.to_global_settings(saved);
         let saved_norm = saved.normalized();
+        let fresh_first_setup = saved.accounts.is_empty() && saved.student_id.trim().is_empty();
+        let autostart_dirty = if fresh_first_setup {
+            let is_default_on = current.auto_boot && current.auto_start_monitoring;
+            let is_untouched_saved = current.auto_boot == saved.auto_boot
+                && current.auto_start_monitoring == saved.auto_start_monitoring;
+            !is_default_on && !is_untouched_saved
+        } else {
+            current.auto_start_monitoring != saved.auto_start_monitoring
+                || current.auto_boot != saved.auto_boot
+        };
         current.campus_zone != saved_norm.campus_zone
             || current.custom_portal_url != saved_norm.custom_portal_url
             || current.check_interval != saved.check_interval
             || current.heartbeat_interval != saved.heartbeat_interval
             || current.offline_interval != saved.offline_interval
             || current.confirm_failures != saved.confirm_failures
-            || current.auto_start_monitoring != saved.auto_start_monitoring
-            || current.auto_boot != saved.auto_boot
+            || autostart_dirty
             || current.auto_check_updates != saved.auto_check_updates
-            || current.notify_toast != saved.notify_toast
+    }
+
+    pub fn is_notify_dirty(&self, saved: &Settings) -> bool {
+        let current = self.to_global_settings(saved);
+        current.notify_toast != saved.notify_toast
             || current.notify_quiet_minutes != saved.notify_quiet_minutes
+    }
+
+    pub fn is_global_dirty(&self, saved: &Settings) -> bool {
+        self.is_monitor_dirty(saved) || self.is_notify_dirty(saved)
+    }
+
+    pub fn is_tab_dirty(&self, tab: SettingsTab, saved: &Settings) -> bool {
+        match tab {
+            SettingsTab::Account => self.is_account_draft_dirty(saved),
+            SettingsTab::Monitor => self.is_monitor_dirty(saved),
+            SettingsTab::Display => false,
+            SettingsTab::Notify => self.is_notify_dirty(saved),
+        }
+    }
+
+    pub fn first_dirty_tab(&self, saved: &Settings) -> Option<SettingsTab> {
+        if self.is_tab_dirty(self.tab, saved) {
+            return Some(self.tab);
+        }
+        [
+            SettingsTab::Account,
+            SettingsTab::Monitor,
+            SettingsTab::Notify,
+        ]
+        .into_iter()
+        .find(|&tab| self.is_tab_dirty(tab, saved))
     }
 
     pub fn is_account_draft_dirty(&self, saved: &Settings) -> bool {
@@ -299,6 +347,7 @@ pub struct SettingsActions {
     pub switch_account: Option<String>,
     pub delete_account: Option<String>,
     pub reset: bool,
+    pub reverted_account_draft: bool,
     pub ui_prefs_changed: bool,
     pub set_window_size: Option<[f32; 2]>,
     pub check_update: bool,
@@ -329,7 +378,9 @@ pub fn draw_settings_view(
     let total_w = ui.available_width();
     let nav_w = 166.0_f32.min((total_w * 0.28).max(138.0));
     let content_w = (total_w - nav_w - 1.0).max(300.0);
-    let global_dirty = form.is_global_dirty(saved);
+    let monitor_dirty = form.is_monitor_dirty(saved);
+    let notify_dirty = form.is_notify_dirty(saved);
+    let global_dirty = monitor_dirty || notify_dirty;
     let draft_dirty = form.is_account_draft_dirty(saved);
     let show_floating_bar = global_dirty
         || (draft_dirty && form.tab != SettingsTab::Account && form.editing_account_id.is_some())
@@ -375,6 +426,7 @@ pub fn draw_settings_view(
                                     form.tab == SettingsTab::Account,
                                     Icon::User,
                                     "账号管理",
+                                    draft_dirty,
                                 ) {
                                     form.tab = SettingsTab::Account;
                                 }
@@ -384,6 +436,7 @@ pub fn draw_settings_view(
                                     form.tab == SettingsTab::Monitor,
                                     Icon::Sliders,
                                     "监控与自启",
+                                    monitor_dirty,
                                 ) {
                                     form.tab = SettingsTab::Monitor;
                                 }
@@ -393,6 +446,7 @@ pub fn draw_settings_view(
                                     form.tab == SettingsTab::Display,
                                     Icon::Monitor,
                                     "外观与显示",
+                                    false,
                                 ) {
                                     form.tab = SettingsTab::Display;
                                 }
@@ -402,6 +456,7 @@ pub fn draw_settings_view(
                                     form.tab == SettingsTab::Notify,
                                     Icon::Bell,
                                     "通知与数据",
+                                    notify_dirty,
                                 ) {
                                     form.tab = SettingsTab::Notify;
                                 }
@@ -774,13 +829,9 @@ fn draw_account_page(
                     } else {
                         ui.label(bold_text("添加校园网账号", 13.0, p.text));
                     }
-
-                    if let Some(active) = saved.active_account() {
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if draw_compact_action_btn(ui, p, None, "取消", false).clicked() {
-                                form.load_account_draft(active);
-                            }
-                        });
+                    if form.is_account_draft_dirty(saved) {
+                        ui.add_space(6.0);
+                        badge(ui, p.warn, p.warn_soft, p.warn_border, "未保存");
                     }
                 },
             );
@@ -798,25 +849,16 @@ fn draw_account_page(
                 Vec2::new(ui.available_width(), 24.0),
                 egui::Layout::left_to_right(egui::Align::Center),
                 |ui| {
+                    ui.spacing_mut().item_spacing.x = 6.0;
                     ui.label(bold_text(format!("编辑账号 · {disp_name}"), 12.5, p.text));
-                    if draft_dirty && !verifying_account {
-                        if let Some(acc) = editing_saved {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if draw_compact_action_btn(ui, p, None, "还原", false).clicked()
-                                    {
-                                        form.load_account_draft(acc);
-                                    }
-                                },
-                            );
-                        }
+                    if draft_dirty {
+                        badge(ui, p.warn, p.warn_soft, p.warn_border, "未保存");
                     }
                 },
             );
         }
 
-        // 注意：必须在顶栏交互（分段切换 / 取消 / 还原）之后再读取最新模式与草稿状态，
+        // 注意：必须在顶栏交互（分段切换 / 取消）之后再读取最新模式与草稿状态，
         // 避免同帧内刚切到「添加其他学号」清空学号后，又误入旧的 QuickExit 分支把原学号写回！
         if form.editing_account_id.is_none() {
             let quick_exit_active =
@@ -853,6 +895,7 @@ fn draw_account_page(
                 ui,
                 p,
                 form,
+                editing_saved,
                 editing_has_cred,
                 draft_dirty,
                 verifying_account,
@@ -1076,11 +1119,12 @@ fn draw_quick_exit_body(
         |ui| {
             ui.spacing_mut().item_spacing.x = 8.0;
             ui.label(body_text("备注（选填）", 11.2, p.text_secondary));
+            let remark_w = (ui.available_width() - 186.0).clamp(120.0, 210.0);
             styled_text_box(
                 ui,
                 p,
                 "quick_exit_remark",
-                220.0,
+                remark_w,
                 None,
                 &mut form.remark,
                 &remark_hint,
@@ -1089,6 +1133,7 @@ fn draw_quick_exit_body(
                 &mut no_focus,
             );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
                 let lbl = if verifying_account {
                     "正在核验…"
                 } else {
@@ -1101,6 +1146,15 @@ fn draw_quick_exit_body(
                     .inner
                 {
                     actions.save_profile = true;
+                }
+                if !verifying_account {
+                    if let Some(active) = saved.active_account() {
+                        if secondary_button(ui, p, None, "取消").clicked() {
+                            let was_dirty = form.is_account_draft_dirty(saved);
+                            form.load_account_draft(active);
+                            actions.reverted_account_draft = was_dirty;
+                        }
+                    }
                 }
             });
         },
@@ -1116,11 +1170,16 @@ fn draw_full_new_account_dual_body(
     verifying_account: bool,
     actions: &mut SettingsActions,
 ) {
+    let is_first_account = saved.accounts.is_empty();
     let total_w = ui.available_width();
     let sep_pad = 12.0_f32;
     let left_w = ((total_w - sep_pad * 2.0 - 1.0) * 0.45).floor().max(160.0);
     let right_w = (total_w - left_w - sep_pad * 2.0 - 1.0).max(180.0);
-    let body_h = 156.0_f32;
+    let body_h = if is_first_account {
+        161.0_f32
+    } else {
+        156.0_f32
+    };
 
     ui.horizontal_top(|ui| {
         ui.spacing_mut().item_spacing.x = 0.0;
@@ -1204,7 +1263,7 @@ fn draw_full_new_account_dual_body(
             Stroke::new(1.0_f32, p.divider),
         );
 
-        // 右栏：单行 5 等分对称出口胶囊 + 固定高度联动说明卡 + 右下角主操作按钮
+        // 右栏：单行 5 等分对称出口胶囊 + 联动说明卡 +（首次添加时）开机自动守护勾选卡 /（后续新增时）右下角按钮
         ui.allocate_ui_with_layout(
             Vec2::new(right_w, body_h),
             egui::Layout::top_down(egui::Align::LEFT),
@@ -1217,7 +1276,7 @@ fn draw_full_new_account_dual_body(
                     actions.selected_campus_carrier = true;
                 }
 
-                ui.add_space(8.0);
+                ui.add_space(if is_first_account { 6.0 } else { 8.0 });
                 let campus_already_saved = !form.student_id.trim().is_empty()
                     && saved.has_carrier_for_student(&form.student_id, "0");
                 draw_exit_companion_or_vpn_card(
@@ -1229,41 +1288,95 @@ fn draw_full_new_account_dual_body(
                     &mut form.also_create_campus_exit,
                 );
 
-                let used = ui.cursor().top();
-                let target_btn_top = sep_r.bottom() - 30.0;
-                if target_btn_top > used {
-                    ui.add_space(target_btn_top - used);
+                if is_first_account {
+                    ui.add_space(6.0);
+                    draw_first_run_autostart_card(
+                        ui,
+                        p,
+                        right_w,
+                        &mut form.auto_boot,
+                        &mut form.auto_start_monitoring,
+                    );
+                } else {
+                    let used = ui.cursor().top();
+                    let target_btn_top = sep_r.bottom() - 30.0;
+                    if target_btn_top > used {
+                        ui.add_space(target_btn_top - used);
+                    }
+                    ui.allocate_ui_with_layout(
+                        Vec2::new(right_w, 30.0),
+                        egui::Layout::right_to_left(egui::Align::Center),
+                        |ui| {
+                            ui.spacing_mut().item_spacing.x = 8.0;
+                            let btn_label = if verifying_account {
+                                "正在核验账号…"
+                            } else {
+                                "验证并添加账号"
+                            };
+                            if ui
+                                .add_enabled_ui(!verifying_account, |ui| {
+                                    primary_button(ui, p, Some(Icon::Check), btn_label).clicked()
+                                })
+                                .inner
+                            {
+                                actions.save_profile = true;
+                            }
+                            if !verifying_account {
+                                if let Some(active) = saved.active_account() {
+                                    if secondary_button(ui, p, None, "取消").clicked() {
+                                        let was_dirty = form.is_account_draft_dirty(saved);
+                                        form.load_account_draft(active);
+                                        actions.reverted_account_draft = was_dirty;
+                                    }
+                                }
+                            }
+                        },
+                    );
                 }
-                ui.allocate_ui_with_layout(
-                    Vec2::new(right_w, 30.0),
-                    egui::Layout::right_to_left(egui::Align::Center),
-                    |ui| {
-                        let btn_label = if verifying_account {
-                            "正在核验账号…"
-                        } else {
-                            "验证并添加账号"
-                        };
-                        if ui
-                            .add_enabled_ui(!verifying_account, |ui| {
-                                primary_button(ui, p, Some(Icon::Check), btn_label).clicked()
-                            })
-                            .inner
-                        {
-                            actions.save_profile = true;
-                        }
-                    },
-                );
             },
         );
     });
 
     draw_verify_error_banner(ui, p, form, verifying_account, actions);
+
+    if is_first_account {
+        row_divider(ui, p);
+        ui.allocate_ui_with_layout(
+            Vec2::new(ui.available_width(), 30.0),
+            egui::Layout::right_to_left(egui::Align::Center),
+            |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
+                let btn_label = if verifying_account {
+                    "正在核验账号…"
+                } else {
+                    "验证并添加账号"
+                };
+                if ui
+                    .add_enabled_ui(!verifying_account, |ui| {
+                        primary_button(ui, p, Some(Icon::Check), btn_label).clicked()
+                    })
+                    .inner
+                {
+                    actions.save_profile = true;
+                }
+                if !verifying_account
+                    && form.is_account_draft_dirty(saved)
+                    && secondary_button(ui, p, None, "清空").clicked()
+                {
+                    form.start_new_account();
+                    actions.reverted_account_draft = true;
+                }
+            },
+        );
+    }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_edit_account_dual_body(
     ui: &mut egui::Ui,
     p: &Palette,
     form: &mut SettingsForm,
+    editing_saved: Option<&AccountProfile>,
     editing_has_cred: bool,
     draft_dirty: bool,
     verifying_account: bool,
@@ -1382,12 +1495,18 @@ fn draw_edit_account_dual_body(
                 let (ir, _) = ui.allocate_exact_size(Vec2::splat(13.5), Sense::hover());
                 icons::paint(ui.painter(), ir, Icon::Shield, p.warn);
                 ui.label(body_text(
-                    "使用「校园网」出口时请关闭本机 VPN / 代理软件",
+                    "「校园网」出口请先关闭本机 VPN / 代理",
                     10.8,
                     p.warn,
                 ));
+            } else if draft_dirty {
+                ui.spacing_mut().item_spacing.x = 6.0;
+                let (dot_r, _) = ui.allocate_exact_size(Vec2::new(8.0, 14.0), Sense::hover());
+                ui.painter().circle_filled(dot_r.center(), 3.2, p.warn);
+                ui.label(body_text("有未保存的修改", 10.8, p.text_secondary));
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing.x = 8.0;
                 let btn_label = if verifying_account {
                     "正在核验账号…"
                 } else {
@@ -1404,6 +1523,14 @@ fn draw_edit_account_dual_body(
                     .inner;
                 if clicked {
                     actions.save_profile = true;
+                }
+                if draft_dirty && !verifying_account {
+                    if let Some(acc) = editing_saved {
+                        if secondary_button(ui, p, None, "还原").clicked() {
+                            form.load_account_draft(acc);
+                            actions.reverted_account_draft = true;
+                        }
+                    }
                 }
             });
         },
@@ -1442,7 +1569,7 @@ fn draw_exit_companion_or_vpn_card(
         ui.painter().text(
             Pos2::new(ic_r.right() + 7.0, box_r.bottom() - 13.0),
             egui::Align2::LEFT_CENTER,
-            "内网出口下开启代理工具易触发学校防共享封禁",
+            "校园网出口下开启代理或加速器存在封号风险",
             egui::FontId::proportional(10.0),
             p.text_secondary,
         );
@@ -1533,6 +1660,76 @@ fn draw_exit_companion_or_vpn_card(
             p.text_muted,
         );
     }
+}
+
+fn draw_first_run_autostart_card(
+    ui: &mut egui::Ui,
+    p: &Palette,
+    width: f32,
+    auto_boot: &mut bool,
+    auto_start_monitoring: &mut bool,
+) {
+    let checked = *auto_boot && *auto_start_monitoring;
+    let (box_r, resp) = ui.allocate_exact_size(Vec2::new(width, 48.0), Sense::click());
+    let resp = resp.on_hover_cursor(CursorIcon::PointingHand);
+    if resp.clicked() {
+        let next = !checked;
+        *auto_boot = next;
+        *auto_start_monitoring = next;
+    }
+    let checked = *auto_boot && *auto_start_monitoring;
+    let border = if resp.hovered() {
+        p.border_strong
+    } else {
+        p.divider
+    };
+    ui.painter().rect(
+        box_r,
+        CornerRadius::same(RADIUS_SM),
+        p.subtle,
+        Stroke::new(1.0_f32, border),
+        StrokeKind::Inside,
+    );
+    let ck_r = Rect::from_center_size(
+        Pos2::new(box_r.left() + 17.0, box_r.top() + 16.5),
+        Vec2::splat(14.5),
+    );
+    let (ck_fill, ck_stroke) = if checked {
+        (p.accent, Stroke::NONE)
+    } else if resp.hovered() {
+        (p.card_hover, Stroke::new(1.0_f32, p.accent))
+    } else {
+        (p.input_bg, Stroke::new(1.0_f32, p.border_strong))
+    };
+    ui.painter().rect(
+        ck_r,
+        CornerRadius::same(4),
+        ck_fill,
+        ck_stroke,
+        StrokeKind::Inside,
+    );
+    if checked {
+        icons::paint(ui.painter(), ck_r.shrink(2.2), Icon::Check, p.on_accent);
+    }
+    let title_c = if checked || resp.hovered() {
+        p.text
+    } else {
+        p.text_secondary
+    };
+    ui.painter().text(
+        Pos2::new(ck_r.right() + 7.0, box_r.top() + 16.5),
+        egui::Align2::LEFT_CENTER,
+        "开机自动启动并守护",
+        egui::FontId::proportional(11.0),
+        title_c,
+    );
+    ui.painter().text(
+        Pos2::new(ck_r.right() + 7.0, box_r.bottom() - 13.0),
+        egui::Align2::LEFT_CENTER,
+        "登录系统时静默驻留托盘并自动保持校园网在线",
+        egui::FontId::proportional(10.0),
+        p.text_muted,
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2056,105 +2253,126 @@ fn draw_monitor_page(
             None,
         );
         row_divider(ui, p);
+        ui.add_space(4.0);
 
         let row_w = ui.available_width();
-        ui.allocate_ui_with_layout(
-            Vec2::new(row_w, 40.0),
-            egui::Layout::left_to_right(egui::Align::Center),
-            |ui| {
-                let left_w = (row_w - 116.0).max(150.0);
-                ui.allocate_ui_with_layout(
-                    Vec2::new(left_w, 40.0),
-                    egui::Layout::top_down(egui::Align::LEFT),
-                    |ui| {
-                        ui.spacing_mut().item_spacing.y = 2.0;
-                        ui.label(bold_text(
-                            format!("当前版本 v{}", crate::VERSION),
-                            12.5,
-                            p.text,
-                        ));
-                        let (sub_txt, sub_col) = match update_state.status {
-                            UpdateStatus::Checking => {
-                                ("正在连接 GitHub 检查新版本…".to_string(), p.accent)
-                            }
-                            UpdateStatus::Downloading => {
-                                let pct = update_state
-                                    .progress_ratio()
-                                    .map(|r| format!(" ({}%)", (r * 100.0).round() as i32))
-                                    .unwrap_or_default();
-                                (format!("正在下载更新包{pct}…"), p.accent)
-                            }
-                            UpdateStatus::Applying => ("正在替换安装并重启…".to_string(), p.ok),
-                            UpdateStatus::Available => {
-                                let ver = update_state
-                                    .release
-                                    .as_ref()
-                                    .map(|r| r.version.as_str())
-                                    .unwrap_or("");
-                                (format!("发现新版本 v{ver}，点击右侧即可原位覆盖升级"), p.ok)
-                            }
-                            UpdateStatus::Error if !update_state.message.is_empty() => {
-                                (update_state.message.clone(), p.warn)
-                            }
-                            UpdateStatus::UpToDate => {
-                                let checked_str = update_state
-                                    .last_checked_unix
-                                    .and_then(|ts| {
-                                        chrono::DateTime::from_timestamp(ts, 0).map(|dt| {
-                                            dt.with_timezone(&chrono::Local)
-                                                .format(" · 上次检查 %H:%M")
-                                                .to_string()
-                                        })
-                                    })
-                                    .unwrap_or_default();
-                                (format!("当前已是最新版本{checked_str}"), p.text_muted)
-                            }
-                            _ => (
-                                "点击右侧可立即前往 GitHub Release 检查是否有新版本".to_string(),
-                                p.text_muted,
-                            ),
-                        };
-                        ui.add(egui::Label::new(body_text(sub_txt, 10.8, sub_col)).truncate());
-                    },
-                );
-
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    match update_state.status {
-                        UpdateStatus::Available | UpdateStatus::Downloading => {
-                            let lbl = if update_state.status == UpdateStatus::Downloading {
-                                "查看进度"
-                            } else {
-                                "查看新版本"
-                            };
-                            if draw_compact_action_btn(ui, p, Some(Icon::Download), lbl, true)
-                                .clicked()
-                            {
-                                actions.open_update_modal = true;
-                            }
-                        }
-                        UpdateStatus::Checking => {
-                            badge(ui, p.accent, p.accent_soft, p.accent_border, "检查中…");
-                        }
-                        UpdateStatus::Applying => {
-                            badge(ui, p.ok, p.ok_soft, p.ok_border, "更新中…");
-                        }
-                        _ => {
-                            if draw_compact_action_btn(
-                                ui,
-                                p,
-                                Some(Icon::Refresh),
-                                "检查更新",
-                                false,
-                            )
-                            .clicked()
-                            {
-                                actions.check_update = true;
-                            }
-                        }
-                    }
-                });
+        let left_w = (row_w - 116.0).max(150.0);
+        let title_galley = ui.painter().layout_no_wrap(
+            format!("当前版本 v{}", crate::VERSION),
+            egui::FontId::new(12.0, crate::ui::theme::bold_family()),
+            p.text,
+        );
+        let (sub_txt, sub_col) = match update_state.status {
+            UpdateStatus::Checking => ("正在连接 GitHub 检查新版本…".to_string(), p.accent),
+            UpdateStatus::Downloading => {
+                let pct = update_state
+                    .progress_ratio()
+                    .map(|r| format!(" ({}%)", (r * 100.0).round() as i32))
+                    .unwrap_or_default();
+                (format!("正在下载更新包{pct}…"), p.accent)
+            }
+            UpdateStatus::Applying => ("正在替换安装并重启…".to_string(), p.ok),
+            UpdateStatus::Available => {
+                let ver = update_state
+                    .release
+                    .as_ref()
+                    .map(|r| r.version.as_str())
+                    .unwrap_or("");
+                (format!("发现新版本 v{ver}，点击右侧即可原位覆盖升级"), p.ok)
+            }
+            UpdateStatus::Error if !update_state.message.is_empty() => {
+                (update_state.message.clone(), p.warn)
+            }
+            UpdateStatus::UpToDate => {
+                let checked_str = update_state
+                    .last_checked_unix
+                    .and_then(|ts| {
+                        chrono::DateTime::from_timestamp(ts, 0).map(|dt| {
+                            dt.with_timezone(&chrono::Local)
+                                .format(" · 上次检查 %H:%M")
+                                .to_string()
+                        })
+                    })
+                    .unwrap_or_default();
+                (format!("当前已是最新版本{checked_str}"), p.text_muted)
+            }
+            _ => (
+                "点击右侧可立即前往 GitHub Release 检查是否有新版本".to_string(),
+                p.text_muted,
+            ),
+        };
+        let mut sub_job = egui::text::LayoutJob::single_section(
+            sub_txt,
+            egui::TextFormat {
+                font_id: egui::FontId::proportional(10.5),
+                color: sub_col,
+                ..Default::default()
             },
         );
+        sub_job.wrap.max_width = left_w;
+        sub_job.wrap.max_rows = 1;
+        sub_job.wrap.break_anywhere = true;
+        let sub_galley = ui.painter().layout_job(sub_job);
+
+        let line_gap = 2.0_f32;
+        let title_h = title_galley.size().y;
+        let sub_h = sub_galley.size().y;
+        let text_block_h = title_h + line_gap + sub_h;
+        let row_h = text_block_h.max(36.0);
+        let (row_rect, _) = ui.allocate_exact_size(Vec2::new(row_w, row_h), Sense::hover());
+        let text_top = row_rect.center().y - text_block_h * 0.5;
+        ui.painter()
+            .galley(Pos2::new(row_rect.left(), text_top), title_galley, p.text);
+        ui.painter().galley(
+            Pos2::new(row_rect.left(), text_top + title_h + line_gap),
+            sub_galley,
+            sub_col,
+        );
+
+        let mut action_ui = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(row_rect)
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        match update_state.status {
+            UpdateStatus::Available | UpdateStatus::Downloading => {
+                let lbl = if update_state.status == UpdateStatus::Downloading {
+                    "查看进度"
+                } else {
+                    "查看新版本"
+                };
+                if draw_compact_action_btn(&mut action_ui, p, Some(Icon::Download), lbl, true)
+                    .clicked()
+                {
+                    actions.open_update_modal = true;
+                }
+            }
+            UpdateStatus::Checking => {
+                badge(
+                    &mut action_ui,
+                    p.accent,
+                    p.accent_soft,
+                    p.accent_border,
+                    "检查中…",
+                );
+            }
+            UpdateStatus::Applying => {
+                badge(&mut action_ui, p.ok, p.ok_soft, p.ok_border, "更新中…");
+            }
+            _ => {
+                if draw_compact_action_btn(
+                    &mut action_ui,
+                    p,
+                    Some(Icon::Refresh),
+                    "检查更新",
+                    false,
+                )
+                .clicked()
+                {
+                    actions.check_update = true;
+                }
+            }
+        }
     });
 }
 
@@ -2670,6 +2888,14 @@ mod tests {
 
     #[test]
     fn settings_form_tracks_account_draft_and_global_dirty_independently() {
+        let fresh = Settings::default();
+        let mut fresh_form = SettingsForm::from_settings(&fresh);
+        assert!(fresh_form.auto_boot && fresh_form.auto_start_monitoring);
+        assert!(!fresh_form.is_dirty(&fresh));
+        fresh_form.auto_boot = false;
+        fresh_form.auto_start_monitoring = false;
+        assert!(!fresh_form.is_dirty(&fresh));
+
         let mut saved = Settings::default();
         saved.upsert_account(
             AccountProfile {
@@ -2722,6 +2948,10 @@ mod tests {
         form.campus_zone = CampusZone::Custom;
         form.custom_portal_url = "192.168.125.21/drcom/login".into();
         assert!(form.is_global_dirty(&saved));
+        assert!(form.is_monitor_dirty(&saved));
+        assert!(!form.is_notify_dirty(&saved));
+        form.tab = SettingsTab::Display;
+        assert_eq!(form.first_dirty_tab(&saved), Some(SettingsTab::Monitor));
         let custom_merged = form.to_global_settings(&saved);
         assert_eq!(custom_merged.campus_zone, CampusZone::Custom);
         assert_eq!(custom_merged.custom_portal_url, "http://192.168.125.21");

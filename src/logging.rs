@@ -32,23 +32,48 @@ pub fn subscribe() -> Receiver<String> {
     rx
 }
 
-/// 读取日志文件最后 `max_lines` 行（用于窗口启动时的历史回填）。
+/// 读取最近 `max_lines` 条常规日志，跳过探测明细，并在需要时向轮转备份回溯。
 pub fn read_tail(path: &Path, max_lines: usize) -> Vec<String> {
-    if max_lines == 0 {
-        return Vec::new();
+    let mut lines = Vec::new();
+    for index in 0..=BACKUPS {
+        if lines.len() == max_lines {
+            break;
+        }
+        let path = if index == 0 {
+            path.to_path_buf()
+        } else {
+            path_with_suffix(path, index)
+        };
+        if let Ok(mut file) = File::open(path) {
+            let _ = append_tail(&mut file, max_lines, &mut lines);
+        }
     }
-    File::open(path)
-        .and_then(|mut file| {
-            let end = file.seek(SeekFrom::End(0))?;
-            if end == 0 {
-                return Ok(Vec::new());
-            }
-            let start = tail_start(&mut file, end, max_lines)?;
-            file.seek(SeekFrom::Start(start))?;
-            // 只解码完整行，并以开始读取时的文件末尾为界。
-            BufReader::new(file.take(end - start)).lines().collect()
-        })
-        .unwrap_or_default()
+    lines.reverse();
+    lines
+}
+
+fn append_tail(file: &mut File, max_lines: usize, lines: &mut Vec<String>) -> io::Result<()> {
+    let mut end = file.seek(SeekFrom::End(0))?;
+    while end > 0 && lines.len() < max_lines {
+        let remaining = max_lines - lines.len();
+        let start = tail_start(file, end, remaining.max(256))?;
+        file.seek(SeekFrom::Start(start))?;
+        // 分块向前补足可见行，不解码整个日志文件。
+        let batch: Vec<_> = BufReader::new((&mut *file).take(end - start))
+            .lines()
+            .map_while(Result::ok)
+            .filter(|line| !is_probe_detail(line))
+            .collect();
+        lines.extend(batch.into_iter().rev().take(remaining));
+        end = start;
+    }
+    Ok(())
+}
+
+pub(crate) fn is_probe_detail(line: &str) -> bool {
+    line.get(20..)
+        .and_then(|rest| rest.split_once(' '))
+        .is_some_and(|(_, message)| message.starts_with("[PUBLIC_PROBE_FAILED] "))
 }
 
 fn tail_start(file: &mut File, end: u64, mut lines_left: usize) -> io::Result<u64> {
@@ -261,6 +286,17 @@ mod tests {
         let text = format!("首行\r\n{}", "x".repeat(TAIL_BLOCK_BYTES - 1));
         assert_eq!(text.as_bytes()[text.len() - TAIL_BLOCK_BYTES], b'\n');
         assert_tail_matches_full_read(&path, &text, &[1, 2, 3]);
+    }
+
+    #[test]
+    fn tail_backfills_normal_logs_past_hidden_probe_details_and_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("app.log");
+        let detail = "2026-11-24 01:00:00 INFO [PUBLIC_PROBE_FAILED] target=fixture\n";
+        fs::write(path_with_suffix(&path, 1), format!("older\n{detail}old\n")).unwrap();
+        fs::write(&path, format!("recent\n{}", detail.repeat(1000))).unwrap();
+        assert_eq!(read_tail(&path, 2), ["old", "recent"]);
+        assert_eq!(read_tail(&path, 10), ["older", "old", "recent"]);
     }
 
     #[test]

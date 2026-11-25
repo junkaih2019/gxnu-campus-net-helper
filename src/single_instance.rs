@@ -5,6 +5,7 @@
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE};
 use windows_sys::Win32::System::Threading::CreateMutexW;
 
+#[derive(Debug)]
 pub struct InstanceGuard {
     handle: HANDLE,
 }

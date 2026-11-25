@@ -24,6 +24,8 @@ pub struct DaemonEndpoint {
     pub port: u16,
     pub token: String,
     pub pid: u32,
+    #[serde(default)]
+    pub version: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +94,9 @@ pub enum UiToDaemon {
     },
     TestToast {
         body: String,
+    },
+    QuitForTakeover {
+        new_version: String,
     },
 }
 
@@ -184,6 +189,7 @@ impl IpcServer {
             port,
             token: token.clone(),
             pid: std::process::id(),
+            version: crate::VERSION.to_string(),
         };
         let endpoint_path = app_dir.join(ENDPOINT_FILE);
         let mut file = tempfile::NamedTempFile::new_in(app_dir).map_err(|e| e.to_string())?;
@@ -287,7 +293,13 @@ impl IpcServer {
         }
         hub.broadcast(DaemonToUi::Shutdown);
         drop(hub);
-        let _ = fs::remove_file(&self.endpoint_path);
+        let owns_endpoint_file = fs::read_to_string(&self.endpoint_path)
+            .ok()
+            .and_then(|text| serde_json::from_str::<DaemonEndpoint>(&text).ok())
+            .is_none_or(|ep| ep.pid == self.endpoint.pid);
+        if owns_endpoint_file {
+            let _ = fs::remove_file(&self.endpoint_path);
+        }
         let addr = ([127, 0, 0, 1], self.endpoint.port).into();
         let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(200));
     }
@@ -472,25 +484,133 @@ impl Drop for IpcClient {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExistingDaemonOutcome {
+    Forwarded,
+    Takeover {
+        old_pid: u32,
+        old_version: String,
+        ipc_quit_sent: bool,
+    },
+}
+
+pub(crate) fn should_takeover_daemon(
+    current_version: &str,
+    running_version: Option<&str>,
+    endpoint_pid: u32,
+    self_pid: u32,
+    allow_takeover: bool,
+) -> bool {
+    if !allow_takeover || endpoint_pid == 0 || endpoint_pid == self_pid {
+        return false;
+    }
+    running_version.is_some_and(|old| {
+        crate::updater::compare_versions(current_version, old) == Some(std::cmp::Ordering::Greater)
+    })
+}
+
+fn resolve_running_version(endpoint: &DaemonEndpoint, client: &IpcClient) -> Option<String> {
+    let from_endpoint = endpoint.version.trim();
+    if !from_endpoint.is_empty() {
+        return Some(from_endpoint.to_string());
+    }
+    if let Some(ver) = crate::startup::process_exe_path(endpoint.pid)
+        .and_then(|exe| crate::startup::read_exe_version(&exe))
+    {
+        return Some(ver);
+    }
+    let wait_until = Instant::now() + Duration::from_millis(200);
+    loop {
+        if let Some(snap) = client.inbox.take().snapshot {
+            let ver = snap.update.current_version.trim();
+            if !ver.is_empty() {
+                return Some(ver.to_string());
+            }
+        }
+        if Instant::now() >= wait_until {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The instance mutex may precede publication of the endpoint. Retry discovery only,
 /// never replay a command whose application is already possible.
-pub fn forward_launch(app_dir: &Path, start: bool, minimized: bool) -> Result<(), String> {
-    if minimized && !start {
-        return Ok(());
+pub fn coordinate_existing_daemon(
+    app_dir: &Path,
+    current_version: &str,
+    allow_takeover: bool,
+    start: bool,
+    minimized: bool,
+) -> Result<ExistingDaemonOutcome, String> {
+    if !allow_takeover && minimized && !start {
+        return Ok(ExistingDaemonOutcome::Forwarded);
     }
     let deadline = Instant::now() + COMMAND_TIMEOUT;
     let connect = || {
         let text = fs::read_to_string(app_dir.join(ENDPOINT_FILE)).map_err(|e| format!("{e}"))?;
         let endpoint: DaemonEndpoint = serde_json::from_str(&text).map_err(|e| format!("{e}"))?;
-        IpcClient::connect(endpoint.port, &endpoint.token)
+        let client = IpcClient::connect(endpoint.port, &endpoint.token)?;
+        Ok::<_, String>((endpoint, client))
     };
-    let mut client = loop {
+    let (endpoint, mut client) = loop {
         match connect() {
-            Ok(connection) => break connection,
+            Ok(pair) => break pair,
             Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
-            Err(err) => return Err(format!("无法连接已运行的守护进程：{err}")),
+            Err(err) => {
+                if minimized && !start {
+                    return Ok(ExistingDaemonOutcome::Forwarded);
+                }
+                return Err(format!("无法连接已运行的守护进程：{err}"));
+            }
         }
     };
+
+    let running_version = resolve_running_version(&endpoint, &client);
+    if should_takeover_daemon(
+        current_version,
+        running_version.as_deref(),
+        endpoint.pid,
+        std::process::id(),
+        allow_takeover,
+    ) {
+        let old_version = running_version.unwrap_or_default();
+        let mut ipc_quit_sent = false;
+        if !endpoint.version.trim().is_empty() {
+            if let Ok(req_id) = client.send(UiToDaemon::QuitForTakeover {
+                new_version: current_version.to_string(),
+            }) {
+                match client.inbox.recv_reply_timeout(Duration::from_millis(1500)) {
+                    Ok((reply_id, Ok(()))) if reply_id == req_id => ipc_quit_sent = true,
+                    // 旧版明确拒绝接管（双方对版本高低判断不一致）：尊重它的决定，
+                    // 不再用窗口消息强制关闭，改为只唤醒它的窗口。
+                    Ok((reply_id, Err(_))) if reply_id == req_id => {
+                        return forward_to_running(&mut client, start, minimized);
+                    }
+                    // 超时或连接中断：旧版很可能只是忙，交给窗口消息通道兜底通知。
+                    _ => {}
+                }
+            }
+        }
+        drop(client);
+        return Ok(ExistingDaemonOutcome::Takeover {
+            old_pid: endpoint.pid,
+            old_version,
+            ipc_quit_sent,
+        });
+    }
+
+    forward_to_running(&mut client, start, minimized)
+}
+
+fn forward_to_running(
+    client: &mut IpcClient,
+    start: bool,
+    minimized: bool,
+) -> Result<ExistingDaemonOutcome, String> {
+    if minimized && !start {
+        return Ok(ExistingDaemonOutcome::Forwarded);
+    }
     let commands = [
         start.then_some(UiToDaemon::Start),
         (!minimized).then_some(UiToDaemon::ShowUi),
@@ -506,7 +626,11 @@ pub fn forward_launch(app_dir: &Path, start: bool, minimized: bool) -> Result<()
         }
         result?;
     }
-    Ok(())
+    Ok(ExistingDaemonOutcome::Forwarded)
+}
+
+pub fn forward_launch(app_dir: &Path, start: bool, minimized: bool) -> Result<(), String> {
+    coordinate_existing_daemon(app_dir, crate::VERSION, false, start, minimized).map(|_| ())
 }
 
 #[cfg(test)]
@@ -787,5 +911,112 @@ mod tests {
                 && empty.samples.into_points().is_empty()
                 && empty.logs.is_empty()
         );
+    }
+
+    #[test]
+    fn coordinates_takeover_for_newer_version_and_forwards_for_same_or_older() {
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, commands) = mpsc::channel();
+        let (server, listener) = IpcServer::bind(dir.path()).unwrap();
+        server
+            .listen(listener, move |cmd| {
+                // 模拟一个对版本高低判断不同的旧版：拒绝 v0.3.0 的接管请求
+                let refuse = matches!(
+                    &cmd,
+                    UiToDaemon::QuitForTakeover { new_version } if new_version == "0.3.0"
+                );
+                tx.send(cmd).map_err(|e| format!("{e}"))?;
+                if refuse {
+                    Err("拒绝非高版本接管请求".into())
+                } else {
+                    Ok(())
+                }
+            })
+            .unwrap();
+        server.broadcast_snapshot(SnapshotEnvelope {
+            snapshot: MonitorSnapshot::new(MonitorState::Online, None, "ok", true),
+            online_since_unix: None,
+            last_check_unix: None,
+            traffic: TrafficSummary::default(),
+            active_account_id: String::new(),
+            self_service: SelfServiceState::default(),
+            update: UpdateState {
+                current_version: "0.2.6".into(),
+                ..Default::default()
+            },
+        });
+
+        let write_endpoint = |version: &str| {
+            let mut ep = server.endpoint().clone();
+            ep.pid = u32::MAX;
+            ep.version = version.to_string();
+            fs::write(
+                dir.path().join(ENDPOINT_FILE),
+                serde_json::to_vec(&ep).unwrap(),
+            )
+            .unwrap();
+        };
+
+        // 1) 同版本或旧版本启动：仅转发唤醒，不触发接管
+        write_endpoint("0.2.7");
+        for caller_ver in ["0.2.7", "0.2.6"] {
+            let outcome =
+                coordinate_existing_daemon(dir.path(), caller_ver, true, false, false).unwrap();
+            assert_eq!(outcome, ExistingDaemonOutcome::Forwarded);
+            assert!(matches!(
+                commands.recv_timeout(Duration::from_secs(1)).unwrap(),
+                UiToDaemon::ShowUi
+            ));
+        }
+
+        // 2) 新版本面对 0.2.7+ 守护进程：通过 IPC 发送 QuitForTakeover 并确认回执
+        let outcome = coordinate_existing_daemon(dir.path(), "0.2.8", true, false, false).unwrap();
+        assert_eq!(
+            outcome,
+            ExistingDaemonOutcome::Takeover {
+                old_pid: u32::MAX,
+                old_version: "0.2.7".into(),
+                ipc_quit_sent: true,
+            }
+        );
+        assert!(matches!(
+            commands.recv_timeout(Duration::from_secs(1)).unwrap(),
+            UiToDaemon::QuitForTakeover { new_version } if new_version == "0.2.8"
+        ));
+
+        // 3) 新版本面对无 version 字段的旧版（如 v0.2.6）：从初始快照识别版本并走旧版窗口退出通道
+        write_endpoint("");
+        let outcome = coordinate_existing_daemon(dir.path(), "0.2.7", true, false, false).unwrap();
+        assert_eq!(
+            outcome,
+            ExistingDaemonOutcome::Takeover {
+                old_pid: u32::MAX,
+                old_version: "0.2.6".into(),
+                ipc_quit_sent: false,
+            }
+        );
+        assert!(commands.try_recv().is_err());
+
+        // 4) 旧版明确拒绝接管：放弃接管、不走窗口消息强退，改为唤醒旧版窗口
+        write_endpoint("0.2.7");
+        let outcome = coordinate_existing_daemon(dir.path(), "0.3.0", true, false, false).unwrap();
+        assert_eq!(outcome, ExistingDaemonOutcome::Forwarded);
+        assert!(matches!(
+            commands.recv_timeout(Duration::from_secs(1)).unwrap(),
+            UiToDaemon::QuitForTakeover { new_version } if new_version == "0.3.0"
+        ));
+        assert!(matches!(
+            commands.recv_timeout(Duration::from_secs(1)).unwrap(),
+            UiToDaemon::ShowUi
+        ));
+
+        // 5) 旧版拒绝且是开机自启的静默启动：不弹窗也不接管，直接安静退出
+        let outcome = coordinate_existing_daemon(dir.path(), "0.3.0", true, false, true).unwrap();
+        assert_eq!(outcome, ExistingDaemonOutcome::Forwarded);
+        assert!(matches!(
+            commands.recv_timeout(Duration::from_secs(1)).unwrap(),
+            UiToDaemon::QuitForTakeover { .. }
+        ));
+        assert!(commands.try_recv().is_err());
     }
 }

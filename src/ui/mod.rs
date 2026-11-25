@@ -385,6 +385,9 @@ impl GuardApp {
 
         let open_update_from_env = std::env::var_os("GXNU_OPEN_UPDATE").is_some();
         let just_updated_from_env = std::env::var_os("GXNU_JUST_UPDATED").is_some();
+        let takeover_from_env = std::env::var("GXNU_TAKEOVER_FROM")
+            .ok()
+            .filter(|s| !s.trim().is_empty());
         let initial_traffic_view = TrafficViewMode::default_for_carrier(&deps.settings.carrier);
         let mut app = Self {
             store: deps.store,
@@ -440,6 +443,11 @@ impl GuardApp {
         };
         if just_updated_from_env {
             app.show_toast(format!("已成功原位更新至 v{}", crate::VERSION), false);
+        } else if let Some(old_ver) = takeover_from_env {
+            app.show_toast(
+                format!("已自动接替旧版 v{old_ver}，当前运行 v{}", crate::VERSION),
+                false,
+            );
         }
         if !app.needs_setup {
             app.request(UiToDaemon::RefreshSelfService { force: false }, None);
@@ -685,16 +693,21 @@ impl GuardApp {
             );
             return;
         }
-        let next = self.form.to_global_settings(&self.settings);
+        let mut next = self.form.to_global_settings(&self.settings);
         if let Err(err) = self.store.save_settings(&next) {
             self.show_toast(format!("保存设置失败：{err}"), true);
             return;
         }
-        let startup_error = if next.auto_boot != self.settings.auto_boot {
+        let startup_error = if next.auto_boot != self.settings.auto_boot
+            || (next.auto_boot && startup::should_repoint_to_current(crate::VERSION))
+        {
             startup::set_enabled(next.auto_boot).err()
         } else {
             None
         };
+        if startup_error.is_some() {
+            self.reconcile_autostart_after_failure(&mut next, startup::is_enabled());
+        }
         let command = UiToDaemon::ReloadSettings {
             start: false,
             password_changed: false,
@@ -702,10 +715,7 @@ impl GuardApp {
         };
         self.settings = next;
         self.form.custom_portal_url = self.settings.custom_portal_url.clone();
-        if startup_error.is_some() {
-            self.settings.auto_boot = startup::is_enabled();
-            self.form.auto_boot = self.settings.auto_boot;
-        }
+        self.form.auto_boot = self.settings.auto_boot;
         self.show_toast("设置已写入磁盘，等待守护进程确认", false);
         self.request(command, startup_error);
     }
@@ -893,13 +903,52 @@ impl GuardApp {
         });
     }
 
+    /// 写注册表失败后，把磁盘配置改回实际开关状态；若回写本身也失败，就保持磁盘原值，
+    /// 确保发给守护进程的 `expected` 始终与磁盘一致，避免守护拒绝加载新设置。
+    fn reconcile_autostart_after_failure(&self, next: &mut Settings, actual: bool) {
+        if next.auto_boot == actual {
+            return;
+        }
+        let mut fixed = next.clone();
+        fixed.auto_boot = actual;
+        if self.store.save_settings(&fixed).is_ok() {
+            *next = fixed;
+        }
+    }
+
     fn commit_account_profile(&mut self, also_save_global: bool, verify_note: Option<String>) {
+        self.commit_account_profile_with(
+            also_save_global,
+            verify_note,
+            || startup::should_repoint_to_current(crate::VERSION),
+            startup::set_enabled,
+            startup::is_enabled,
+            credentials::load_for_account,
+            credentials::save_for_account,
+            credentials::delete_for_account,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_account_profile_with(
+        &mut self,
+        also_save_global: bool,
+        verify_note: Option<String>,
+        needs_repoint: impl FnOnce() -> bool,
+        set_autostart: impl FnOnce(bool) -> Result<(), String>,
+        read_actual_autostart: impl FnOnce() -> bool,
+        load_cred: impl Fn(&str, &str) -> Result<Option<credentials::StoredCredential>, String>,
+        save_cred: impl Fn(&str, &str, &str) -> Result<(), String>,
+        delete_cred: impl Fn(&str) -> Result<(), String>,
+    ) {
         let student_id = self.form.student_id.trim().to_string();
         if student_id.is_empty() {
             self.show_toast("请输入校园网学号", true);
             return;
         }
         let is_new = self.form.editing_account_id.is_none();
+        let is_first_account = self.settings.accounts.is_empty() && is_new;
+        let apply_global = also_save_global || is_first_account;
         let account_id = self.form.editing_account_id.clone().unwrap_or_else(|| {
             if self.settings.accounts.is_empty() {
                 "default".to_string()
@@ -913,7 +962,7 @@ impl GuardApp {
             .map(|a| a.student_id.clone())
             .unwrap_or_default();
 
-        let mut next = if also_save_global {
+        let mut next = if apply_global {
             self.form.to_global_settings(&self.settings)
         } else {
             self.settings.clone()
@@ -929,16 +978,25 @@ impl GuardApp {
         } else {
             previous_student_id.as_str()
         };
-        let start = self.needs_setup;
+        let start = self.needs_setup || is_first_account;
         let entered_password = self.form.password.clone();
         let reused_peer_pwd = if entered_password.is_empty() {
-            self.load_reusable_peer_credential(&student_id, &account_id)
+            self.settings
+                .accounts
+                .iter()
+                .filter(|acc| acc.id != account_id && acc.student_id.trim() == student_id)
+                .find_map(|acc| {
+                    load_cred(&acc.id, &student_id)
+                        .ok()
+                        .flatten()
+                        .filter(|c| c.matches_account(&student_id) && !c.password.is_empty())
+                })
                 .map(|c| c.password)
         } else {
             None
         };
 
-        let stored = match credentials::load_for_account(&account_id, lookup_sid) {
+        let stored = match load_cred(&account_id, lookup_sid) {
             Ok(s) => s,
             Err(err) => {
                 self.show_toast(format!("保存账号失败：{err}"), true);
@@ -999,10 +1057,8 @@ impl GuardApp {
             &pwd_to_write,
             stored.as_ref(),
             |value| match value {
-                Some(cred) => {
-                    credentials::save_for_account(&target_id, &cred.username, &cred.password)
-                }
-                None => credentials::delete_for_account(&target_id),
+                Some(cred) => save_cred(&target_id, &cred.username, &cred.password),
+                None => delete_cred(&target_id),
             },
         ) {
             Ok(changed) => changed,
@@ -1013,7 +1069,7 @@ impl GuardApp {
         };
 
         if let (Some(cid), Some(pwd)) = (&created_companion_id, &companion_pwd) {
-            let _ = credentials::save_for_account(cid, &student_id, pwd);
+            let _ = save_cred(cid, &student_id, pwd);
         }
 
         // 同一学号改密自动联动：当用户输入了新密码时，同步刷新该学号下其他出口条目的加密凭据
@@ -1025,8 +1081,7 @@ impl GuardApp {
                 if peer.id != account_id
                     && Some(peer.id.as_str()) != created_companion_id.as_deref()
                     && peer.student_id.trim() == student_id
-                    && credentials::save_for_account(&peer.id, &student_id, &entered_password)
-                        .is_ok()
+                    && save_cred(&peer.id, &student_id, &entered_password).is_ok()
                 {
                     synced_peer_count += 1;
                     synced_peer_ids.push(peer.id.clone());
@@ -1049,11 +1104,16 @@ impl GuardApp {
         self.form.verify_error = None;
         self.form.editing_account_id = Some(account_id.clone());
 
-        let startup_error = if also_save_global && next.auto_boot != self.settings.auto_boot {
-            startup::set_enabled(next.auto_boot).err()
+        let startup_error = if apply_global
+            && (next.auto_boot != self.settings.auto_boot || (next.auto_boot && needs_repoint()))
+        {
+            set_autostart(next.auto_boot).err()
         } else {
             None
         };
+        if startup_error.is_some() {
+            self.reconcile_autostart_after_failure(&mut next, read_actual_autostart());
+        }
         let affects_active = next.active_account_id == account_id;
         let command = UiToDaemon::ReloadSettings {
             start,
@@ -1061,12 +1121,10 @@ impl GuardApp {
             expected: next.clone(),
         };
         self.settings = next;
-        if also_save_global {
+        if apply_global {
             self.form.custom_portal_url = self.settings.custom_portal_url.clone();
-        }
-        if startup_error.is_some() {
-            self.settings.auto_boot = startup::is_enabled();
             self.form.auto_boot = self.settings.auto_boot;
+            self.form.auto_start_monitoring = self.settings.auto_start_monitoring;
         }
         self.refresh_account_creds();
         if wrote_primary_pwd {
@@ -1504,15 +1562,26 @@ impl GuardApp {
 
                 ui.add_space(4.0);
                 let in_settings = self.view == AppView::Settings;
+                let settings_tip = if in_settings {
+                    "返回主页"
+                } else if dirty {
+                    "有未保存的设置修改，点击进入保存或还原"
+                } else {
+                    "打开设置"
+                };
                 if draw_titlebar_chip_btn(ui, p, Icon::Settings, "设置", in_settings, dirty)
+                    .on_hover_text(settings_tip)
                     .clicked()
                 {
                     self.account_menu_open = false;
-                    self.view = if in_settings {
-                        AppView::Home
+                    if in_settings {
+                        self.view = AppView::Home;
                     } else {
-                        AppView::Settings
-                    };
+                        if let Some(dirty_tab) = self.form.first_dirty_tab(&self.settings) {
+                            self.form.tab = dirty_tab;
+                        }
+                        self.view = AppView::Settings;
+                    }
                 }
 
                 if has_upd {
@@ -3022,6 +3091,9 @@ impl eframe::App for GuardApp {
                     self.form.reset_from(&self.settings);
                     self.show_toast("已还原未保存的修改", false);
                 }
+                if actions.reverted_account_draft {
+                    self.show_toast("已还原未保存的修改", false);
+                }
                 if actions.test_toast {
                     self.request(
                         UiToDaemon::TestToast {
@@ -3404,5 +3476,184 @@ mod workflow_tests {
             classify_self_service_for_preverify(Err(PortalError::Unreachable("连接超时".into()))),
             PreverifyOutcome::SkippedWithNote(_)
         ));
+    }
+
+    #[test]
+    fn first_run_commit_enables_autostart_persists_config_and_handles_denial() {
+        use std::cell::Cell;
+        use std::sync::{mpsc, Mutex};
+
+        let run_case = |keep_checked: bool, deny_registry: Option<&str>| {
+            let dir = tempfile::tempdir().unwrap();
+            let store = SettingsStore {
+                app_dir: dir.path().to_path_buf(),
+                path: dir.path().join("config.json"),
+            };
+            let (cmd_tx, cmd_rx) = mpsc::channel();
+            let (server, listener) = crate::ipc::IpcServer::bind(dir.path()).unwrap();
+            server
+                .listen(listener, move |cmd| {
+                    cmd_tx.send(cmd).map_err(|e| e.to_string())
+                })
+                .unwrap();
+            let ipc = IpcClient::connect(server.endpoint().port, &server.endpoint().token).unwrap();
+
+            let ctx = egui::Context::default();
+            let brand_icon = ctx.load_texture(
+                "test-brand",
+                egui::ColorImage::example(),
+                egui::TextureOptions::LINEAR,
+            );
+            let initial = Settings::default().normalized();
+            let form = settings_page::SettingsForm::from_settings(&initial);
+            assert!(form.auto_boot && form.auto_start_monitoring);
+
+            let mut app = GuardApp {
+                store,
+                settings: initial,
+                ipc,
+                latest: None,
+                log_lines: Vec::<String>::new().into(),
+                log_path: dir.path().join("app.log"),
+                ui_prefs: UiPrefs::default(),
+                window_size_dirty_since: None,
+                view: AppView::Settings,
+                form,
+                account_creds: HashMap::new(),
+                account_menu_open: false,
+                account_menu_anchor: None,
+                account_chip_clicked: false,
+                logs_state: logs_page::LogsState::default(),
+                telemetry: SampleHistory::default(),
+                traffic: TrafficSummary::default(),
+                self_service: SelfServiceState::default(),
+                time_range: TimeRange::H24,
+                traffic_view_mode: TrafficViewMode::default_for_carrier("2"),
+                traffic_view_user_override: false,
+                preverify_job: None,
+                gateway_probe_job: None,
+                campus_vpn_modal: None,
+                campus_vpn_ack_for_draft: false,
+                kicking_ips: HashSet::new(),
+                local_kick_confirm_ip: None,
+                recent_sessions_open: false,
+                recent_sessions_anchor: None,
+                recent_sessions_clicked: false,
+                update_state: UpdateState::default(),
+                update_modal_open: false,
+                update_notes_cache: markdown::MarkdownCache::default(),
+                pending_manual_update_check: None,
+                last_check_seq: 0,
+                last_check_unix: None,
+                online_since_unix: None,
+                toast: None,
+                pending_manual_check: None,
+                pending: HashMap::new(),
+                needs_setup: true,
+                trimmed_while_idle: false,
+                brand_icon,
+                #[cfg(debug_assertions)]
+                qa_shot_out: Some(dir.path().join("unused.rgba")),
+                #[cfg(debug_assertions)]
+                qa_shot_frames: 0,
+            };
+
+            if !keep_checked {
+                app.form.auto_boot = false;
+                app.form.auto_start_monitoring = false;
+            }
+            app.form.student_id = "2024010001".into();
+            app.form.password = "fixture-secret".into();
+
+            let reg_calls = Cell::new(0usize);
+            let reg_enabled = Cell::new(false);
+            let creds_saved: Mutex<Vec<(String, String, String)>> = Mutex::new(Vec::new());
+
+            app.commit_account_profile_with(
+                true,
+                None,
+                || !reg_enabled.get(),
+                |enable| {
+                    reg_calls.set(reg_calls.get() + 1);
+                    if let Some(reason) = deny_registry {
+                        Err(reason.to_string())
+                    } else {
+                        reg_enabled.set(enable);
+                        Ok(())
+                    }
+                },
+                || reg_enabled.get(),
+                |_, _| Ok(None),
+                |id, user, pwd| {
+                    creds_saved.lock().unwrap().push((
+                        id.to_string(),
+                        user.to_string(),
+                        pwd.to_string(),
+                    ));
+                    Ok(())
+                },
+                |_| Ok(()),
+            );
+
+            let disk = app
+                .store
+                .load_strict()
+                .expect("config.json must be written");
+            let cmd = cmd_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("daemon must receive ReloadSettings");
+            let UiToDaemon::ReloadSettings {
+                start,
+                password_changed,
+                expected,
+            } = cmd
+            else {
+                panic!("unexpected daemon command: {cmd:?}");
+            };
+            assert!(
+                start,
+                "first-run account commit must start daemon monitoring"
+            );
+            assert!(password_changed);
+            assert_eq!(
+                disk, expected,
+                "disk config.json and daemon expected snapshot must match strictly"
+            );
+            assert_eq!(disk.accounts.len(), 2, "primary + companion campus exit");
+            assert_eq!(creds_saved.lock().unwrap().len(), 2);
+            assert!(!app.needs_setup);
+            assert!(!app.form.is_dirty(&app.settings));
+
+            let pending_err = app
+                .pending
+                .values()
+                .next()
+                .and_then(|p| p.startup_error.clone());
+            (
+                reg_calls.get(),
+                reg_enabled.get(),
+                disk.auto_boot,
+                disk.auto_start_monitoring,
+                pending_err,
+            )
+        };
+
+        // 1) 默认保持勾选：写注册表开启自启 + 落盘 auto_boot/auto_start_monitoring = true
+        let (calls, reg_on, disk_boot, disk_mon, err) = run_case(true, None);
+        assert_eq!(calls, 1);
+        assert!(reg_on && disk_boot && disk_mon);
+        assert_eq!(err, None);
+
+        // 2) 用户取消勾选：0 次注册表写入，auto_boot/auto_start_monitoring 保持 false，当次仍正常连网
+        let (calls, reg_on, disk_boot, disk_mon, err) = run_case(false, None);
+        assert_eq!(calls, 0);
+        assert!(!reg_on && !disk_boot && !disk_mon);
+        assert_eq!(err, None);
+
+        // 3) 注册表被安全软件拦截：自动将 config.json 回退为 false 并与守护进程保持一致，不阻塞账号启用
+        let (calls, reg_on, disk_boot, disk_mon, err) = run_case(true, Some("火绒拦截"));
+        assert_eq!(calls, 1);
+        assert!(!reg_on && !disk_boot && disk_mon);
+        assert_eq!(err.as_deref(), Some("火绒拦截"));
     }
 }

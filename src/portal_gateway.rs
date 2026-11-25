@@ -22,10 +22,8 @@ use crate::models::CampusZone;
 pub const YUCAI_HTTPS_ORIGIN: &str = "https://yc.gxnu.edu.cn";
 pub const YUCAI_IP_ORIGIN: &str = "http://192.168.125.13";
 pub const YANSHAN_IP_ORIGIN: &str = "http://192.168.125.21";
-
-/// 用于在离线未认证态触发校园网 AC 302 重定向的纯明文 HTTP 探针地址。
-const CAPTIVE_SNIFF_URL: &str = "http://www.msftconnecttest.com/connecttest.txt";
-const CAPTIVE_EXPECT_BODY: &str = "Microsoft Connect Test";
+const CAPTIVE_BODY_LIMIT: usize = 8 * 1024;
+const STALE_GATEWAY: &str = "校区设置或网络出口已变化，需重新探测网关";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedPortal {
@@ -53,6 +51,19 @@ impl ResolvedPortal {
             short_name,
         }
     }
+
+    pub(crate) fn is_https_alternative_to(&self, origin: &str) -> bool {
+        if !self.origin.starts_with("https://") || !origin.starts_with("http://") {
+            return false;
+        }
+        let (Ok(secure), Ok(plain)) = (Url::parse(&self.origin), Url::parse(origin)) else {
+            return false;
+        };
+        let secure = secure.host_str().unwrap_or_default().trim_end_matches('.');
+        let plain = plain.host_str().unwrap_or_default().trim_end_matches('.');
+        !secure.is_empty()
+            && (secure == plain || (secure == "yc.gxnu.edu.cn" && plain == "192.168.125.13"))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -63,9 +74,21 @@ struct GatewayConfig {
     test_candidates: Option<Vec<String>>,
 }
 
+struct GatewayState {
+    config: GatewayConfig,
+    cached: Option<ResolvedPortal>,
+    revision: u64,
+}
+
+impl GatewayState {
+    fn invalidate(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        self.cached = None;
+    }
+}
+
 pub struct PortalGatewayResolver {
-    config: Mutex<GatewayConfig>,
-    cached: Mutex<Option<ResolvedPortal>>,
+    state: Mutex<GatewayState>,
 }
 
 impl Default for PortalGatewayResolver {
@@ -77,146 +100,168 @@ impl Default for PortalGatewayResolver {
 impl PortalGatewayResolver {
     pub fn new(zone: CampusZone, custom_portal_url: &str) -> Self {
         Self {
-            config: Mutex::new(GatewayConfig {
-                zone,
-                custom_origin: normalize_custom_portal_origin(custom_portal_url),
-                #[cfg(test)]
-                test_candidates: None,
+            state: Mutex::new(GatewayState {
+                config: GatewayConfig {
+                    zone,
+                    custom_origin: normalize_custom_portal_origin(custom_portal_url),
+                    #[cfg(test)]
+                    test_candidates: None,
+                },
+                cached: None,
+                revision: 0,
             }),
-            cached: Mutex::new(None),
         }
     }
 
     #[cfg(test)]
     pub fn with_test_candidates(candidates: Vec<String>) -> Self {
-        Self {
-            config: Mutex::new(GatewayConfig {
-                zone: CampusZone::Auto,
-                custom_origin: None,
-                test_candidates: Some(candidates),
-            }),
-            cached: Mutex::new(None),
-        }
+        let resolver = Self::default();
+        resolver.state.lock().unwrap().config.test_candidates = Some(candidates);
+        resolver
     }
 
     /// 更新校区与自定义网关设置；若配置变化则清空旧网关缓存。
     pub fn update_config(&self, zone: CampusZone, custom_portal_url: &str) -> bool {
         let next_custom = normalize_custom_portal_origin(custom_portal_url);
-        let mut cfg = self.config.lock().unwrap();
-        let changed = cfg.zone != zone || cfg.custom_origin != next_custom;
+        let mut state = self.state.lock().unwrap();
+        let changed = state.config.zone != zone || state.config.custom_origin != next_custom;
         if changed {
-            cfg.zone = zone;
-            cfg.custom_origin = next_custom;
-            drop(cfg);
-            *self.cached.lock().unwrap() = None;
+            state.config.zone = zone;
+            state.config.custom_origin = next_custom;
+            state.invalidate();
         }
         changed
     }
 
     /// 当出网路由发生切换时清空自动探测缓存，以便跨校区移动后重新识别当前网关。
     pub fn invalidate_cache(&self) {
-        *self.cached.lock().unwrap() = None;
+        self.state.lock().unwrap().invalidate();
     }
 
     /// 当某个网关源请求失败时按源地址精确失效缓存，避免并发下误清刚切好的新网关。
     pub fn invalidate_if_origin(&self, failed_origin: &str) {
-        let mut guard = self.cached.lock().unwrap();
-        if guard.as_ref().is_some_and(|c| c.origin == failed_origin) {
-            *guard = None;
+        let mut state = self.state.lock().unwrap();
+        if state
+            .cached
+            .as_ref()
+            .is_some_and(|portal| portal.origin == failed_origin)
+        {
+            state.invalidate();
         }
     }
 
     pub fn is_custom_mode(&self) -> bool {
-        self.config.lock().unwrap().zone == CampusZone::Custom
+        self.state.lock().unwrap().config.zone == CampusZone::Custom
     }
 
     /// 仅读取当前已缓存的网关端点（不触发网络探测）。
     pub fn cached_endpoints(&self) -> Option<ResolvedPortal> {
-        self.cached.lock().unwrap().clone()
+        self.state.lock().unwrap().cached.clone()
     }
 
     /// 返回当前已缓存网关（若有）；未缓存时执行一次快速探测，若完全离校则平滑回退到首选候选网关。
     pub fn resolve_endpoints(&self) -> ResolvedPortal {
-        if let Some(cached) = self.cached.lock().unwrap().clone() {
+        if let Some(cached) = self.cached_endpoints() {
             return cached;
         }
         if let Ok((resolved, _, _)) = self.probe_and_cache() {
             return resolved;
         }
-        self.default_fallback_portal()
+        Self::default_fallback_portal(&self.state.lock().unwrap().config)
+    }
+
+    /// 明文门户必须在当前连接上返回有效的 Dr.COM 状态才允许认证。
+    pub(crate) fn resolve_login_endpoints(&self) -> Result<ResolvedPortal, String> {
+        let (cached, revision) = {
+            let state = self.state.lock().unwrap();
+            (state.cached.clone(), state.revision)
+        };
+        if let Some(portal) = cached {
+            if portal.origin.starts_with("https://") {
+                return Ok(portal);
+            }
+            let verified = probe_chkstatus_once(&fast_portal_agent(2), &portal).is_some();
+            let mut state = self.state.lock().unwrap();
+            if state.revision != revision
+                || state
+                    .cached
+                    .as_ref()
+                    .is_some_and(|current| current.origin != portal.origin)
+            {
+                return Err(STALE_GATEWAY.into());
+            }
+            if verified {
+                return Ok(portal);
+            }
+            if state
+                .cached
+                .as_ref()
+                .is_some_and(|current| current.origin == portal.origin)
+            {
+                state.invalidate();
+            }
+            if state.config.zone == CampusZone::Custom {
+                return Err("自定义明文网关未返回有效的 Dr.COM 状态响应".into());
+            }
+        }
+        let revision = self.state.lock().unwrap().revision;
+        match self.probe_and_cache() {
+            Ok((portal, _, _)) => Ok(portal),
+            Err(err) => {
+                let state = self.state.lock().unwrap();
+                if state.revision != revision {
+                    return Err(STALE_GATEWAY.into());
+                }
+                let fallback = Self::default_fallback_portal(&state.config);
+                if fallback.origin.starts_with("https://") {
+                    Ok(fallback)
+                } else {
+                    Err(err)
+                }
+            }
+        }
     }
 
     /// 强制重新探测当前网络环境下可用的校园网 Dr.COM 网关，测量真实 RTT 并刷新缓存。
     /// 返回 `(网关端点, 往返毫秒, 门户在线状态详情)`。
     pub fn probe_and_cache(&self) -> Result<(ResolvedPortal, u64, CampusStatusInfo), String> {
-        let cfg = self.config.lock().unwrap().clone();
-
-        if cfg.zone == CampusZone::Custom {
-            let Some(origin) = cfg.custom_origin else {
-                return Err(
-                    "自定义网关地址为空或格式无效，请在设置中填写有效的 http(s):// 地址".into(),
-                );
-            };
-            let portal = ResolvedPortal::from_origin(origin, Some(CampusZone::Custom));
-            let agent = fast_portal_agent(3);
-            return match probe_chkstatus_once(&agent, &portal) {
-                Some((ms, info)) => {
-                    *self.cached.lock().unwrap() = Some(portal.clone());
-                    Ok((portal, ms, info))
-                }
-                None => Err(format!(
-                    "自定义网关 {} 未返回有效的 Dr.COM 状态响应",
-                    portal.origin
-                )),
-            };
-        }
-
-        #[cfg(test)]
-        if let Some(custom_list) = &cfg.test_candidates {
-            let refs: Vec<&str> = custom_list.iter().map(String::as_str).collect();
-            return match discover_best_gateway(&refs, cfg.zone, false) {
-                Some((portal, ms, info)) => {
-                    *self.cached.lock().unwrap() = Some(portal.clone());
-                    Ok((portal, ms, info))
-                }
-                None => Err("未探测到模拟测试网关".into()),
-            };
-        }
-
-        let candidates = candidate_origins_for(cfg.zone);
-        let need_captive_sniff = matches!(
-            cfg.zone,
-            CampusZone::Auto | CampusZone::Wangcheng | CampusZone::Yanshan
-        );
-
-        let discovered = discover_best_gateway(&candidates, cfg.zone, need_captive_sniff);
-        match discovered {
-            Some((portal, ms, info)) => {
-                let prev_origin = self
-                    .cached
-                    .lock()
-                    .unwrap()
-                    .as_ref()
-                    .map(|p| p.origin.clone());
-                if prev_origin.as_deref() != Some(portal.origin.as_str()) {
-                    logging::info(&format!(
-                        "[PORTAL_GATEWAY] 已锁定认证网关：{}（{} ms）",
-                        portal.label, ms
-                    ));
-                }
-                *self.cached.lock().unwrap() = Some(portal.clone());
-                Ok((portal, ms, info))
-            }
-            None => Err("未探测到可达的师大校园网认证网关（请确认已连入 GXNU 校园网）".into()),
-        }
+        self.probe_and_cache_with_hint(None)
     }
 
-    fn default_fallback_portal(&self) -> ResolvedPortal {
-        let cfg = self.config.lock().unwrap().clone();
+    pub(crate) fn probe_and_cache_with_hint(
+        &self,
+        captive_origin: Option<&str>,
+    ) -> Result<(ResolvedPortal, u64, CampusStatusInfo), String> {
+        let (config, revision) = {
+            let state = self.state.lock().unwrap();
+            (state.config.clone(), state.revision)
+        };
+        let (portal, ms, info) = probe_configured_gateway(&config, captive_origin)?;
+        let mut state = self.state.lock().unwrap();
+        if state.revision != revision {
+            return Err(STALE_GATEWAY.into());
+        }
+        let changed = state
+            .cached
+            .as_ref()
+            .is_none_or(|previous| previous.origin != portal.origin);
+        state.cached = Some(portal.clone());
+        drop(state);
+        if changed {
+            logging::info(&format!(
+                "[PORTAL_GATEWAY] 已锁定认证网关：{}（{} ms）",
+                portal.label, ms
+            ));
+        }
+        Ok((portal, ms, info))
+    }
+
+    fn default_fallback_portal(cfg: &GatewayConfig) -> ResolvedPortal {
         match cfg.zone {
             CampusZone::Custom => {
                 let origin = cfg
                     .custom_origin
+                    .clone()
                     .unwrap_or_else(|| YUCAI_HTTPS_ORIGIN.to_string());
                 ResolvedPortal::from_origin(origin, Some(CampusZone::Custom))
             }
@@ -231,6 +276,44 @@ impl PortalGatewayResolver {
             }
         }
     }
+}
+
+fn probe_configured_gateway(
+    config: &GatewayConfig,
+    captive_origin: Option<&str>,
+) -> Result<(ResolvedPortal, u64, CampusStatusInfo), String> {
+    if config.zone == CampusZone::Custom {
+        let origin = config
+            .custom_origin
+            .as_deref()
+            .ok_or("自定义网关地址为空或格式无效，请在设置中填写有效的 http(s):// 地址")?;
+        let portal = ResolvedPortal::from_origin(origin, Some(CampusZone::Custom));
+        let agent = fast_portal_agent(3);
+        let (ms, info) = probe_chkstatus_once(&agent, &portal)
+            .ok_or_else(|| format!("自定义网关 {} 未返回有效的 Dr.COM 状态响应", portal.origin))?;
+        return Ok((portal, ms, info));
+    }
+
+    #[cfg(test)]
+    if let Some(custom_list) = &config.test_candidates {
+        let refs: Vec<&str> = custom_list.iter().map(String::as_str).collect();
+        return discover_best_gateway(&refs, config.zone, false, None)
+            .ok_or_else(|| "未探测到模拟测试网关".into());
+    }
+
+    let candidates = candidate_origins_for(config.zone);
+    let need_captive_sniff = matches!(
+        config.zone,
+        CampusZone::Auto | CampusZone::Wangcheng | CampusZone::Yanshan
+    );
+    let observed_origin = captive_origin.and_then(validate_captive_target_url);
+    discover_best_gateway(
+        &candidates,
+        config.zone,
+        need_captive_sniff,
+        observed_origin.as_deref(),
+    )
+    .ok_or_else(|| "未探测到可达的师大校园网认证网关（请确认已连入 GXNU 校园网）".into())
 }
 
 fn candidate_origins_for(zone: CampusZone) -> Vec<&'static str> {
@@ -250,6 +333,7 @@ fn fast_portal_agent(timeout_secs: u64) -> ureq::Agent {
         .timeout(Duration::from_secs(timeout_secs + 1))
         .timeout_connect(Duration::from_millis(1500))
         .timeout_read(Duration::from_millis(timeout_secs * 1000))
+        .redirects(0)
         .build()
 }
 
@@ -284,13 +368,20 @@ fn discover_best_gateway(
     candidates: &[&str],
     zone: CampusZone,
     with_captive_sniff: bool,
+    observed_origin: Option<&str>,
 ) -> Option<(ResolvedPortal, u64, CampusStatusInfo)> {
+    let observed_origin = observed_origin.filter(|_| with_captive_sniff);
     let mut results: Vec<(usize, ResolvedPortal, u64, CampusStatusInfo)> = Vec::new();
 
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
 
         for (idx, &origin) in candidates.iter().enumerate() {
+            let rank = if observed_origin == Some(origin) {
+                0
+            } else {
+                idx + 1
+            };
             let origin_owned = origin.to_string();
             handles.push(scope.spawn(move || {
                 let agent = fast_portal_agent(2);
@@ -300,14 +391,17 @@ fn discover_best_gateway(
                     Some(zone)
                 };
                 let portal = ResolvedPortal::from_origin(origin_owned, hint);
-                probe_chkstatus_once(&agent, &portal).map(|(ms, info)| (idx + 1, portal, ms, info))
+                probe_chkstatus_once(&agent, &portal).map(|(ms, info)| (rank, portal, ms, info))
             }));
         }
 
-        let sniff_handle = if with_captive_sniff {
+        let sniff_handle = if with_captive_sniff
+            && !observed_origin.is_some_and(|origin| candidates.contains(&origin))
+        {
             Some(scope.spawn(move || {
-                let sniffed_origin = sniff_captive_redirect_origin()?;
-                // 若嗅探到的地址已在候选列表中，交给候选线程或赋予最高优先级（0 = 当前真实拦截网关！）
+                let sniffed_origin = observed_origin
+                    .map(str::to_owned)
+                    .or_else(sniff_captive_redirect_origin)?;
                 let agent = fast_portal_agent(2);
                 let hint = if zone == CampusZone::Wangcheng {
                     Some(CampusZone::Wangcheng)
@@ -333,38 +427,61 @@ fn discover_best_gateway(
         }
     });
 
-    // 排序规则：
-    // 1) 强制门户直接嗅探命中的当前拦截 AC（rank == 0）最优先（100% 代表本网段真实认证控制器）；
-    // 2) 若同为预设候选，优先选择同源 HTTPS（如 yc.gxnu.edu.cn 优于裸 IP 192.168.125.13），其次按 RTT 升序。
-    results.sort_by_key(|(rank, portal, ms, _)| {
-        let is_sniffed = if *rank == 0 { 0u8 } else { 1u8 };
-        let https_pref = if portal.origin.starts_with("https://") {
-            0u8
-        } else {
-            1u8
-        };
-        (is_sniffed, *rank, https_pref, *ms)
-    });
+    select_verified_gateway(results)
+}
 
+fn select_verified_gateway(
+    mut results: Vec<(usize, ResolvedPortal, u64, CampusStatusInfo)>,
+) -> Option<(ResolvedPortal, u64, CampusStatusInfo)> {
+    // 跳转线索可以提升同一网关的优先级。若该网关支持 HTTPS，优先采用其 TLS 状态证据。
+    let https_alias =
+        results
+            .iter()
+            .find(|(rank, _, _, _)| *rank == 0)
+            .and_then(|(_, observed, _, _)| {
+                results
+                    .iter()
+                    .position(|(_, portal, _, _)| portal.is_https_alternative_to(&observed.origin))
+            });
+    if let Some(index) = https_alias {
+        results[index].0 = 0;
+    }
     results
         .into_iter()
-        .next()
+        .min_by_key(|(rank, portal, ms, _)| (*rank, !portal.origin.starts_with("https://"), *ms))
         .map(|(_, portal, ms, info)| (portal, ms, info))
 }
 
 /// 发起一次不跟随重定向的明文 HTTP 探测，若被师大校园网 AC 302 跳转或注入跳转脚本，提取并校验网关源。
 fn sniff_captive_redirect_origin() -> Option<String> {
     let agent = fast_no_redirect_agent();
-    let resp = http::get_response(&agent, CAPTIVE_SNIFF_URL).ok()?;
-    let status = resp.status();
-    let location = resp.header("Location").map(str::to_string);
-    let body = if status == 200 {
-        http::read_text(resp, 8 * 1024).unwrap_or_default()
-    } else {
+    let resp = http::get_response(&agent, http::CONNECT_TEST_URL).ok()?;
+    let origin = extract_captive_portal_origin(resp.header("Location"), "");
+    if origin.is_some() || resp.status() != 200 {
         http::drain_small_body(resp);
-        String::new()
+        return origin;
+    }
+    let mut prefix = [0; CAPTIVE_BODY_LIMIT];
+    let (len, error) = http::read_prefix_with_error(resp.into_reader(), &mut prefix);
+    captive_origin_from_prefix(&prefix[..len], error.is_some() || len == prefix.len())
+}
+
+pub(crate) fn captive_origin_from_prefix(prefix: &[u8], incomplete: bool) -> Option<String> {
+    let text = String::from_utf8_lossy(prefix);
+    let body = if incomplete {
+        // 截断处可能落在主机名或端口中间，仅解析已读到终止符的 URL。
+        &text[..=text.rfind(captive_url_delimiter)?]
+    } else {
+        text.as_ref()
     };
-    extract_captive_portal_origin(location.as_deref(), &body)
+    extract_captive_portal_origin(None, body)
+}
+
+fn captive_url_delimiter(ch: char) -> bool {
+    matches!(
+        ch,
+        '"' | '\'' | '>' | '<' | ' ' | '\r' | '\n' | '\t' | ';' | ')'
+    )
 }
 
 /// 从强制门户 302 `Location` 头或 200 HTML 跳转页中提取受信的师大校园网网关 `scheme://host[:port]`。
@@ -379,7 +496,7 @@ pub fn extract_captive_portal_origin(
     }
 
     let trimmed = html_body.trim();
-    if trimmed.is_empty() || trimmed.contains(CAPTIVE_EXPECT_BODY) {
+    if trimmed.is_empty() || trimmed.contains(http::CONNECT_TEST_BODY) {
         return None;
     }
 
@@ -388,14 +505,7 @@ pub fn extract_captive_portal_origin(
         let mut rest = trimmed;
         while let Some(pos) = rest.find(prefix) {
             let sub = &rest[pos..];
-            let end = sub
-                .find(|ch: char| {
-                    matches!(
-                        ch,
-                        '"' | '\'' | '>' | '<' | ' ' | '\r' | '\n' | '\t' | ';' | ')'
-                    )
-                })
-                .unwrap_or(sub.len());
+            let end = sub.find(captive_url_delimiter).unwrap_or(sub.len());
             let candidate = &sub[..end];
             if let Some(origin) = validate_captive_target_url(candidate) {
                 return Some(origin);
@@ -564,6 +674,164 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_captive_url_is_not_used_as_a_candidate() {
+        let fragment = b"<script>location.href='http://192.168.125.21";
+        assert!(captive_origin_from_prefix(fragment, true).is_none());
+    }
+
+    #[test]
+    fn plaintext_auth_rejects_a_redirecting_chkstatus_even_with_a_cached_gateway() {
+        use std::sync::Arc;
+
+        for (had_cache, current) in [(false, true), (true, true), (false, false)] {
+            let destination = TcpListener::bind("127.0.0.1:0").unwrap();
+            destination.set_nonblocking(true).unwrap();
+            let location = destination.local_addr().unwrap();
+            let (origin, server) = http::mock::serve(move |stream| {
+                write!(
+                    stream,
+                    "HTTP/1.1 302 Found\r\nLocation: http://{location}/status\r\nContent-Length: 0\r\n\r\n"
+                )
+                .unwrap();
+            });
+            let resolver = Arc::new(PortalGatewayResolver::new(CampusZone::Custom, &origin));
+            if had_cache {
+                resolver.state.lock().unwrap().cached = Some(ResolvedPortal::from_origin(
+                    origin,
+                    Some(CampusZone::Custom),
+                ));
+            }
+            let auth = crate::authenticator::CampusAuthenticator::with_resolver(resolver);
+            let result =
+                auth.authenticate_if("fixture-user", "fixture-value", "2", "192.0.2.1", || {
+                    current
+                });
+            server.join().unwrap();
+            if current {
+                assert_eq!(
+                    result.unwrap().reason,
+                    crate::models::DisconnectReason::PortalUnavailable
+                );
+            } else {
+                assert!(
+                    result.is_none(),
+                    "cancelled lookup must not count as an auth result"
+                );
+            }
+            assert_eq!(
+                destination.accept().unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+        }
+    }
+
+    #[test]
+    fn verified_https_alias_keeps_precedence_over_plaintext_redirect() {
+        let verified = |rank, origin, online| {
+            (
+                rank,
+                ResolvedPortal::from_origin(origin, None),
+                1,
+                CampusStatusInfo {
+                    online,
+                    portal_ip: None,
+                    gateway_label: None,
+                },
+            )
+        };
+        for plaintext in [
+            YUCAI_IP_ORIGIN,
+            "http://yc.gxnu.edu.cn",
+            "http://yc.gxnu.edu.cn.",
+            "http://192.168.125.13:801",
+        ] {
+            let (portal, _, status) = select_verified_gateway(vec![
+                verified(0, plaintext, false),
+                verified(1, YUCAI_HTTPS_ORIGIN, true),
+            ])
+            .unwrap();
+            assert_eq!(portal.origin, YUCAI_HTTPS_ORIGIN);
+            assert!(status.online);
+            assert!(portal.is_https_alternative_to(plaintext));
+        }
+        let (portal, _, _) = select_verified_gateway(vec![
+            verified(0, YANSHAN_IP_ORIGIN, false),
+            verified(1, YUCAI_HTTPS_ORIGIN, true),
+        ])
+        .unwrap();
+        assert_eq!(portal.origin, YANSHAN_IP_ORIGIN);
+    }
+
+    #[test]
+    fn outdated_discovery_cannot_restore_an_invalidated_gateway() {
+        use std::sync::{mpsc, Arc};
+
+        for change_config in [false, true] {
+            let (started, waiting) = mpsc::channel();
+            let (release, gate) = mpsc::channel();
+            let (old_origin, old_server) = http::mock::serve(move |stream| {
+                started.send(()).unwrap();
+                gate.recv_timeout(Duration::from_secs(4)).unwrap();
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n{\"result\":0}")
+                    .unwrap();
+            });
+            let resolver = Arc::new(PortalGatewayResolver::new(CampusZone::Custom, &old_origin));
+            let pending = Arc::clone(&resolver);
+            let discovery = std::thread::spawn(move || pending.probe_and_cache());
+            waiting.recv_timeout(Duration::from_secs(3)).unwrap();
+            let current_origin = if change_config {
+                let (current, server) = http::mock::serve(|stream| {
+                    stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\n\r\n{\"result\":1}")
+                        .unwrap();
+                });
+                assert!(resolver.update_config(CampusZone::Custom, &current));
+                assert_eq!(resolver.probe_and_cache().unwrap().0.origin, current);
+                server.join().unwrap();
+                Some(current)
+            } else {
+                resolver.invalidate_cache();
+                None
+            };
+            release.send(()).unwrap();
+            old_server.join().unwrap();
+            assert_eq!(discovery.join().unwrap().unwrap_err(), STALE_GATEWAY);
+            assert_eq!(
+                resolver.cached_endpoints().map(|portal| portal.origin),
+                current_origin
+            );
+        }
+    }
+
+    #[test]
+    fn a_verified_observed_origin_takes_priority_over_default_candidates() {
+        let status_response = |body: &'static str| {
+            http::mock::serve(move |stream| {
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+            })
+        };
+        let (default_origin, default_server) = status_response(r#"{"result":1}"#);
+        let (observed_origin, observed_server) = status_response(r#"{"result":0}"#);
+        let result = discover_best_gateway(
+            &[&default_origin, &observed_origin],
+            CampusZone::Auto,
+            true,
+            Some(&observed_origin),
+        );
+        default_server.join().unwrap();
+        observed_server.join().unwrap();
+        let (portal, _, status) = result.unwrap();
+        assert_eq!(portal.origin, observed_origin);
+        assert!(!status.online);
+    }
+
+    #[test]
     fn resolver_races_candidates_and_locks_onto_live_drcom_gateway() {
         // 候选 1：拒绝连接的死端口；候选 2：正常返回 dr1002 的模拟雁山网关
         let dead = TcpListener::bind("127.0.0.1:0").unwrap();
@@ -590,6 +858,7 @@ mod tests {
             &[dead_origin.as_str(), live_origin.as_str()],
             CampusZone::Auto,
             false,
+            None,
         )
         .expect("should discover live mock Dr.COM gateway");
         server.join().unwrap();

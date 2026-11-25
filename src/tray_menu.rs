@@ -35,7 +35,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 use crate::models::{MonitorSnapshot, MonitorState, UpdateState};
 use crate::tray::TrayAction;
 
-const MENU_CLASS_NAME: &str = "GXNUGuardFluentTrayMenu";
+pub(crate) const MENU_CLASS_NAME: &str = "GXNUGuardFluentTrayMenu";
 const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
 const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
 const DWMWA_BORDER_COLOR: u32 = 34;
