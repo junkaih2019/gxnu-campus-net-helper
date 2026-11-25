@@ -233,10 +233,36 @@ pub fn same_exe_path(a: &Path, b: &Path) -> bool {
 }
 
 fn normalize_path_key(path: &Path) -> String {
-    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let resolved = resolve_best_effort(path);
     let raw = resolved.to_string_lossy();
     let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);
     stripped.replace('/', r"\").to_lowercase()
+}
+
+/// 优先对完整路径做 `canonicalize`；若目标文件尚不存在（例如临时目录探测路径或已删除文件），
+/// 向上回溯最近存在的祖先目录展开 8.3 短路径（如 `RUNNER~1` → `runneradmin`）与符号链接后再拼接剩余文件名。
+fn resolve_best_effort(path: &Path) -> PathBuf {
+    if let Ok(canon) = fs::canonicalize(path) {
+        return canon;
+    }
+    let mut tail = Vec::new();
+    let mut cur = path;
+    while let Some(parent) = cur.parent() {
+        if parent == cur {
+            break;
+        }
+        if let Some(name) = cur.file_name() {
+            tail.push(name.to_os_string());
+        }
+        if let Ok(mut canon_parent) = fs::canonicalize(parent) {
+            for seg in tail.iter().rev() {
+                canon_parent.push(seg);
+            }
+            return canon_parent;
+        }
+        cur = parent;
+    }
+    path.to_path_buf()
 }
 
 fn ensure_trailing_sep(path: &str) -> String {
@@ -457,6 +483,10 @@ mod tests {
         assert!(me.is_file());
         let in_tmp = std::env::temp_dir().join("gxnu-temp-probe.exe");
         assert!(is_in_temp_dir(&in_tmp));
+        let nested_tmp = std::env::temp_dir()
+            .join("gxnu-nonexistent-subdir")
+            .join("gxnu-temp-probe.exe");
+        assert!(is_in_temp_dir(&nested_tmp));
     }
 
     #[test]
